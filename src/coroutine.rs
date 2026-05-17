@@ -19,6 +19,7 @@ pub struct Coroutine {
     pub stack_base: *mut u8,
     pub stack_size: usize,
     pub state: State,
+    pub exit_code: i32,
 }
 
 // Assembly trampoline: vproc_switch restores x19=f_ptr then `ret` jumps here.
@@ -102,6 +103,7 @@ impl Coroutine {
             stack_base,
             stack_size: STACK_SIZE,
             state: State::Ready,
+            exit_code: 0,
         }
     }
 
@@ -206,6 +208,7 @@ impl Coroutine {
             stack_base,
             stack_size,
             state: State::Ready,
+            exit_code: 0,
         }
     }
 }

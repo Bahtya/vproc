@@ -12,10 +12,10 @@ thread_local! {
 const MAIN_VPID: VPid = 0;
 
 pub struct Executor {
-    vprocs: HashMap<VPid, Coroutine>,
+    pub vprocs: HashMap<VPid, Coroutine>,
     ready_queue: VecDeque<VPid>,
     next_pid: VPid,
-    current: Option<VPid>,
+    pub current: Option<VPid>,
     main_sp: *mut u8,
     switch_count: u64,
 }
@@ -131,10 +131,15 @@ impl Executor {
     }
 }
 
-/// Called from assembly trampoline when a coroutine finishes.
+/// Called from assembly trampoline when a coroutine finishes normally.
 /// Marks the coroutine as Done and yields back.
 #[no_mangle]
 pub extern "C" fn vproc_exit() {
+    vproc_exit_with_code(0);
+}
+
+/// Terminate the current coroutine with an exit code.
+pub fn vproc_exit_with_code(code: i32) {
     let ex = unsafe { &mut *EXECUTOR.with(|e| e.get()) };
     let pid = match ex.current {
         Some(p) => p,
@@ -142,9 +147,19 @@ pub extern "C" fn vproc_exit() {
     };
     if let Some(co) = ex.vprocs.get_mut(&pid) {
         co.state = State::Done;
+        co.exit_code = code;
     }
     // Don't re-queue — just schedule the next one
     ex.schedule();
+}
+
+/// Get the exit code of a completed coroutine.
+/// Returns None if the coroutine hasn't finished yet or doesn't exist.
+pub fn get_exit_code(pid: VPid) -> Option<i32> {
+    let ex = unsafe { &mut *EXECUTOR.with(|e| e.get()) };
+    ex.vprocs.get(&pid).and_then(|co| {
+        if co.is_done() { Some(co.exit_code) } else { None }
+    })
 }
 
 /// Public API: yield from current coroutine

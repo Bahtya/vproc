@@ -5,6 +5,7 @@ pub mod executor;
 pub mod loader;
 pub mod preload;
 pub mod vexec;
+pub mod vfd;
 
 use coroutine::VPid;
 
@@ -26,4 +27,14 @@ pub fn block_on_all() {
 /// Get total context switch count.
 pub fn switch_count() -> u64 {
     executor::EXECUTOR.with(|e| unsafe { &mut *e.get() }.switch_count())
+}
+
+/// Terminate the current coroutine with an exit code.
+pub fn exit(code: i32) {
+    executor::vproc_exit_with_code(code);
+}
+
+/// Get the exit code of a completed coroutine.
+pub fn get_exit_code(pid: VPid) -> Option<i32> {
+    executor::get_exit_code(pid)
 }
