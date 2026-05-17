@@ -11,9 +11,23 @@ pub extern "C" fn vproc_ffi_current_vpid() -> u32 {
 }
 
 /// Exit the current virtual process. Does not return.
+/// If not in a coroutine context, uses raw syscall to avoid interceptor recursion.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_exit(code: c_int) {
-    crate::executor::vproc_exit_with_code(code);
+    let in_coroutine = crate::executor::EXECUTOR.with(|e| unsafe { (*e.get()).current.is_some() });
+    if in_coroutine {
+        crate::executor::vproc_exit_with_code(code);
+    } else {
+        // Raw syscall — bypass LD_PRELOAD interceptors to avoid recursion.
+        unsafe {
+            std::arch::asm!(
+                "mov x8, #94", // __NR_exit on aarch64
+                "svc #0",
+                in("x0") code,
+                options(noreturn)
+            );
+        }
+    }
 }
 
 /// Yield control to the next ready virtual process.

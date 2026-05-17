@@ -11,7 +11,7 @@ CC ?= cc
 CFLAGS ?= -Wall -Wextra -O2
 RUST_TARGET_DIR ?= ../target/release
 
-.PHONY: all clean test
+.PHONY: all clean test e2e
 
 all: libvproc_preload.so test_preload
 
@@ -40,4 +40,12 @@ test: libvproc_preload.so $(RUST_TARGET_DIR)/libvproc.so test_preload
 		echo "[test] Exit status (should be 42): $$?"
 
 clean:
-	rm -f libvproc_preload.so test_preload
+	rm -f libvproc_preload.so test_preload e2e_preload
+
+# --- E2E test: coroutine exit() interception ---
+# Build the example with -rdynamic so vproc_ffi_* symbols are visible to dlsym
+e2e: libvproc_preload.so
+	cd .. && RUSTFLAGS='-C link-args=-rdynamic' cargo build --example e2e_preload --release
+	cp $(RUST_TARGET_DIR)/examples/e2e_preload .
+	@echo ""
+	LD_PRELOAD=./libvproc_preload.so VPROC=1 ./e2e_preload

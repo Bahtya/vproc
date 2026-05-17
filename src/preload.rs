@@ -61,8 +61,14 @@ pub extern "C" fn _exit(code: c_int) -> ! {
             f(code);
         }
     }
-    crate::executor::vproc_exit_with_code(code);
-    unreachable!()
+    if current_vpid().is_some() {
+        crate::executor::vproc_exit_with_code(code);
+    }
+    // No coroutine context — fall through to real libc _exit
+    unsafe {
+        let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
+        f(code);
+    }
 }
 
 #[no_mangle]
@@ -73,8 +79,13 @@ pub extern "C" fn exit(code: c_int) -> ! {
             f(code);
         }
     }
-    crate::executor::vproc_exit_with_code(code);
-    unreachable!()
+    if current_vpid().is_some() {
+        crate::executor::vproc_exit_with_code(code);
+    }
+    unsafe {
+        let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
+        f(code);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -44,9 +44,12 @@ static int g_ffi_loaded;
 static const struct vproc_ffi *ffi(void) {
     if (!g_ffi_loaded) {
         g_ffi_loaded = 1;
+        /* Try dlopen libvproc.so first (production: host loads runtime .so).
+         * Fall back to RTLD_DEFAULT (e2e test: FFI symbols in main binary
+         * compiled with -rdynamic). */
         g_ffi.handle = dlopen("libvproc.so", RTLD_NOW | RTLD_GLOBAL);
-        if (!g_ffi.handle) return NULL;
-#define LOAD(name) g_ffi.name = dlsym(g_ffi.handle, "vproc_ffi_" #name)
+        void *src = g_ffi.handle ? g_ffi.handle : RTLD_DEFAULT;
+#define LOAD(name) g_ffi.name = dlsym(src, "vproc_ffi_" #name)
         LOAD(current_vpid);
         LOAD(exit);
         LOAD(yield);
@@ -62,8 +65,9 @@ static const struct vproc_ffi *ffi(void) {
         LOAD(dup2);
         LOAD(execve);
 #undef LOAD
+        if (!g_ffi.exit) return NULL; /* nothing found */
     }
-    return g_ffi.handle ? &g_ffi : NULL;
+    return g_ffi.exit ? &g_ffi : NULL;
 }
 
 /* ------------------------------------------------------------------ */
