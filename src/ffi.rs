@@ -21,7 +21,7 @@ pub extern "C" fn vproc_ffi_exit(code: c_int) {
         // Raw syscall — bypass LD_PRELOAD interceptors to avoid recursion.
         unsafe {
             std::arch::asm!(
-                "mov x8, #94", // __NR_exit on aarch64
+                "mov x8, #94", // __NR_exit_group on aarch64
                 "svc #0",
                 in("x0") code,
                 options(noreturn)
@@ -189,8 +189,8 @@ pub extern "C" fn vproc_ffi_execve(
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }
         .to_string_lossy()
         .into_owned();
-    let argv_vec = unsafe { c_array_to_vec(argv) };
-    let envp_vec = unsafe { c_array_to_vec(envp) };
+    let argv_vec = unsafe { crate::c_array_to_vec(argv) };
+    let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
     match crate::vexec::virtual_execve(&path_str, argv_vec, envp_vec) {
         Ok(_) => {
@@ -203,20 +203,4 @@ pub extern "C" fn vproc_ffi_execve(
             -1
         }
     }
-}
-
-unsafe fn c_array_to_vec(arr: *const *const c_char) -> Vec<String> {
-    let mut vec = Vec::new();
-    if arr.is_null() {
-        return vec;
-    }
-    let mut ptr = arr;
-    while !(*ptr).is_null() {
-        let s = std::ffi::CStr::from_ptr(*ptr)
-            .to_string_lossy()
-            .into_owned();
-        vec.push(s);
-        ptr = ptr.add(1);
-    }
-    vec
 }

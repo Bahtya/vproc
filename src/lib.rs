@@ -39,3 +39,20 @@ pub fn exit(code: i32) {
 pub fn get_exit_code(pid: VPid) -> Option<i32> {
     executor::get_exit_code(pid)
 }
+
+/// Convert a C `*const *const c_char` array (NULL-terminated) to `Vec<String>`.
+pub(crate) unsafe fn c_array_to_vec(arr: *const *const std::os::raw::c_char) -> Vec<String> {
+    let mut vec = Vec::new();
+    if arr.is_null() {
+        return vec;
+    }
+    let mut ptr = arr;
+    while !(*ptr).is_null() {
+        let s = std::ffi::CStr::from_ptr(*ptr)
+            .to_string_lossy()
+            .into_owned();
+        vec.push(s);
+        ptr = ptr.add(1);
+    }
+    vec
+}
