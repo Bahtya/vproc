@@ -2,6 +2,7 @@
 
 use std::alloc::{alloc, Layout};
 use std::ffi::c_int;
+use std::os::raw::c_void;
 
 use crate::coroutine::VPid;
 use crate::elf;
@@ -131,6 +132,165 @@ pub fn virtual_execve_dynamic(
     Ok(VirtualExec { vpid })
 }
 
+/// Load and execute a dynamically-linked binary via dlopen + entry point jump.
+///
+/// Unlike `virtual_execve_dynamic` (which requires `dlsym("main")`),
+/// this approach works with any PIE executable:
+/// 1. dlopen loads the binary + all DT_NEEDED dependencies
+/// 2. Find the loaded base address via dl_iterate_phdr
+/// 3. Calculate entry = base + e_entry from the ELF header
+/// 4. Spawn an ELF coroutine that jumps to the entry point
+pub fn virtual_execve_via_entry(
+    path: &str,
+    argv: Vec<String>,
+    envp: Vec<String>,
+) -> Result<VirtualExec, String> {
+    // Parse ELF header to get e_entry
+    let data = std::fs::read(path)
+        .map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let hdr = elf::parse_header(&data)?;
+    let e_entry = hdr.e_entry as usize;
+    let phdrs = elf::program_headers(&data, &hdr)?;
+
+    // dlopen — dynamic linker loads all dependencies and resolves relocations
+    let c_path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+    let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) }
+            .to_string_lossy()
+            .into_owned();
+        return Err(format!("dlopen({}): {}", path, err));
+    }
+
+    // Find loaded base address via dl_iterate_phdr
+    let base = find_loaded_base(path).ok_or_else(|| format!(
+        "dlopen({}) succeeded but dl_iterate_phdr cannot find it", path
+    ))?;
+
+    let entry_addr = base + e_entry;
+
+    // Clear DT_INIT_ARRAY / DT_INIT to prevent double constructor execution
+    // (dlopen already called them, _start would call them again)
+    clear_init_arrays(base, &phdrs);
+
+    // Build C strings (leaked — must survive coroutine lifetime)
+    let argv_c: Vec<*const u8> = argv
+        .iter()
+        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
+        .collect();
+    let envp_c: Vec<*const u8> = envp
+        .iter()
+        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
+        .collect();
+
+    // Build auxv for the loaded binary
+    let image = loader::LoadedImage {
+        base,
+        total_size: 0,
+        entry: entry_addr,
+        phdr_addr: base + (hdr.e_phoff as usize),
+        phnum: hdr.e_phnum,
+        phentsize: hdr.e_phentsize,
+        interp_path: None,
+    };
+    let auxv = loader::build_auxv(&image, 0);
+
+    // Allocate stack
+    let stack_layout = Layout::from_size_align(ELF_STACK_SIZE, 16)
+        .map_err(|e| e.to_string())?;
+    let stack_base = unsafe { alloc(stack_layout) };
+    if stack_base.is_null() {
+        return Err("stack allocation failed".into());
+    }
+
+    // Spawn ELF coroutine that jumps to the entry point
+    let vpid = crate::executor::EXECUTOR.with(|e| unsafe {
+        (&mut *e.get()).spawn_elf(
+            entry_addr,
+            stack_base,
+            ELF_STACK_SIZE,
+            argv_c.len(),
+            argv_c,
+            envp_c,
+            auxv,
+        )
+    });
+
+    Ok(VirtualExec { vpid })
+}
+
+/// Find the base address of a loaded shared object by pathname.
+/// Resolves symlinks first since dl_iterate_phdr reports the real path.
+fn find_loaded_base(path: &str) -> Option<usize> {
+    let real_path = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| path.to_string());
+    let path_c = std::ffi::CString::new(real_path).ok()?;
+    let result = std::cell::Cell::new(None::<usize>);
+
+    // Store path in a static for the callback to access
+    unsafe {
+        SEARCH_PATH = path_c.as_ptr();
+        libc::dl_iterate_phdr(
+            Some(dl_iterate_callback),
+            &result as *const _ as *mut c_void,
+        );
+    }
+
+    result.get()
+}
+
+// Static used to pass the search path to the dl_iterate_phdr callback.
+static mut SEARCH_PATH: *const std::os::raw::c_char = std::ptr::null();
+
+unsafe extern "C" fn dl_iterate_callback(
+    info: *mut libc::dl_phdr_info,
+    _size: usize,
+    data: *mut c_void,
+) -> c_int {
+    let info = &*info;
+    let result = &*(data as *const std::cell::Cell<Option<usize>>);
+
+    if info.dlpi_name.is_null() {
+        return 0;
+    }
+    let name = std::ffi::CStr::from_ptr(info.dlpi_name);
+    let search = std::ffi::CStr::from_ptr(SEARCH_PATH);
+
+    if name == search {
+        result.set(Some(info.dlpi_addr as usize));
+        return 1; // stop iterating
+    }
+    0
+}
+
+/// Clear DT_INIT_ARRAY and DT_INIT entries in the loaded binary's memory.
+/// This prevents double constructor execution when _start runs after dlopen
+/// has already called them.
+fn clear_init_arrays(base: usize, phdrs: &[elf::Phdr]) {
+    // Find PT_DYNAMIC
+    let dyn_phdr = match phdrs.iter().find(|p| p.p_type == elf::PT_DYNAMIC) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let dyn_addr = base + (dyn_phdr.p_vaddr as usize);
+    let dyn_size = dyn_phdr.p_memsz as usize / std::mem::size_of::<elf::Dyn>();
+
+    // Parse dynamic entries and zero out init-related ones
+    for i in 0..dyn_size {
+        let dyn_ptr = (dyn_addr + i * std::mem::size_of::<elf::Dyn>()) as *mut elf::Dyn;
+        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_tag)) }.into();
+        match tag {
+            elf::DT_INIT_ARRAY | elf::DT_INIT => {
+                unsafe { std::ptr::write_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_val), 0) };
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Determine if a binary is static or dynamic and call the appropriate loader.
 pub fn virtual_execve(
     path: &str,
@@ -145,7 +305,11 @@ pub fn virtual_execve(
     let has_interp = elf::interpreter_path(&data, &phdrs)?.is_some();
 
     if has_interp {
-        virtual_execve_dynamic(path, argv, envp)
+        // Dynamic binary: prefer entry point jump, fall back to dlsym("main")
+        match virtual_execve_via_entry(path, argv.clone(), envp.clone()) {
+            ok @ Ok(_) => ok,
+            Err(_) => virtual_execve_dynamic(path, argv, envp),
+        }
     } else {
         virtual_execve_static(path, argv, envp)
     }
