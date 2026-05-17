@@ -23,13 +23,16 @@ Go 运行时在 1 个 OS 进程内调度数万个 goroutine，上下文切换仅
 │  │  │ VP 1     │ │ VP 2     │ │ VP 3     │    │  │
 │  │  │ (coro)   │ │ (coro)   │ │ (coro)   │    │  │
 │  │  │ own stack│ │ own stack│ │ own stack│    │  │
+│  │  │ own fds  │ │ own fds  │ │ own fds  │    │  │
 │  │  └────┬─────┘ └────┬─────┘ └────┬─────┘    │  │
 │  │       └──────┬──────┘──────────┘           │  │
 │  │     Scheduler (asm context_switch)          │  │
 │  │              │                              │  │
 │  │  ┌───────────┴───────────┐                  │  │
 │  │  │ ELF Loader / dlopen   │                  │  │
-│  │  │ virtual_execve        │                  │  │
+│  │  │ Virtual FD Table      │                  │  │
+│  │  │ Virtual Pipes         │                  │  │
+│  │  │ LD_PRELOAD Intercepts │                  │  │
 │  │  └───────────────────────┘                  │  │
 │  └─────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────┘
@@ -37,7 +40,7 @@ Go 运行时在 1 个 OS 进程内调度数万个 goroutine，上下文切换仅
 
 ## 实现细节
 
-### Phase 1: 协程调度器
+### Phase 1: 协程调度器 ✅
 
 aarch64 汇编上下文切换 + Rust 调度器。
 
@@ -54,15 +57,15 @@ aarch64 汇编上下文切换 + Rust 调度器。
 
 **性能**: 1000 协程 4001 次切换在 20ms 内完成（release），~5μs/switch（含 HashMap/VecDeque 开销）。
 
-### Phase 2: 虚拟 fork/waitpid
+### Phase 2: 虚拟 fork/waitpid ✅
 
 纯协程虚拟化，无需真实 fork。
 
 `virtual_fork()` 创建子协程而非真实进程，`virtual_waitpid()` 通过 yield 等待子协程完成。所有父子逻辑运行在根协程内（yield 需要协程上下文）。支持嵌套 fork（子协程 → 孙协程）。
 
-`src/preload.rs` 实现了 LD_PRELOAD 拦截层（fork/execve/waitpid/_exit），用 `VPROC=1` 环境变量开关。当前验证了纯 Rust 协程路径；生产环境 LD_PRELOAD .so 需要用 C/NDK 编译（Rust stdlib 与 glibc 冲突）。
+`src/preload.rs` 实现了 LD_PRELOAD 拦截层（fork/execve/waitpid/_exit），用 `VPROC=1` 环境变量开关。
 
-### Phase 3: 用户态 ELF 加载器
+### Phase 3: 用户态 ELF 加载器 ✅
 
 加载 PIE ELF 二进制到协程内执行，替代真实 execve()。
 
@@ -81,8 +84,6 @@ __vproc_elf_entry:
     br   x19        // 跳转到入口点
 ```
 
-vproc_switch 恢复帧后，x30 指向此跳板，x19 = 入口地址，x20 = ELF 数据区 sp。
-
 **ELF 栈布局**:
 ```
 sp → argc (u64)
@@ -93,20 +94,72 @@ sp → argc (u64)
 
 **双路径加载**:
 - **静态 PIE**: 自定义加载器（mmap + 重定位 + 跳板），在协程内直接跳转到 ELF 入口
-- **动态二进制**: dlopen() 加载为共享对象，dlsym("main") 找入口，在常规协程内调用（需要 -rdynamic 编译以导出符号）
+- **动态二进制**: dlopen() 加载为共享对象，dlsym("main") 找入口，在常规协程内调用
+
+### Phase 4: 系统调用拦截 + 虚拟 fd + 管道 ✅
+
+拦截关键 libc 函数，让加载的二进制不会杀死宿主进程。
+
+**退出码传播**:
+- Coroutine 新增 `exit_code: i32` 字段
+- `vproc_exit_with_code(code)` 设置退出码并终止协程
+- `get_exit_code(pid)` 仅对已完成的协程返回 `Some(code)`，避免过早返回默认值 0
+- preload 层拦截 `exit()`/`_exit()` → 调用 `vproc_exit_with_code()` 而非真实系统调用
+
+**虚拟 fd 表** (`src/vfd.rs`):
+```rust
+enum Vfd {
+    Real(i32),                    // 直通真实内核 fd
+    PipeRead(*mut PipeBuffer),    // 管道读端
+    PipeWrite(*mut PipeBuffer),   // 管道写端
+}
+```
+- 每个虚拟进程有独立 fd 命名空间（thread-local HashMap）
+- fd 0/1/2 默认直通真实 stdin/stdout/stderr
+- 支持 open/close/dup/dup2 操作
+
+**管道模拟**:
+- `PipeBuffer` 64 KiB 环形缓冲区
+- 读端空时 yield（协作式），写端满时 yield
+- 支持协程间双向通信
+
+**LD_PRELOAD 拦截层** (`src/preload.rs`):
+- 拦截 10 个函数: exit/_exit, fork, waitpid/wait4, execve, pipe, read, write, close, dup, dup2
+- 所有函数检查 `VPROC=1` 环境变量，未设置时直通真实 libc
+- dlsym(RTLD_NEXT) 结果缓存，避免重复符号解析
+- 未在协程上下文时（current_vpid() == None）自动回退到真实 libc
+
+**测试结果**:
+```
+--- Test 1: exit code propagation ---
+  [child] about to exit(42)
+  [parent] child exited with 42 (expected 42) ✅
+
+--- Test 2: virtual pipe ---
+  [writer] wrote 12 bytes
+  [reader] got: hello pipe! ✅
+```
 
 ## 当前工作重心
 
+### 已验证
+- ✅ 协程调度器（1000 协程，20ms）
+- ✅ 虚拟 fork/waitpid（嵌套 fork，0 真实进程）
+- ✅ PIE ELF 加载（静态 + 动态二进制）
+- ✅ 退出码传播（exit(42) 不杀进程）
+- ✅ 虚拟 fd 表 + 管道模拟
+
 ### 待解决的关键问题
 
-1. **系统调用拦截**: 加载的二进制调用 `_exit()` 会终止真实进程。Phase 4 需要拦截系统调用（seccomp-bpf 或 LD_PRELOAD 扩展），让 `_exit()` 变为协程终止
-2. **动态二进制符号导出**: dlopen 路径要求二进制用 `-rdynamic` 编译。大部分预编译二进制不满足。需要实现完整解释器委托（加载 ld-linux/linker64 并跳转）
-3. **生产 LD_PRELOAD .so**: 用 C + Android NDK 编译（而非 Rust stdlib），避免 glibc/bionic 冲突
+1. **LD_PRELOAD exit() 拦截**: 当前需要 `LD_PRELOAD=libvproc.so VPROC=1` 才能拦截 dlopen 二进制的 exit()。需要 C/NDK 编译生产 .so（Rust stdlib 与 glibc 冲突）
+2. **动态二进制符号导出**: dlopen 路径要求 `-rdynamic` 编译。预编译二进制不满足，需要完整解释器委托
+3. **静态 PIE 的 raw syscall**: 直接 `svc #0` 系统调用无法拦截（无 seccomp/ptrace）
 
-### Phase 4 路线
+### 下一步方向
 
-- **系统调用模拟**: signal/pipe/socket 的用户态实现
-- **fd 表隔离**: 每个虚拟进程独立的文件描述符表
+- **C/NDK preload .so**: 用 C 编译 LD_PRELOAD 层，避免 Rust stdlib 冲突
+- **解释器委托**: 加载 ld-linux/linker64 并跳转，支持任意预编译动态二进制
+- **更多 syscall**: signal/pipe/socket 的用户态实现
 - **完整 apt install 工作流**: 端到端验证
 
 ## 文件结构
@@ -119,13 +172,14 @@ vproc/
 │   ├── switch.S              # aarch64 上下文切换 (160B 帧)
 │   └── elf_entry.S           # ELF 入口跳板
 ├── src/
-│   ├── lib.rs                # 公开 API: spawn, yield, block_on_all
-│   ├── coroutine.rs          # Coroutine struct + trampoline + new_elf()
-│   ├── executor.rs           # UnsafeCell 调度器 + spawn_elf()
+│   ├── lib.rs                # 公开 API: spawn, yield, block_on_all, exit, get_exit_code
+│   ├── coroutine.rs          # Coroutine struct + trampoline + new_elf() + exit_code
+│   ├── executor.rs           # UnsafeCell 调度器 + spawn_elf() + vproc_exit_with_code()
 │   ├── elf.rs                # ELF64 解析器 (纯安全 Rust)
 │   ├── loader.rs             # PIE 加载器 (mmap + 重定位)
-│   ├── vexec.rs              # virtual_execve API
-│   ├── preload.rs            # LD_PRELOAD 拦截层
+│   ├── vexec.rs              # virtual_execve API (static + dynamic)
+│   ├── vfd.rs                # 虚拟 fd 表 + 环形缓冲区管道
+│   ├── preload.rs            # LD_PRELOAD 拦截层 (10 函数)
 │   └── arch/
 │       ├── mod.rs
 │       └── aarch64.rs        # context_switch FFI
@@ -134,7 +188,8 @@ vproc/
 │   ├── stress.rs             # 1000 协程压力测试
 │   ├── fork_sim.rs           # 虚拟 fork/waitpid
 │   ├── vexec_demo.rs         # 静态 PIE 加载演示
-│   └── vexec_dynamic_demo.rs # dlopen 动态加载演示
+│   ├── vexec_dynamic_demo.rs # dlopen 动态加载演示
+│   └── pipe_demo.rs          # 退出码传播 + 虚拟管道演示
 └── tests/
     ├── test_static_pie.S     # 最小 aarch64 静态 PIE (write+exit)
     └── test_fork.c           # fork/waitpid 拦截测试
@@ -146,6 +201,7 @@ vproc/
 cargo build --release
 cargo test
 cargo run --example vexec_demo
+cargo run --example pipe_demo
 ```
 
 需要 aarch64 Linux/Android 环境。
