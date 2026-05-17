@@ -30,11 +30,16 @@ Go 运行时在 1 个 OS 进程内调度数万个 goroutine，上下文切换仅
 │  │              │                              │  │
 │  │  ┌───────────┴───────────┐                  │  │
 │  │  │ ELF Loader / dlopen   │                  │  │
+│  │  │ Interpreter Delegation│                  │  │
 │  │  │ Virtual FD Table      │                  │  │
 │  │  │ Virtual Pipes         │                  │  │
-│  │  │ LD_PRELOAD Intercepts │                  │  │
+│  │  │ C LD_PRELOAD .so      │                  │  │
+│  │  │ Rust FFI Runtime      │                  │  │
 │  │  └───────────────────────┘                  │  │
 │  └─────────────────────────────────────────────┘  │
+│                                                   │
+│  libvproc_preload.so (LD_PRELOAD, pure C)         │
+│  → dlopen("libvproc.so") → Rust FFI              │
 └───────────────────────────────────────────────────┘
 ```
 
@@ -140,27 +145,88 @@ enum Vfd {
   [reader] got: hello pipe! ✅
 ```
 
-## 当前工作重心
+### Phase 5: C LD_PRELOAD 层 + Rust FFI 运行时 ✅
+
+Rust 编译的 .so 带入 Rust stdlib（panic handler、allocator），与宿主进程 glibc/bionic 冲突导致 crash。改用纯 C .so 做 LD_PRELOAD，Rust 运行时通过 dlopen 按需加载。
+
+**双层 .so 架构**:
+```
+libvproc_preload.so (LD_PRELOAD, 纯 C ~310 行)
+  → dlopen("libvproc.so") 或 RTLD_DEFAULT
+  → 调用 vproc_ffi_* 函数
+
+libvproc.so (Rust cdylib, FFI 运行时)
+  → 导出 14 个 vproc_ffi_* 函数
+  → 包装协程调度器、虚拟 fd、管道、ELF 加载
+```
+
+**C preload 层** (`preload/preload.c`):
+- `struct vproc_ffi` 一次解析所有 FFI 函数指针，`dlsym` 批量加载
+- 先尝试 `dlopen("libvproc.so")`，失败则回退 `RTLD_DEFAULT`（支持主二进制内嵌 FFI）
+- 拦截 12 个 libc 函数，全部检查 `VPROC=1` 开关
+- 无协程上下文时（`current_vpid() == 0`）自动直通真实 libc
+
+**Rust FFI 层** (`src/ffi.rs`):
+- 14 个 `#[no_mangle] extern "C"` 函数导出运行时能力
+- `vproc_ffi_exit()` 无协程上下文时用 raw `svc #0` 终止进程（避免 LD_PRELOAD 递归）
+- 支持 virtual fd 操作：`pipe`, `is_virtual_fd`, `read`, `write`, `close`, `dup`, `dup2`
+
+**E2E 测试** (`examples/e2e_preload.rs`):
+```
+Test 1: exit(42) interception     — 协程内 libc::exit(42) 被拦截，exit code 42 捕获 ✅
+Test 2: multiple coroutines       — 两个协程分别 exit(10)/exit(20) ✅
+Test 3: _exit(99) interception    — libc::_exit(99) 也被正确拦截 ✅
+switches: 7, exit: 0
+```
+
+### Phase 6: 解释器委托 ✅
+
+加载任意预编译动态 ELF 二进制，无需 `-rdynamic` 或符号导出。
+
+**问题**: Phase 3 的 dlopen 路径要求 `dlsym("main")`，但 Termux 预编译二进制（`apt`, `dpkg`, `ls`, `true`）不导出 `main` 符号。
+
+**方案**: `dlopen` + 入口点跳转。
+
+```
+1. 解析 ELF 头获取 e_entry（入口偏移）
+2. dlopen() 加载二进制 → 动态链接器加载所有 DT_NEEDED 依赖
+3. dl_iterate_phdr() 找到加载基址（canonicalize 解析符号链接）
+4. 计算入口地址 = base + e_entry
+5. 清空 DT_INIT_ARRAY/DT_INIT（防止 dlopen 已执行的构造器被 _start 再次调用）
+6. Coroutine::new_elf() 构造协程栈（argc/argv/envp/auxv）
+7. 跳转到入口点 → _start → __libc_init → main() → exit()
+```
+
+**关键实现细节** (`src/vexec.rs`):
+- `find_loaded_base()`: 先 `canonicalize()` 解析符号链接（`true` → `coreutils`），再用 `dl_iterate_phdr` 按路径匹配基址
+- `clear_init_arrays()`: 遍历 PT_DYNAMIC 中的 DT_INIT_ARRAY/DT_INIT 条目，将 d_val 清零。`#[repr(C, packed)]` 结构体用 `addr_of_mut!` + `write_unaligned` 避免对齐 UB
+- `virtual_execve()` 调度：优先 via_entry，失败回退 dlsym("main")
+
+**验证** — 加载真实 Termux 预编译二进制:
+```
+true  → exit code 0 ✅
+false → exit code 1 ✅
+echo  → exit code 0 ✅
+```
+
+## 当前状态
 
 ### 已验证
-- ✅ 协程调度器（1000 协程，20ms）
+- ✅ 协程调度器（1000 协程，~5μs/switch）
 - ✅ 虚拟 fork/waitpid（嵌套 fork，0 真实进程）
 - ✅ PIE ELF 加载（静态 + 动态二进制）
-- ✅ 退出码传播（exit(42) 不杀进程）
+- ✅ 退出码传播（exit() 不杀进程）
 - ✅ 虚拟 fd 表 + 管道模拟
+- ✅ 纯 C LD_PRELOAD .so（避免 Rust stdlib 冲突）
+- ✅ 解释器委托（加载任意预编译动态二进制）
 
-### 待解决的关键问题
+### 待解决
 
-1. **LD_PRELOAD exit() 拦截**: 当前需要 `LD_PRELOAD=libvproc.so VPROC=1` 才能拦截 dlopen 二进制的 exit()。需要 C/NDK 编译生产 .so（Rust stdlib 与 glibc 冲突）
-2. **动态二进制符号导出**: dlopen 路径要求 `-rdynamic` 编译。预编译二进制不满足，需要完整解释器委托
-3. **静态 PIE 的 raw syscall**: 直接 `svc #0` 系统调用无法拦截（无 seccomp/ptrace）
-
-### 下一步方向
-
-- **C/NDK preload .so**: 用 C 编译 LD_PRELOAD 层，避免 Rust stdlib 冲突
-- **解释器委托**: 加载 ld-linux/linker64 并跳转，支持任意预编译动态二进制
-- **更多 syscall**: signal/pipe/socket 的用户态实现
-- **完整 apt install 工作流**: 端到端验证
+1. **hermux 集成**: 将 vproc 的 `virtual_execve_via_entry()` 接入 hermux 命令执行流程
+2. **更多 syscall 拦截**: signal (kill/sigaction), socket, 文件操作 (open/stat/access), 进程管理 (getpid/getppid)
+3. **虚拟 fork**: 协程栈复制 + fd 表复制（当前 fork 返回 ENOSYS）
+4. **静态 PIE raw syscall**: 直接 `svc #0` 系统调用无法拦截
+5. **端到端验证**: `apt install` 完整工作流
 
 ## 文件结构
 
@@ -171,15 +237,20 @@ vproc/
 ├── asm/
 │   ├── switch.S              # aarch64 上下文切换 (160B 帧)
 │   └── elf_entry.S           # ELF 入口跳板
+├── preload/
+│   ├── preload.c             # 纯 C LD_PRELOAD 层 (310 行)
+│   ├── Makefile              # 构建 libvproc_preload.so + 测试
+│   └── test_preload.c        # 基础拦截测试
 ├── src/
-│   ├── lib.rs                # 公开 API: spawn, yield, block_on_all, exit, get_exit_code
+│   ├── lib.rs                # 公开 API + c_array_to_vec 工具函数
 │   ├── coroutine.rs          # Coroutine struct + trampoline + new_elf() + exit_code
 │   ├── executor.rs           # UnsafeCell 调度器 + spawn_elf() + vproc_exit_with_code()
 │   ├── elf.rs                # ELF64 解析器 (纯安全 Rust)
-│   ├── loader.rs             # PIE 加载器 (mmap + 重定位)
-│   ├── vexec.rs              # virtual_execve API (static + dynamic)
+│   ├── ffi.rs                # C FFI 接口 (14 个 vproc_ffi_* 导出函数)
+│   ├── loader.rs             # PIE 加载器 (mmap + 重定位) + build_auxv()
+│   ├── vexec.rs              # virtual_execve (static + dlsym + via_entry)
 │   ├── vfd.rs                # 虚拟 fd 表 + 环形缓冲区管道
-│   ├── preload.rs            # LD_PRELOAD 拦截层 (10 函数)
+│   ├── preload.rs            # Rust LD_PRELOAD 拦截层 (10 函数)
 │   └── arch/
 │       ├── mod.rs
 │       └── aarch64.rs        # context_switch FFI
@@ -189,7 +260,9 @@ vproc/
 │   ├── fork_sim.rs           # 虚拟 fork/waitpid
 │   ├── vexec_demo.rs         # 静态 PIE 加载演示
 │   ├── vexec_dynamic_demo.rs # dlopen 动态加载演示
-│   └── pipe_demo.rs          # 退出码传播 + 虚拟管道演示
+│   ├── pipe_demo.rs          # 退出码传播 + 虚拟管道演示
+│   ├── e2e_preload.rs        # C preload + Rust runtime E2E 测试
+│   └── entry_demo.rs         # 解释器委托演示 (加载 Termux 二进制)
 └── tests/
     ├── test_static_pie.S     # 最小 aarch64 静态 PIE (write+exit)
     └── test_fork.c           # fork/waitpid 拦截测试
@@ -200,8 +273,8 @@ vproc/
 ```bash
 cargo build --release
 cargo test
-cargo run --example vexec_demo
-cargo run --example pipe_demo
+cargo run --example entry_demo      # 加载 Termux 二进制
+cd preload && make e2e              # C preload E2E 测试
 ```
 
 需要 aarch64 Linux/Android 环境。
