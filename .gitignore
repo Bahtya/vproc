@@ -1,0 +1,7 @@
+/target
+*.o
+*.so
+*.d
+tests/test_static_pie
+tests/test_dynamic
+tests/test_fork
