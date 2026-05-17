@@ -2,6 +2,7 @@ pub mod arch;
 pub mod coroutine;
 pub mod elf;
 pub mod executor;
+pub mod ffi;
 pub mod loader;
 pub mod preload;
 pub mod vexec;
