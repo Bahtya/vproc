@@ -1,13 +1,20 @@
 //! LD_PRELOAD interception layer for vproc.
 
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // SIGSEGV handler — install early for crash diagnosis
 // ---------------------------------------------------------------------------
 
+static CRASH_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
 /// Install a SIGSEGV handler that prints fault address and fp-based backtrace.
+/// Safe to call multiple times — only installs once.
 pub fn install_crash_handler() {
+    if CRASH_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = crash_handler as *const () as usize;
@@ -101,7 +108,8 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
     let rtld_next = -1isize as *mut c_void;
     let ptr = libc::dlsym(rtld_next, sym.as_ptr() as *const c_char);
     if ptr.is_null() {
-        eprintln!("vproc: cannot resolve {:?}", sym);
+        let msg = format!("vproc: cannot resolve {:?}\n", sym);
+        libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len());
         libc::_exit(99);
     }
     if COUNT < 32 {
@@ -323,7 +331,8 @@ pub extern "C" fn execve(
             unreachable!()
         }
         Err(e) => {
-            eprintln!("vproc: virtual_execve: {}", e);
+            let msg = format!("vproc: virtual_execve: {}\n", e);
+            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
             unsafe { *libc::__errno() = libc::ENOEXEC };
             -1
         }

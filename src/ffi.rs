@@ -229,7 +229,8 @@ pub extern "C" fn vproc_ffi_execve(
             -1 // unreachable but needed for type
         }
         Err(e) => {
-            eprintln!("vproc: virtual_execve: {}", e);
+            let msg = format!("vproc: virtual_execve: {}\n", e);
+            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
             unsafe { *libc::__errno() = libc::ENOEXEC };
             -1
         }
@@ -284,15 +285,14 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
 
     // Save the return address that our prologue stored on the stack.
     // Other coroutines (specifically those doing dlopen/__libc_init) can
-    // corrupt our stack while we're yielded, so we verify and restore it.
-    // From assembly: stp x29, x30, [sp, #16] → lr is at sp+24.
-    let saved_lr_addr: *mut u64;
-    let saved_lr_value: u64;
+    // corrupt our stack while we're yielded, so we save lr to the Executor
+    // (heap-allocated, immune to stack corruption) and restore it after yield.
     unsafe {
         let sp_val: usize;
         std::arch::asm!("mov {}, sp", out(reg) sp_val);
-        saved_lr_addr = (sp_val + 24) as *mut u64;
-        saved_lr_value = *saved_lr_addr;
+        let lr_addr = (sp_val + 24) as *mut u64;
+        let lr_value = *lr_addr;
+        (*crate::executor::get_global_executor()).saved_fork_lr = Some((lr_value, lr_addr));
     }
 
     crate::spawn_front(Box::new(move || {
@@ -304,9 +304,13 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
     crate::executor::do_yield();
 
     // Phase 3: restore lr if corrupted during yield by dlopen/__libc_init.
+    // Read from Executor (heap) rather than local stack vars.
     unsafe {
-        if *saved_lr_addr != saved_lr_value {
-            *saved_lr_addr = saved_lr_value;
+        let ex = &mut *crate::executor::get_global_executor();
+        if let Some((lr_val, lr_addr)) = ex.saved_fork_lr.take() {
+            if *lr_addr != lr_val {
+                *lr_addr = lr_val;
+            }
         }
     }
 

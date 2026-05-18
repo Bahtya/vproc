@@ -1,7 +1,7 @@
 //! Virtual execve — load and execute ELF binaries inside coroutines.
 
 use std::alloc::{alloc, Layout};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_int;
 use std::os::raw::c_void;
 use std::sync::Mutex;
@@ -367,6 +367,10 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 
     let rela_count = pltrelsz / std::mem::size_of::<elf::Rela>();
 
+    // Collect patches and unique pages for batch mprotect
+    let mut patches: Vec<(*mut usize, usize)> = Vec::new();
+    let mut pages = BTreeSet::new();
+
     for i in 0..rela_count {
         let rela_ptr = (jmprel + i * std::mem::size_of::<elf::Rela>()) as *const elf::Rela;
         let r_info = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*rela_ptr).r_info)) };
@@ -386,7 +390,6 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
             Err(_) => continue,
         };
 
-        // Look up our interceptor by name — use direct function references
         let our_addr: usize = match name {
             "fork" | "vfork" => crate::preload::fork as *const c_void as usize,
             "execve" => crate::preload::execve as *const c_void as usize,
@@ -410,16 +413,24 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
         };
 
         let got_entry = (base + r_offset as usize) as *mut usize;
-        let page = (got_entry as usize) & !0xfff;
+        pages.insert((got_entry as usize) & !0xfff);
+        patches.push((got_entry, our_addr));
+    }
 
+    if patches.is_empty() {
+        return;
+    }
+
+    // Batch mprotect: make all unique pages writable
+    for &page in &pages {
         unsafe {
-            libc::mprotect(
-                page as *mut c_void,
-                0x2000,
-                libc::PROT_READ | libc::PROT_WRITE,
-            );
-            std::ptr::write_unaligned(got_entry, our_addr);
+            libc::mprotect(page as *mut c_void, 0x2000, libc::PROT_READ | libc::PROT_WRITE);
         }
+    }
+
+    // Apply all GOT patches
+    for &(got_entry, our_addr) in &patches {
+        unsafe { std::ptr::write_unaligned(got_entry, our_addr); }
     }
 }
 
@@ -485,94 +496,60 @@ fn spawn_main_coroutine(
     }))
 }
 
+/// Write an inline-hook trampoline at `func_addr` that branches to `target`.
+///
+/// Overwrites the first 16 bytes with:
+///   ldr x16, [pc, #8]   // load target address
+///   br  x16             // branch to target
+///   .quad target        // 64-bit target address
+unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
+    let page = func_addr & !0xfff;
+    if libc::mprotect(
+        page as *mut c_void,
+        0x2000,
+        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+    ) != 0 {
+        return false;
+    }
+
+    let code = func_addr as *mut u32;
+    std::ptr::write_unaligned(code, 0x58000050);       // ldr x16, [pc, #8]
+    std::ptr::write_unaligned(code.add(1), 0xD61F0200); // br x16
+    std::ptr::write_unaligned(code.add(2) as *mut usize, target);
+
+    // Flush instruction cache for all 16 bytes
+    for off in (0..16).step_by(8) {
+        std::arch::asm!(
+            "dc cvau, {addr}",
+            "dsb ish",
+            "ic ivau, {addr}",
+            "dsb ish",
+            addr = in(reg) func_addr + off,
+        );
+    }
+    std::arch::asm!("isb");
+    true
+}
+
 /// Inline-hook libc's exit() by overwriting its first instructions
 /// with a branch to our interceptor.
-///
-/// We hook exit at the libc code level (not GOT) because __libc_init calls
-/// exit() through libc's internal linkage, bypassing PLT/GOT.
 fn hook_libc_exit() {
     let rtld_next = -1isize as *mut c_void;
     unsafe {
-        let targets: &[(&[u8], *const c_void)] = &[
-            (b"exit\0", crate::preload::exit as *const c_void),
-        ];
-
-        for &(name, target) in targets {
-            let name_c = std::ffi::CStr::from_ptr(name.as_ptr() as *const std::os::raw::c_char);
-            let original = libc::dlsym(rtld_next, name_c.as_ptr());
-            if original.is_null() { continue; }
-
-            let func_addr = original as usize;
-            let page = func_addr & !0xfff;
-
-            let ret = libc::mprotect(
-                page as *mut c_void,
-                0x2000,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            );
-            if ret != 0 { continue; }
-
-            let code = func_addr as *mut u32;
-            std::ptr::write_unaligned(code, 0x58000050);
-            std::ptr::write_unaligned(code.add(1), 0xD61F0200);
-            let target_ptr = code.add(2) as *mut usize;
-            std::ptr::write_unaligned(target_ptr, target as usize);
-
-            std::arch::asm!(
-                "dc cvau, {addr}",
-                "dsb ish",
-                "ic ivau, {addr}",
-                "dsb ish",
-                "isb",
-                addr = in(reg) func_addr,
-            );
-        }
+        let original = libc::dlsym(rtld_next, b"exit\0".as_ptr() as *const std::os::raw::c_char);
+        if original.is_null() { return; }
+        write_inline_hook(original as usize, crate::preload::exit as *const c_void as usize);
     }
 }
 
 /// Inline-hook libc's execve() by overwriting its first instructions
 /// with a branch to our interceptor.
-///
-/// We hook execve at the libc code level (not GOT/PLT) because PLT/GOT
-/// interception may not work reliably for fork child coroutines.
 fn hook_libc_execve() {
     let rtld_next = -1isize as *mut c_void;
     unsafe {
         let original = libc::dlsym(rtld_next, b"execve\0".as_ptr() as *const std::os::raw::c_char);
-        if original.is_null() {
-            return;
-        }
-
-        let func_addr = original as usize;
-        let page = func_addr & !0xfff;
-        let target = crate::preload::execve as *const c_void as usize;
-
-        let ret = libc::mprotect(
-            page as *mut c_void,
-            0x2000,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-        );
-        if ret != 0 {
-            return;
-        }
-
-        let code = func_addr as *mut u32;
-        // ldr x16, [pc, #8]; br x16; .quad target
-        std::ptr::write_unaligned(code, 0x58000050);
-        std::ptr::write_unaligned(code.add(1), 0xD61F0200);
-        std::ptr::write_unaligned(code.add(2) as *mut usize, target);
-
-        // Flush instruction cache for all 16 bytes of the trampoline
-        for off in (0..16).step_by(8) {
-            std::arch::asm!(
-                "dc cvau, {addr}",
-                "dsb ish",
-                "ic ivau, {addr}",
-                "dsb ish",
-                addr = in(reg) func_addr + off,
-            );
-        }
-        std::arch::asm!("isb");
+        if original.is_null() { return; }
+        write_inline_hook(original as usize, crate::preload::execve as *const c_void as usize);
     }
 }
 

@@ -221,10 +221,12 @@ impl VfdTable {
 
 impl Drop for VfdTable {
     fn drop(&mut self) {
-        // Don't free PipeBuffers here — they're shared across fork'd tables.
-        // The PipeBuffer is cleaned up when close() is called on all references,
-        // or leaked if the table is dropped without proper cleanup.
-        // TODO: use Arc<PipeBuffer> for proper reference counting.
+        // Intentionally leak PipeBuffers. After fork(), parent and child fd tables
+        // share the same PipeBuffer pointers (via clone_for_fork). Dropping one table
+        // and calling Box::from_raw on a still-referenced PipeBuffer would be UB.
+        // PipeBuffers are freed when close() detects no other fd in the same table
+        // references them, or intentionally leaked if the table is dropped first.
+        // TODO: use Arc<PipeBuffer> for proper cross-table reference counting.
     }
 }
 

@@ -59,6 +59,9 @@ pub const R_AARCH64_RELATIVE: u32 = 0x403;
 pub const R_AARCH64_GLOB_DAT: u32 = 0x401;
 pub const R_AARCH64_JUMP_SLOT: u32 = 0x402;
 
+// Symbol type (lower 4 bits of st_info)
+pub const STT_FUNC: u8 = 2;
+
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;
 pub const AT_PHDR: u64 = 3;
@@ -117,6 +120,17 @@ pub struct Rela {
     pub r_offset: u64,
     pub r_info: u64,
     pub r_addend: i64,
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone)]
+pub struct Sym {
+    pub st_name: u32,
+    pub st_info: u8,
+    pub st_other: u8,
+    pub st_shndx: u16,
+    pub st_value: u64,
+    pub st_size: u64,
 }
 
 // --- Parsing functions ---
