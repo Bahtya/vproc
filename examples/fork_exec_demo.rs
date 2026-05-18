@@ -80,32 +80,35 @@ fn wait_child(name: &str, pid: u32, expected: i32) {
 /// Virtual fork using the helper coroutine pattern.
 fn vproc_fork() -> u32 {
     // Check if we are a fork child resuming after do_yield
-    let fork_result = vproc::executor::EXECUTOR.with(|e| unsafe {
-        let ex = &mut *e.get();
+    let fork_result = unsafe {
+        let ex = &mut *vproc::executor::get_global_executor();
         let pid = ex.current.unwrap();
         let co = ex.vprocs.get(&pid).unwrap();
         if co.is_fork_child {
             ex.vprocs.get_mut(&pid).unwrap().is_fork_child = false;
-            return 0u32;
+            0u32
+        } else {
+            u32::MAX
         }
-        u32::MAX
-    });
+    };
 
     if fork_result != u32::MAX {
         return fork_result;
     }
 
-    vproc::spawn(Box::new(move || {
-        vproc::executor::EXECUTOR.with(|e| unsafe {
-            (&mut *e.get()).spawn_fork_child();
-        });
+    let parent_pid = unsafe { (*vproc::executor::get_global_executor()).current.unwrap() };
+
+    vproc::spawn_front(Box::new(move || {
+        unsafe {
+            (*vproc::executor::get_global_executor()).spawn_fork_child(parent_pid);
+        }
     }));
 
     vproc::executor::do_yield();
 
-    vproc::executor::EXECUTOR.with(|e| unsafe {
-        let ex = &mut *e.get();
+    unsafe {
+        let ex = &mut *vproc::executor::get_global_executor();
         let pid = ex.current.unwrap();
         ex.vprocs.get(&pid).unwrap().fork_child_pid
-    })
+    }
 }

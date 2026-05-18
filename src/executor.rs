@@ -39,10 +39,10 @@ pub struct Executor {
     main_sp: *mut u8,
     switch_count: u64,
     pub children: HashMap<VPid, Vec<VPid>>,
-    /// Saved (lr_value, lr_addr) for fork LR restoration.
+    /// Saved lr (x30) value for fork LR restoration.
     /// Stored on the heap (Executor is heap-allocated via AtomicPtr),
     /// so it survives stack corruption from dlopen/__libc_init in other coroutines.
-    pub saved_fork_lr: Option<(u64, *mut u64)>,
+    pub saved_fork_lr: Option<u64>,
 }
 
 impl Executor {
@@ -146,7 +146,6 @@ impl Executor {
                     }
                 }
 
-                let new_sp = self.vprocs.get(&next_pid).unwrap().sp;
                 let old_sp_ptr = if current_pid == MAIN_VPID {
                     sp_ptr(&mut self.main_sp)
                 } else {
@@ -157,7 +156,7 @@ impl Executor {
                 self.current = Some(next_pid);
                 self.switch_count += 1;
 
-                unsafe { context_switch(old_sp_ptr, new_sp) };
+                unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
             }
             None => {
                 // No ready coroutine, switch back to main
