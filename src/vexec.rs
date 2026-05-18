@@ -234,6 +234,9 @@ pub fn virtual_execve_via_entry(
 
     let vpid = unsafe {
         let ex = &mut *crate::executor::get_global_executor();
+        // Pin executor to global pointer so it survives TLS reinitialization
+        // when __libc_init runs inside the dlopen'd binary's _start.
+        crate::executor::set_global_executor(ex as *mut _);
         ex.spawn_elf(
             entry_addr,
             stack_base,

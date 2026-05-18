@@ -140,13 +140,11 @@ impl Executor {
                 if current_pid != MAIN_VPID {
                     let co = self.vprocs.get(&current_pid).unwrap();
                     if co.state == State::Running {
-                        // Yield (not exit): put back in queue
                         self.vprocs.get_mut(&current_pid).unwrap().state = State::Ready;
                         self.ready_queue.push_back(current_pid);
                     }
                 }
 
-                let new_sp = self.vprocs.get(&next_pid).unwrap().sp;
                 let old_sp_ptr = if current_pid == MAIN_VPID {
                     sp_ptr(&mut self.main_sp)
                 } else {
@@ -157,7 +155,7 @@ impl Executor {
                 self.current = Some(next_pid);
                 self.switch_count += 1;
 
-                unsafe { context_switch(old_sp_ptr, new_sp) };
+                unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
             }
             None => {
                 // No ready coroutine, switch back to main
@@ -230,7 +228,6 @@ pub fn vproc_exit_with_code(code: i32) {
         co.state = State::Done;
         co.exit_code = code;
     }
-    // Don't re-queue — just schedule the next one
     ex.schedule();
 }
 
