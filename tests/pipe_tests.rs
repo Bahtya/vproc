@@ -1,4 +1,4 @@
-//! Integration tests for pipe/fork fix (issue #1).
+//! Integration tests for pipe/fork and sequential execve fixes (issues #1, #3).
 //!
 //! Each test spawns `test_single` as a subprocess with a timeout,
 //! because the tests involve real fork() which is incompatible
@@ -9,16 +9,21 @@ use std::process::Command;
 const TIMEOUT_SECS: u64 = 10;
 
 fn run_vproc(cmd: &str) -> (bool, String, String) {
+    run_vproc_multi(&[cmd])
+}
+
+fn run_vproc_multi(cmds: &[&str]) -> (bool, String, String) {
     let bin = std::env::current_dir()
         .unwrap()
         .join("target/release/examples/test_single");
-    let output = Command::new("timeout")
-        .arg(format!("{}s", TIMEOUT_SECS))
-        .arg(bin)
-        .arg(cmd)
-        .env("VPROC", "1")
-        .output()
-        .expect("failed to run test_single");
+    let mut cmd = Command::new("timeout");
+    cmd.arg(format!("{}s", TIMEOUT_SECS))
+        .arg(&bin)
+        .env("VPROC", "1");
+    for c in cmds {
+        cmd.arg(c);
+    }
+    let output = cmd.output().expect("failed to run test_single");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -76,4 +81,15 @@ fn test_pipe_with_grep() {
     let (ok, stdout, stderr) = run_vproc("printf 'foo\\nbar\\nbaz\\n' | grep ba");
     assert!(ok, "exit != 0\nstdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("bar") && stdout.contains("baz"), "missing grep output: {stdout}");
+}
+
+#[test]
+fn test_sequential_pipe_invocations() {
+    // Run two pipe commands back to back in the same process.
+    // This tests that the binary cache correctly restores writable segments
+    // so the shell's global state is fresh for the second invocation.
+    let (ok, stdout, stderr) = run_vproc_multi(&["echo hello | cat", "echo world | cat"]);
+    assert!(ok, "exit != 0\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("hello"), "missing 'hello': {stdout}");
+    assert!(stdout.contains("world"), "missing 'world': {stdout}");
 }
