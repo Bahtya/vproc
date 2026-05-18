@@ -458,7 +458,7 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
         if let Some(table) = crate::vfd::get_table(vpid) {
             if let Some(crate::vfd::Vfd::PipeRead(pipe_buf)) = table.get(fd as u32) {
                 let dst = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count) };
-                let n = unsafe { (**pipe_buf).read_from(dst) };
+                let n = pipe_buf.read_from(dst);
                 if n >= 0 {
                     return n;
                 }
@@ -510,11 +510,11 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
         if let Some(table) = crate::vfd::get_table(vpid) {
             if let Some(crate::vfd::Vfd::PipeWrite(pipe_buf)) = table.get(fd as u32) {
                 let src = unsafe { std::slice::from_raw_parts(buf as *const u8, count) };
-                let n = unsafe { (**pipe_buf).write_to(src) };
+                let n = pipe_buf.write_to(src);
                 if n >= 0 {
                     return n;
                 }
-                if unsafe { (**pipe_buf).is_closed() } {
+                if pipe_buf.is_closed() {
                     unsafe { *libc::__errno() = libc::EPIPE };
                     return -1;
                 }

@@ -99,6 +99,20 @@ impl Executor {
         pid
     }
 
+    /// Register C strings for a coroutine. They will be freed when the coroutine is dropped.
+    pub fn register_c_strings(&mut self, vpid: VPid, strings: Vec<*mut u8>) {
+        if let Some(co) = self.vprocs.get_mut(&vpid) {
+            co.c_strings = strings;
+        }
+    }
+
+    /// Register a mmap'd region to be unmapped when the coroutine is dropped.
+    pub fn register_mapped_region(&mut self, vpid: VPid, base: usize, size: usize) {
+        if let Some(co) = self.vprocs.get_mut(&vpid) {
+            co.mapped_regions.push((base, size));
+        }
+    }
+
     /// Create a fork child coroutine from the given parent's saved stack state.
     ///
     /// Allocates a new VPid, copies the parent's stack via `Coroutine::fork_from`,

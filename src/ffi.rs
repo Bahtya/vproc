@@ -100,7 +100,7 @@ pub extern "C" fn vproc_ffi_read(
     match table.get(fd as u32) {
         Some(crate::vfd::Vfd::PipeRead(pipe_buf)) => {
             let dst = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count) };
-            unsafe { (**pipe_buf).read_from(dst) }
+            pipe_buf.read_from(dst)
         }
         _ => -1,
     }
@@ -121,7 +121,7 @@ pub extern "C" fn vproc_ffi_write(
     match table.get(fd as u32) {
         Some(crate::vfd::Vfd::PipeWrite(pipe_buf)) => {
             let src = unsafe { std::slice::from_raw_parts(buf as *const u8, count) };
-            unsafe { (**pipe_buf).write_to(src) }
+            pipe_buf.write_to(src)
         }
         _ => -1,
     }
@@ -133,8 +133,8 @@ pub extern "C" fn vproc_ffi_pipe_is_closed(vpid: u32, fd: c_int) -> c_int {
     crate::vfd::get_table(vpid)
         .and_then(|t| t.get(fd as u32))
         .map(|vfd| match vfd {
-            crate::vfd::Vfd::PipeWrite(buf) => unsafe {
-                if (**buf).is_closed() {
+            crate::vfd::Vfd::PipeWrite(buf) => {
+                if buf.is_closed() {
                     1
                 } else {
                     0

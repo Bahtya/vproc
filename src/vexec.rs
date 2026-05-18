@@ -40,6 +40,40 @@ struct WritableSegment {
 static BINARY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, BinaryCacheEntry>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Remove a binary from the cache and dlclose its handle.
+/// Returns true if the binary was found and unloaded.
+pub fn unload_binary(path: &str) -> bool {
+    let real_path = match std::fs::canonicalize(path) {
+        Ok(p) => p.to_str().map(|s| s.to_string()),
+        Err(_) => Some(path.to_string()),
+    };
+    let real_path = match real_path {
+        Some(p) => p,
+        None => return false,
+    };
+    let mut cache = BINARY_CACHE.lock().unwrap();
+    match cache.remove(&real_path) {
+        Some(entry) => {
+            unsafe { libc::dlclose(entry.handle.0); }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Remove all binaries from the cache and dlclose their handles.
+pub fn unload_all_binaries() {
+    let mut cache = BINARY_CACHE.lock().unwrap();
+    for (_, entry) in cache.drain() {
+        unsafe { libc::dlclose(entry.handle.0); }
+    }
+}
+
+/// Return the number of cached binaries.
+pub fn cached_binary_count() -> usize {
+    BINARY_CACHE.lock().unwrap().len()
+}
+
 /// Result of a virtual_execve operation.
 pub struct VirtualExec {
     pub vpid: VPid,
@@ -75,15 +109,10 @@ pub fn virtual_execve_static(
     // Load into memory
     let image = loader::load_pie(&data)?;
 
-    // Build C strings (leaked — must survive the coroutine lifetime)
-    let argv_c = argv
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
-        .collect::<Vec<_>>();
-    let envp_c = envp
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
-        .collect::<Vec<_>>();
+    // Build C strings (cleaned up when coroutine is dropped)
+    let (argv_c, mut argv_raw) = build_c_strings(&argv);
+    let (envp_c, envp_raw) = build_c_strings(&envp);
+    argv_raw.extend(envp_raw);
 
     // Build auxiliary vector
     let auxv = loader::build_auxv(&image, 0);
@@ -107,12 +136,14 @@ pub fn virtual_execve_static(
             auxv,
         )
     });
+    register_elf_c_strings(vpid, argv_raw);
+    unsafe {
+        (*crate::executor::get_global_executor())
+            .register_mapped_region(vpid, image.base, image.total_size);
+    }
 
     Ok(VirtualExec { vpid })
 }
-
-/// Load and execute a dynamically-linked binary using dlopen.
-///
 /// The binary is loaded as a shared object via the dynamic linker.
 /// Its `main` symbol is found and called inside a coroutine.
 pub fn virtual_execve_dynamic(
@@ -137,15 +168,10 @@ pub fn virtual_execve_dynamic(
         return Err(format!("dlsym(main) failed in {}", path));
     }
 
-    // Build C strings
-    let argv_c: Vec<*const u8> = argv
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
-        .collect();
-    let _envp_c: Vec<*const u8> = envp
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
-        .collect();
+    // Build C strings (cleaned up when coroutine is dropped)
+    let (argv_c, mut c_strings) = build_c_strings(&argv);
+    let (_envp_c, envp_raw) = build_c_strings(&envp);
+    c_strings.extend(envp_raw);
 
     // Spawn a regular coroutine that calls main()
     let main_ptr = main_sym;
@@ -158,6 +184,9 @@ pub fn virtual_execve_dynamic(
         let _exit_code = main_fn(argc, argv_ptr, std::ptr::null());
         // TODO: propagate exit code to virtual_waitpid
     }));
+    unsafe {
+        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+    }
 
     Ok(VirtualExec { vpid })
 }
@@ -179,15 +208,10 @@ pub fn virtual_execve_via_entry(
         .map_err(|e| format!("cannot canonicalize {}: {}", path, e))?;
     let real_path_str = real_path.to_str().ok_or("invalid path")?.to_string();
 
-    // Build C strings (leaked — must survive coroutine lifetime)
-    let argv_c: Vec<*const u8> = argv
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
-        .collect();
-    let envp_c: Vec<*const u8> = envp
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
-        .collect();
+    // Build C strings (cleaned up when coroutine is dropped)
+    let (argv_c, mut c_strings) = build_c_strings(&argv);
+    let (envp_c, envp_raw) = build_c_strings(&envp);
+    c_strings.extend(envp_raw);
     let argc = argv_c.len();
 
     // Check if we already have main() cached for this binary
@@ -213,7 +237,7 @@ pub fn virtual_execve_via_entry(
         let re_base = find_loaded_base(path).ok_or("cannot find re-loaded base")?;
         patch_got_for_loaded_binary(re_base, &re_phdrs);
 
-        let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c);
+        let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c, c_strings);
         // Inherit fd table from current coroutine (Linux execve preserves fds)
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
@@ -296,6 +320,7 @@ pub fn virtual_execve_via_entry(
             auxv,
         )
     };
+    register_elf_c_strings(vpid, c_strings);
 
     // Inherit fd table from current coroutine (Linux execve preserves fds)
     if let Some(pid) = current_pid {
@@ -640,13 +665,39 @@ fn spawn_main_coroutine(
     argc: usize,
     argv: Vec<*const u8>,
     envp: Vec<*const u8>,
+    c_strings: Vec<*mut u8>,
 ) -> VPid {
-    crate::spawn(Box::new(move || {
+    let vpid = crate::spawn(Box::new(move || {
         let main_fn: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int =
             unsafe { std::mem::transmute(main_addr) };
         let result = main_fn(argc as c_int, argv.as_ptr(), envp.as_ptr());
         crate::executor::vproc_exit_with_code(result);
-    }))
+    }));
+    unsafe {
+        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+    }
+    vpid
+}
+
+/// Convert Rust strings to C strings, returning both the pointer vec for use
+/// and the raw pointers for later cleanup.
+fn build_c_strings(strings: &[String]) -> (Vec<*const u8>, Vec<*mut u8>) {
+    let mut ptrs = Vec::with_capacity(strings.len());
+    let mut raw = Vec::with_capacity(strings.len());
+    for s in strings {
+        let cs = std::ffi::CString::new(s.as_str()).unwrap();
+        let r = cs.into_raw();
+        ptrs.push(r as *const u8);
+        raw.push(r);
+    }
+    (ptrs, raw)
+}
+
+/// Register C strings for cleanup when a coroutine spawned via spawn_elf is dropped.
+fn register_elf_c_strings(vpid: VPid, c_strings: Vec<*mut u8>) {
+    unsafe {
+        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+    }
 }
 
 /// Write an inline-hook trampoline at `func_addr` that branches to `target`.

@@ -23,6 +23,10 @@ pub struct Coroutine {
     pub exit_code: i32,
     pub is_fork_child: bool,
     pub fork_child_pid: u32,
+    /// C strings allocated for argv/envp. Freed on Drop.
+    pub c_strings: Vec<*mut u8>,
+    /// mmap'd regions to munmap on Drop (base, size).
+    pub mapped_regions: Vec<(usize, usize)>,
 }
 
 // Assembly trampoline: vproc_switch restores x19=f_ptr then `ret` jumps here.
@@ -52,7 +56,16 @@ unsafe extern "C" fn __vproc_entry(f_ptr: *mut u8) {
     // f_ptr is Box<Box<dyn FnOnce()>> — a thin pointer
     let outer = Box::from_raw(f_ptr as *mut Box<dyn FnOnce()>);
     let f: Box<dyn FnOnce()> = *outer;
-    f();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f();
+    }));
+
+    if let Err(_) = result {
+        // Panic caught — exit with 134 (128 + SIGABRT). This context-switches
+        // away and never returns, so the trampoline's `bl vproc_exit` is never reached.
+        crate::executor::vproc_exit_with_code(134);
+    }
 }
 
 impl Coroutine {
@@ -110,6 +123,8 @@ impl Coroutine {
             exit_code: 0,
             is_fork_child: false,
             fork_child_pid: 0,
+            c_strings: Vec::new(),
+            mapped_regions: Vec::new(),
         }
     }
 
@@ -218,6 +233,8 @@ impl Coroutine {
             exit_code: 0,
             is_fork_child: false,
             fork_child_pid: 0,
+            c_strings: Vec::new(),
+            mapped_regions: Vec::new(),
         }
     }
 
@@ -282,12 +299,22 @@ impl Coroutine {
             exit_code: 0,
             is_fork_child: true,
             fork_child_pid: 0,
+            c_strings: Vec::new(),
+            mapped_regions: Vec::new(),
         }
     }
 }
 
 impl Drop for Coroutine {
     fn drop(&mut self) {
+        // Free C strings allocated for argv/envp.
+        for ptr in self.c_strings.drain(..) {
+            unsafe { let _ = std::ffi::CString::from_raw(ptr.cast()); }
+        }
+        // Unmap mmap'd regions (e.g., PIE loader images).
+        for &(base, size) in &self.mapped_regions {
+            unsafe { libc::munmap(base as *mut _, size); }
+        }
         let layout = Layout::from_size_align(self.stack_size, 16).unwrap();
         unsafe { dealloc(self.stack_base, layout) };
     }
