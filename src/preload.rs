@@ -297,6 +297,7 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
     if !enabled() || is_real_fork_child() {
         return raw_wait4(pid, status, options);
     }
+    // Check if this is a virtual process (exists in vproc executor)
     let vpid = pid as u32;
     let is_virtual = {
         let ptr = crate::executor::get_global_executor();

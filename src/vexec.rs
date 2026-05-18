@@ -3,6 +3,7 @@
 use std::alloc::{alloc, Layout};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_int;
+use std::sync::Arc;
 use std::os::raw::c_void;
 use std::sync::Mutex;
 
@@ -12,11 +13,11 @@ use crate::loader;
 
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
 
-#[derive(Clone)]
 struct BinaryCacheEntry {
     main_addr: usize,
     /// Saved writable segment contents (addr, saved_bytes) for state reset.
-    saved_writable: Vec<(usize, Vec<u8>)>,
+    /// Wrapped in Arc so cache lookups don't clone the entire snapshot.
+    saved_writable: Arc<Vec<(usize, Vec<u8>)>>,
 }
 
 /// Cache of loaded binary metadata per canonicalized path.
@@ -179,12 +180,15 @@ pub fn virtual_execve_via_entry(
 
     // Check if we already have main() cached for this binary
     let current_pid = unsafe { (*crate::executor::get_global_executor()).current };
-    let cached = BINARY_CACHE.lock().unwrap().get(&real_path_str).cloned();
+    let cached = {
+        let lock = BINARY_CACHE.lock().unwrap();
+        lock.get(&real_path_str).map(|e| (e.main_addr, Arc::clone(&e.saved_writable)))
+    };
 
-    if let Some(entry) = cached {
+    if let Some((main_addr, saved_writable)) = cached {
         // Binary already initialized — restore writable segments, call main() directly
-        restore_writable_segments(&entry.saved_writable);
-        let vpid = spawn_main_coroutine(entry.main_addr, argc, argv_c, envp_c);
+        restore_writable_segments(&saved_writable);
+        let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c);
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
         }
@@ -221,14 +225,14 @@ pub fn virtual_execve_via_entry(
     hook_libc_execve();
     patch_got_for_loaded_binary(base, &phdrs);
 
-    // Save writable segment state AFTER dlopen/patch but BEFORE _start runs.
-    // This captures the post-constructor, post-GOT-patch state so we can
-    // restore fresh globals on subsequent calls.
+    // Save writable segment state AFTER clear_init_arrays + GOT patch but
+    // BEFORE _start runs. The snapshot has zeroed init_arrays and patched GOT,
+    // which is exactly what subsequent calls need restored before calling main().
     if let Some(main_addr) = extracted {
         let saved = save_writable_segments(base, &phdrs);
         BINARY_CACHE.lock().unwrap().insert(real_path_str.clone(), BinaryCacheEntry {
             main_addr,
-            saved_writable: saved,
+            saved_writable: Arc::new(saved),
         });
     }
 
@@ -382,28 +386,25 @@ fn restore_writable_segments(segments: &[(usize, Vec<u8>)]) {
         let page_end = (addr + size + 0xfff) & !0xfff;
         let page_size = page_end - page_start;
         unsafe {
-            libc::mprotect(
+            if libc::mprotect(
                 page_start as *mut c_void,
                 page_size,
                 libc::PROT_READ | libc::PROT_WRITE,
-            );
-            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, size);
-            // Flush instruction cache in case .text pages were affected
-            let mut off = page_start;
-            while off < page_end {
-                std::arch::asm!(
-                    "dc cvau, {addr}",
-                    "dsb ish",
-                    "ic ivau, {addr}",
-                    addr = in(reg) off,
-                );
-                off += 64; // cache line size
+            ) != 0 {
+                eprintln!("[vexec] mprotect RW failed for {:#x}: {}", page_start, *libc::__errno());
+                continue;
             }
-            libc::mprotect(
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, size);
+            // Restore permissions — writable segments may overlap with RELRO pages
+            // that were originally RWX after dlopen. The original permissions vary
+            // per segment, but RW+EXEC is safe for .data/.bss (.got lives here too).
+            if libc::mprotect(
                 page_start as *mut c_void,
                 page_size,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            );
+            ) != 0 {
+                eprintln!("[vexec] mprotect RWX failed for {:#x}: {}", page_start, *libc::__errno());
+            }
         }
     }
 }
@@ -535,8 +536,8 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 /// Returns the address of main(), or None if the pattern doesn't match.
 unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
     let code = entry_addr as *const u32;
-    // Scan first 32 instructions for adrp x2
-    for i in 0..32 {
+    // Scan first 48 instructions for adrp x2
+    for i in 0..48 {
         let insn = std::ptr::read_unaligned(code.add(i));
         // ADRP x2: opcode 1xx1 0000, rd=2
         if (insn & 0x9F00001F) != 0x90000002 {
@@ -544,7 +545,7 @@ unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
         }
         let adrp_page = decode_adrp(entry_addr + i * 4, insn);
         // Scan forward for ldr x2, [x2, #imm]
-        for j in (i + 1)..std::cmp::min(i + 8, 32) {
+        for j in (i + 1)..std::cmp::min(i + 8, 56) {
             let ldr_insn = std::ptr::read_unaligned(code.add(j));
             // LDR Xt, [Xn, #imm12]: 11 111 0 01 01 imm12(12) Rn(5) Rt(5)
             // With Rt=2 (Rn can be any register, typically x2 after adrp x2)
