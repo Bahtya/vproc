@@ -39,10 +39,10 @@ pub struct Executor {
     main_sp: *mut u8,
     switch_count: u64,
     pub children: HashMap<VPid, Vec<VPid>>,
-    /// Saved (lr_value, lr_addr) for fork LR restoration.
+    /// Saved lr (x30) value for fork LR restoration.
     /// Stored on the heap (Executor is heap-allocated via AtomicPtr),
     /// so it survives stack corruption from dlopen/__libc_init in other coroutines.
-    pub saved_fork_lr: Option<(u64, *mut u64)>,
+    pub saved_fork_lr: Option<u64>,
 }
 
 impl Executor {

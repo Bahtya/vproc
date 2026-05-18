@@ -59,9 +59,6 @@ pub const R_AARCH64_RELATIVE: u32 = 0x403;
 pub const R_AARCH64_GLOB_DAT: u32 = 0x401;
 pub const R_AARCH64_JUMP_SLOT: u32 = 0x402;
 
-// Symbol type (lower 4 bits of st_info)
-pub const STT_FUNC: u8 = 2;
-
 // Auxiliary vector types
 pub const AT_NULL: u64 = 0;
 pub const AT_PHDR: u64 = 3;

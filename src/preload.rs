@@ -1,5 +1,6 @@
 //! LD_PRELOAD interception layer for vproc.
 
+use std::cell::UnsafeCell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -83,8 +84,9 @@ fn enabled() -> bool {
     if v == 1 {
         return true;
     }
-    // Check env every time until we see "1" — the env var may be set
-    // after program start (e.g. std::env::set_var in main).
+    // Keep checking env until we see "1" — VPROC may be set after
+    // program start (e.g. std::env::set_var in main), or during
+    // early init before the env var is visible.
     let val = unsafe { libc::getenv(b"VPROC\0".as_ptr() as *const c_char) };
     let on = !val.is_null() && unsafe { *val == b'1' as _ };
     if on {
@@ -95,13 +97,21 @@ fn enabled() -> bool {
 }
 
 /// Resolve a real libc function via dlsym(RTLD_NEXT).
-unsafe fn real(sym: &'static str) -> *mut c_void {
-    static mut CACHE: [(*const u8, *mut c_void); 32] = [(std::ptr::null(), std::ptr::null_mut()); 32];
-    static mut COUNT: usize = 0;
+/// Uses a dlsym cache with manual synchronization (cooperative scheduling
+/// guarantees single-threaded access; AtomicUsize for count ensures safe init).
+struct DlsymCache(UnsafeCell<[(*const u8, *mut c_void); 32]>);
+unsafe impl Sync for DlsymCache {}
 
-    for i in 0..COUNT {
-        if CACHE[i].0 == sym.as_ptr() {
-            return CACHE[i].1;
+unsafe fn real(sym: &'static str) -> *mut c_void {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CACHE: DlsymCache = DlsymCache(UnsafeCell::new([(std::ptr::null(), std::ptr::null_mut()); 32]));
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    let count = COUNT.load(Ordering::Acquire);
+    let cache = &*CACHE.0.get();
+    for i in 0..count {
+        if cache[i].0 == sym.as_ptr() {
+            return cache[i].1;
         }
     }
 
@@ -112,9 +122,9 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
         libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len());
         libc::_exit(99);
     }
-    if COUNT < 32 {
-        CACHE[COUNT] = (sym.as_ptr(), ptr);
-        COUNT += 1;
+    let idx = COUNT.fetch_add(1, Ordering::AcqRel);
+    if idx < 32 {
+        (*CACHE.0.get())[idx] = (sym.as_ptr(), ptr);
     }
     ptr
 }
@@ -212,7 +222,7 @@ pub extern "C" fn getppid() -> c_int {
     }
     unsafe {
         let ex = &*ptr;
-        match (*ex).current {
+        match ex.current {
             Some(pid) => ex
                 .vprocs
                 .get(&pid)
