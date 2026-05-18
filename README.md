@@ -328,6 +328,54 @@ entry_demo: true→0, false→1, echo→0 ✅
 - 新增 `raise(sig)` 透传
 - Rust + C 双层同步更新
 
+### Phase 10: 管道修复 + 连续 execve ✅
+
+修复管道操作符 `|` 导致的 SIGSEGV 和同一二进制连续 `virtual_execve` 挂起，解除阶段 9 识别的两个关键阻塞问题。
+
+#### 问题 1: 管道 SIGSEGV (issue #1, PR #2)
+
+`sh -c "echo hello | cat"` 触发 SIGSEGV。
+
+**根因**: 虚拟 fork（协程栈复制）+ 虚拟 pipe（内存环形缓冲区）无法满足 shell 的真实 pipe/fork 语义。bionic 的 `waitpid()` 内部调用 `wait4()`，而我们也拦截了 `wait4()`，形成 `waitpid → libc waitpid → libc wait4 → 我们的 wait4 → 我们的 waitpid` 无限递归 → 栈溢出 → SIGSEGV。
+
+**修复**:
+- **真实 fork**: `fork()` 拦截器改用 `dlsym(RTLD_NEXT)` 获取真正的 libc fork（`libc::fork()` 会解析到我们自己的符号），子进程设 `REAL_FORK_CHILD` 标志
+- **真实 pipe**: `pipe()` 始终创建真实 OS 管道
+- **raw wait4 系统调用**: 绕过 libc 直接用 `syscall(__NR_wait4)` 等待真实子进程，消除递归
+- **直通模式**: `REAL_FORK_CHILD` 的所有拦截器（read/write/close/dup/dup2/exit/_exit/execve）直通真实 libc
+
+**验证** — 8 项集成测试全部通过:
+```
+test_simple_echo .............. ok   (echo hello)
+test_sequential_builtins ...... ok   (echo hello; echo world)
+test_pipe_builtin_builtin ..... ok   (echo hello | true)
+test_pipe_builtin_cat ......... ok   (echo hello | cat)
+test_multi_stage_pipe ......... ok   (echo hello world | cat | cat)
+test_subshell_pipe ............ ok   ((echo a; echo b) | cat)
+test_pipe_with_grep ........... ok   (printf 'foo\nbar\nbaz\n' | grep ba)
+```
+
+#### 问题 2: 连续 virtual_execve 挂起 (issue #3, PR #4)
+
+同一进程内第二次调用 `virtual_execve_via_entry("sh", ...)` 挂起。
+
+**根因**:
+1. `extract_main_addr()` 的 LDR 指令掩码 `0xFFC003FF` 检查 Rn=0，但 dash 的 `_start` 用 `ldr x2, [x2, #off]`（Rn=2），导致 main() 地址提取失败
+2. 即使提取成功，直接调用 `main()` 时 shell 的全局变量（job table、fd tracking 等）残留第一次运行的脏状态，初始化挂死
+
+**修复**:
+- **放宽 LDR 掩码**: `0xFFC003FF` → `0xFFC0001F`，只检查 Rt=2 不检查 Rn
+- **寄存器配对**: 改为从 `ldr x2, [xN, #imm]` 反向搜索匹配的 `adrp xN`，支持 `adrp+add` 指令对
+- **可写段快照/恢复**: `BINARY_CACHE` 保存 main 地址 + 所有可写 PT_LOAD 段的完整内容。后续调用先恢复段数据再调 main()，模拟 execve 的"干净进程映像"语义
+- **GOT re-patch**: 段恢复后重新执行 `patch_got_for_loaded_binary()`，确保拦截器在 `__libc_init` 可能的 GOT 修改后仍然生效
+- **原始权限恢复**: `WritableSegment` 记录 PT_LOAD flags，restore 时恢复正确权限而非硬编码 RWX
+- **DlHandle 保留**: cache entry 保存 dlopen handle，为未来多 binary 卸载做准备
+
+**验证**:
+```
+test_sequential_pipe_invocations ... ok  (echo hello | cat → echo world | cat)
+```
+
 ## 当前状态
 
 ### 已验证
@@ -342,13 +390,16 @@ entry_demo: true→0, false→1, echo→0 ✅
 - ✅ **端到端验证**: `sh -c "echo hello"` 完整工作流
 - ✅ 信号拦截（kill/getpgid/setpgid/raise）
 - ✅ 代码清理（0 compiler warnings）
+- ✅ **管道操作符 `|`**: 真实 fork + 真实 pipe + raw wait4（8 项集成测试）
+- ✅ **同一二进制连续 execve**: 可写段快照/恢复 + GOT re-patch
+- ✅ **多阶段管道**: `echo hello | cat | cat` 三级管道通过
+- ✅ **子 shell 管道**: `(echo a; echo b) | cat` 通过
 
 ### 待解决
 
-1. **虚拟 fork + pipe 完整路径**: 管道操作符 `|` 和命令替换 `$()` 的虚拟 pipe I/O 失败
-2. **hermux 集成**: 需要新 FFI 函数 `vproc_ffi_create_process()` 接入 termux.c
-3. **单次 dlopen 限制**: `__libc_init` 只能调用一次，同一二进制不能多次 virtual_execve
-4. **静态 PIE raw syscall**: 直接 `svc #0` 系统调用无法拦截
+1. **hermux 集成**: 需要新 FFI 函数 `vproc_ffi_create_process()` 接入 termux.c
+2. **命令替换 `$()`**: 需要验证管道修复是否同时解决了命令替换
+3. **静态 PIE raw syscall**: 直接 `svc #0` 系统调用无法拦截
 
 ## 文件结构
 
@@ -386,8 +437,10 @@ vproc/
 │   ├── pipe_demo.rs          # 退出码传播 + 虚拟管道演示
 │   ├── e2e_preload.rs        # C preload + Rust runtime E2E 测试
 │   ├── entry_demo.rs         # 解释器委托演示 (加载 Termux 二进制)
-│   └── sh_test.rs            # sh -c "echo hello" 端到端测试
+│   ├── sh_test.rs            # sh -c "echo hello" 端到端测试
+│   └── test_single.rs        # 测试工具，支持多命令顺序执行
 └── tests/
+    ├── pipe_tests.rs         # 管道 + 连续 execve 集成测试 (8 项)
     ├── test_static_pie.S     # 最小 aarch64 静态 PIE (write+exit)
     └── test_fork.c           # fork/waitpid 拦截测试
 ```
