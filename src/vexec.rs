@@ -12,10 +12,19 @@ use crate::loader;
 
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
 
-/// Cache of main() addresses per canonicalized binary path.
-/// After first _start → __libc_init run, we extract main's address from the
-/// GOT so subsequent execve calls skip _start entirely.
-static MAIN_CACHE: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+#[derive(Clone)]
+struct BinaryCacheEntry {
+    main_addr: usize,
+    /// Saved writable segment contents (addr, saved_bytes) for state reset.
+    saved_writable: Vec<(usize, Vec<u8>)>,
+}
+
+/// Cache of loaded binary metadata per canonicalized path.
+/// After the first dlopen + _start run, we save main()'s address and a snapshot
+/// of all writable segments. Subsequent calls restore writable state so the
+/// binary's globals are fresh, then call main() directly — skipping _start
+/// entirely.
+static BINARY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, BinaryCacheEntry>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Result of a virtual_execve operation.
@@ -170,12 +179,12 @@ pub fn virtual_execve_via_entry(
 
     // Check if we already have main() cached for this binary
     let current_pid = unsafe { (*crate::executor::get_global_executor()).current };
-    let cached_main = MAIN_CACHE.lock().unwrap().get(&real_path_str).copied();
+    let cached = BINARY_CACHE.lock().unwrap().get(&real_path_str).cloned();
 
-    if let Some(main_addr) = cached_main {
-        // Binary already initialized — call main() directly, skip _start/__libc_init
-        let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c);
-        // Inherit fd table from current coroutine (Linux execve preserves fds)
+    if let Some(entry) = cached {
+        // Binary already initialized — restore writable segments, call main() directly
+        restore_writable_segments(&entry.saved_writable);
+        let vpid = spawn_main_coroutine(entry.main_addr, argc, argv_c, envp_c);
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
         }
@@ -205,14 +214,23 @@ pub fn virtual_execve_via_entry(
     let entry_addr = base + e_entry;
 
     // Extract main() address from _start instructions before running it
-    if let Some(main_addr) = unsafe { extract_main_addr(entry_addr) } {
-        MAIN_CACHE.lock().unwrap().insert(real_path_str, main_addr);
-    }
+    let extracted = unsafe { extract_main_addr(entry_addr) };
 
     clear_init_arrays(base, &phdrs);
     hook_libc_exit();
     hook_libc_execve();
     patch_got_for_loaded_binary(base, &phdrs);
+
+    // Save writable segment state AFTER dlopen/patch but BEFORE _start runs.
+    // This captures the post-constructor, post-GOT-patch state so we can
+    // restore fresh globals on subsequent calls.
+    if let Some(main_addr) = extracted {
+        let saved = save_writable_segments(base, &phdrs);
+        BINARY_CACHE.lock().unwrap().insert(real_path_str.clone(), BinaryCacheEntry {
+            main_addr,
+            saved_writable: saved,
+        });
+    }
 
     let image = loader::LoadedImage {
         base,
@@ -324,6 +342,68 @@ fn clear_init_arrays(base: usize, phdrs: &[elf::Phdr]) {
                 unsafe { std::ptr::write_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_val), 0) };
             }
             _ => {}
+        }
+    }
+}
+
+/// Save contents of all writable PT_LOAD segments of the loaded binary.
+/// Called after dlopen + GOT patching, before _start runs, so the snapshot
+/// captures the correct initial state.
+fn save_writable_segments(base: usize, phdrs: &[elf::Phdr]) -> Vec<(usize, Vec<u8>)> {
+    let mut segments = Vec::new();
+    for phdr in phdrs {
+        if phdr.p_type != elf::PT_LOAD {
+            continue;
+        }
+        if phdr.p_flags & elf::PF_W == 0 {
+            continue;
+        }
+        let addr = base + (phdr.p_vaddr as usize);
+        let size = phdr.p_memsz as usize;
+        if size == 0 {
+            continue;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
+        segments.push((addr, slice.to_vec()));
+    }
+    segments
+}
+
+/// Restore writable segment contents from a saved snapshot.
+/// Re-mprotects pages writable, writes data, restores permissions.
+fn restore_writable_segments(segments: &[(usize, Vec<u8>)]) {
+    for &(addr, ref data) in segments {
+        let size = data.len();
+        if size == 0 {
+            continue;
+        }
+        // Page-align
+        let page_start = addr & !0xfff;
+        let page_end = (addr + size + 0xfff) & !0xfff;
+        let page_size = page_end - page_start;
+        unsafe {
+            libc::mprotect(
+                page_start as *mut c_void,
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, size);
+            // Flush instruction cache in case .text pages were affected
+            let mut off = page_start;
+            while off < page_end {
+                std::arch::asm!(
+                    "dc cvau, {addr}",
+                    "dsb ish",
+                    "ic ivau, {addr}",
+                    addr = in(reg) off,
+                );
+                off += 64; // cache line size
+            }
+            libc::mprotect(
+                page_start as *mut c_void,
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            );
         }
     }
 }
@@ -467,8 +547,8 @@ unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
         for j in (i + 1)..std::cmp::min(i + 8, 32) {
             let ldr_insn = std::ptr::read_unaligned(code.add(j));
             // LDR Xt, [Xn, #imm12]: 11 111 0 01 01 imm12(12) Rn(5) Rt(5)
-            // With Rt=2, Rn=2
-            if (ldr_insn & 0xFFC003FF) == 0xF9400002 {
+            // With Rt=2 (Rn can be any register, typically x2 after adrp x2)
+            if (ldr_insn & 0xFFC0001F) == 0xF9400002 {
                 let imm12 = ((ldr_insn >> 10) & 0xFFF) as usize;
                 let got_addr = adrp_page + imm12 * 8;
                 let main_addr = std::ptr::read_unaligned(got_addr as *const usize);
