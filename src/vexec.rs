@@ -13,11 +13,23 @@ use crate::loader;
 
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
 
+struct DlHandle(*mut c_void);
+unsafe impl Send for DlHandle {}
+unsafe impl Sync for DlHandle {}
+
 struct BinaryCacheEntry {
     main_addr: usize,
-    /// Saved writable segment contents (addr, saved_bytes) for state reset.
+    handle: DlHandle,
+    /// Saved writable segment contents and their original mprotect permissions.
     /// Wrapped in Arc so cache lookups don't clone the entire snapshot.
-    saved_writable: Arc<Vec<(usize, Vec<u8>)>>,
+    saved_writable: Arc<Vec<WritableSegment>>,
+}
+
+struct WritableSegment {
+    addr: usize,
+    data: Vec<u8>,
+    /// Original permissions from PT_LOAD flags (PF_R|PF_W|PF_X).
+    orig_flags: u32,
 }
 
 /// Cache of loaded binary metadata per canonicalized path.
@@ -182,12 +194,25 @@ pub fn virtual_execve_via_entry(
     let current_pid = unsafe { (*crate::executor::get_global_executor()).current };
     let cached = {
         let lock = BINARY_CACHE.lock().unwrap();
-        lock.get(&real_path_str).map(|e| (e.main_addr, Arc::clone(&e.saved_writable)))
+        lock.get(&real_path_str).map(|e| (e.main_addr, Arc::clone(&e.saved_writable), e.handle.0))
     };
 
-    if let Some((main_addr, saved_writable)) = cached {
-        // Binary already initialized — restore writable segments, call main() directly
+    if let Some((main_addr, saved_writable, _handle)) = cached {
+        // Binary already initialized — restore writable segments and re-patch GOT,
+        // then call main() directly, skipping _start/__libc_init.
         restore_writable_segments(&saved_writable);
+
+        // Re-read ELF to get phdrs for GOT re-patching after restore.
+        // The snapshot was taken before _start ran, so __libc_init may have
+        // modified GOT entries (e.g. resolved lazy bindings). Restore brings
+        // back the pre-_start GOT, so we must re-apply our hooks.
+        let re_data = std::fs::read(&real_path)
+            .map_err(|e| format!("cannot read {}: {}", path, e))?;
+        let re_hdr = elf::parse_header(&re_data)?;
+        let re_phdrs = elf::program_headers(&re_data, &re_hdr)?;
+        let re_base = find_loaded_base(path).ok_or("cannot find re-loaded base")?;
+        patch_got_for_loaded_binary(re_base, &re_phdrs);
+
         let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c);
         // Inherit fd table from current coroutine (Linux execve preserves fds)
         if let Some(pid) = current_pid {
@@ -233,6 +258,7 @@ pub fn virtual_execve_via_entry(
         let saved = save_writable_segments(base, &phdrs);
         BINARY_CACHE.lock().unwrap().insert(real_path_str.clone(), BinaryCacheEntry {
             main_addr,
+            handle: DlHandle(handle),
             saved_writable: Arc::new(saved),
         });
     }
@@ -352,9 +378,8 @@ fn clear_init_arrays(base: usize, phdrs: &[elf::Phdr]) {
 }
 
 /// Save contents of all writable PT_LOAD segments of the loaded binary.
-/// Called after dlopen + GOT patching, before _start runs, so the snapshot
-/// captures the correct initial state.
-fn save_writable_segments(base: usize, phdrs: &[elf::Phdr]) -> Vec<(usize, Vec<u8>)> {
+/// Records original PT_LOAD flags so restore can set correct permissions.
+fn save_writable_segments(base: usize, phdrs: &[elf::Phdr]) -> Vec<WritableSegment> {
     let mut segments = Vec::new();
     for phdr in phdrs {
         if phdr.p_type != elf::PT_LOAD {
@@ -369,24 +394,29 @@ fn save_writable_segments(base: usize, phdrs: &[elf::Phdr]) -> Vec<(usize, Vec<u
             continue;
         }
         let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
-        segments.push((addr, slice.to_vec()));
+        segments.push(WritableSegment {
+            addr,
+            data: slice.to_vec(),
+            orig_flags: phdr.p_flags,
+        });
     }
     segments
 }
 
 /// Restore writable segment contents from a saved snapshot.
-/// Re-mprotects pages writable, writes data, restores permissions.
-fn restore_writable_segments(segments: &[(usize, Vec<u8>)]) {
-    for &(addr, ref data) in segments {
-        let size = data.len();
+/// Re-mprotects pages writable, writes data, then restores original permissions
+/// derived from PT_LOAD flags.
+fn restore_writable_segments(segments: &[WritableSegment]) {
+    for seg in segments {
+        let size = seg.data.len();
         if size == 0 {
             continue;
         }
-        // Page-align
-        let page_start = addr & !0xfff;
-        let page_end = (addr + size + 0xfff) & !0xfff;
+        let page_start = seg.addr & !0xfff;
+        let page_end = (seg.addr + size + 0xfff) & !0xfff;
         let page_size = page_end - page_start;
         unsafe {
+            // Make writable for restore
             if libc::mprotect(
                 page_start as *mut c_void,
                 page_size,
@@ -395,16 +425,24 @@ fn restore_writable_segments(segments: &[(usize, Vec<u8>)]) {
                 eprintln!("[vexec] mprotect RW failed for {:#x}: {}", page_start, *libc::__errno());
                 continue;
             }
-            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, size);
-            // Restore permissions — writable segments may overlap with RELRO pages
-            // that were originally RWX after dlopen. The original permissions vary
-            // per segment, but RW+EXEC is safe for .data/.bss (.got lives here too).
+            std::ptr::copy_nonoverlapping(seg.data.as_ptr(), seg.addr as *mut u8, size);
+
+            // Restore to original permissions from PT_LOAD flags
+            let mut prot = 0u32;
+            if seg.orig_flags & elf::PF_R != 0 { prot |= libc::PROT_READ as u32; }
+            if seg.orig_flags & elf::PF_W != 0 { prot |= libc::PROT_WRITE as u32; }
+            if seg.orig_flags & elf::PF_X != 0 { prot |= libc::PROT_EXEC as u32; }
+            // Writable segments containing GOT need at least RW for future
+            // lazy binding resolution; ensure W is preserved.
+            if prot & (libc::PROT_WRITE as u32) == 0 {
+                prot |= libc::PROT_WRITE as u32;
+            }
             if libc::mprotect(
                 page_start as *mut c_void,
                 page_size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                prot as c_int,
             ) != 0 {
-                eprintln!("[vexec] mprotect RWX failed for {:#x}: {}", page_start, *libc::__errno());
+                eprintln!("[vexec] mprotect restore failed for {:#x}: {}", page_start, *libc::__errno());
             }
         }
     }
@@ -529,34 +567,57 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 /// Extract main() address from _start's instruction sequence.
 ///
 /// On bionic aarch64, _start loads main's address into x2 via:
-///   adrp x2, <page>
-///   ... (other instructions setting x0, x1, x3)
-///   ldr  x2, [x2, #<offset>]   // x2 = GOT entry for main
-///   bl   __libc_init@plt
+///   adrp xN, <page>
+///   add  xN, xN, #<addend>     (optional, for large offsets)
+///   ...
+///   ldr  x2, [xN, #<offset>]   // x2 = GOT entry for main
+///   bl   __libc_init
 ///
-/// Returns the address of main(), or None if the pattern doesn't match.
+/// We scan for `ldr x2, [xN, #imm]` (Rt=2, any Rn), then search backward
+/// for the matching `adrp xN` (and optional `add xN, xN, #imm`) to compute
+/// the correct GOT address.
 unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
     let code = entry_addr as *const u32;
-    // Scan first 48 instructions for adrp x2
+    // Scan first 48 instructions for ldr x2, [xN, #imm12]
     for i in 0..48 {
         let insn = std::ptr::read_unaligned(code.add(i));
-        // ADRP x2: opcode 1xx1 0000, rd=2
-        if (insn & 0x9F00001F) != 0x90000002 {
+        // LDR Xt, [Xn, #imm12]: 11 111 0 01 01 imm12(12) Rn(5) Rt(5)
+        // Rt must be 2 (x2), Rn can be any register
+        if (insn & 0xFFC0001F) != 0xF9400002 {
             continue;
         }
-        let adrp_page = decode_adrp(entry_addr + i * 4, insn);
-        // Scan forward for ldr x2, [x2, #imm]
-        for j in (i + 1)..std::cmp::min(i + 8, 56) {
-            let ldr_insn = std::ptr::read_unaligned(code.add(j));
-            // LDR Xt, [Xn, #imm12]: 11 111 0 01 01 imm12(12) Rn(5) Rt(5)
-            // With Rt=2 (Rn can be any register, typically x2 after adrp x2)
-            if (ldr_insn & 0xFFC0001F) == 0xF9400002 {
-                let imm12 = ((ldr_insn >> 10) & 0xFFF) as usize;
-                let got_addr = adrp_page + imm12 * 8;
-                let main_addr = std::ptr::read_unaligned(got_addr as *const usize);
-                if main_addr != 0 && main_addr % 4 == 0 {
-                    return Some(main_addr);
+        let rn = ((insn >> 5) & 0x1F) as u32;
+        let ldr_imm12 = ((insn >> 10) & 0xFFF) as usize;
+
+        // Search backward for adrp xN
+        for j in (0..i).rev() {
+            let adrp_insn = std::ptr::read_unaligned(code.add(j));
+            // ADRP xN: opcode 1xx1 0000, rd=N
+            if (adrp_insn & 0x9F000000) != 0x90000000 {
+                continue;
+            }
+            if (adrp_insn & 0x1F) != rn {
+                continue;
+            }
+            let adrp_page = decode_adrp(entry_addr + j * 4, adrp_insn);
+
+            // Check for add xN, xN, #imm12 between adrp and ldr (adrp+add pair)
+            let mut addend: usize = 0;
+            for k in (j + 1)..i {
+                let mid = std::ptr::read_unaligned(code.add(k));
+                // ADD Xd, Xn, #imm12: 1 00 100010 0 imm12(12) Rn(5) Rd(5)
+                if (mid & 0xFFC00000) == 0x91000000
+                    && (mid & 0x1F) == rn
+                    && ((mid >> 5) & 0x1F) == rn
+                {
+                    addend = ((mid >> 10) & 0xFFF) as usize;
                 }
+            }
+
+            let got_addr = adrp_page + addend + ldr_imm12 * 8;
+            let main_addr = std::ptr::read_unaligned(got_addr as *const usize);
+            if main_addr != 0 && main_addr % 4 == 0 {
+                return Some(main_addr);
             }
         }
     }
