@@ -14,23 +14,16 @@ fn main() {
     let envp: Vec<String> = std::env::vars().map(|(k, v)| format!("{}={}", k, v)).collect();
 
     println!("=== sh -c \"echo hello\" test ===");
-    eprintln!("[debug] about to call virtual_execve_via_entry");
 
     match vproc::vexec::virtual_execve_via_entry(shell, argv, envp) {
         Ok(exec) => {
-            eprintln!("[debug] spawned shell vpid={}", exec.vpid);
-            let mut tries = 0;
             loop {
-                tries += 1;
                 match vproc::get_exit_code(exec.vpid) {
                     Some(code) => {
                         println!("[parent] shell exited with {}", code);
                         break;
                     }
                     None => {
-                        if tries <= 5 {
-                            eprintln!("[debug] yield #{}, shell not done yet", tries);
-                        }
                         vproc::r#yield();
                     }
                 }

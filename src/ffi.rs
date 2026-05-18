@@ -184,19 +184,27 @@ pub extern "C" fn vproc_ffi_dup2(vpid: u32, old_fd: c_int, new_fd: c_int) -> c_i
 /// Get the current virtual process ID. Returns real PID if not in a coroutine.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_getpid() -> u32 {
-    crate::executor::EXECUTOR.with(|e| unsafe {
-        match (*e.get()).current {
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return unsafe { libc::getpid() as u32 };
+    }
+    unsafe {
+        match (*ptr).current {
             Some(pid) => pid,
             None => libc::getpid() as u32,
         }
-    })
+    }
 }
 
 /// Get the parent virtual process ID. Returns real PPID if not in a coroutine.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_getppid() -> u32 {
-    crate::executor::EXECUTOR.with(|e| unsafe {
-        let ex = &*e.get();
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return unsafe { libc::getppid() as u32 };
+    }
+    unsafe {
+        let ex = &*ptr;
         match ex.current {
             Some(pid) => ex
                 .vprocs
@@ -205,7 +213,7 @@ pub extern "C" fn vproc_ffi_getppid() -> u32 {
                 .unwrap_or(0),
             None => libc::getppid() as u32,
         }
-    })
+    }
 }
 
 /// Virtual execve — load and execute an ELF binary in a coroutine.
@@ -249,6 +257,12 @@ pub extern "C" fn vproc_ffi_execve(
 /// resumes inside this function after do_yield() and returns 0 via
 /// fork_child_pid (initialized to 0 by fork_from).
 ///
+/// Virtual fork — create a child coroutine by copying the parent's stack.
+///
+/// **Deprecated:** preload.rs fork() now uses real OS fork for memory isolation.
+/// This function is retained for the FFI API but is no longer called from the
+/// main interception path.
+///
 /// # Safety limitation
 ///
 /// vproc_switch only saves callee-saved registers (x19-x30, d8-d15).
@@ -283,16 +297,12 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
     // minimizing the window where other coroutines can corrupt our stack.
     let parent_pid = ex.current.unwrap();
 
-    // Save the return address that our prologue stored on the stack.
-    // Other coroutines (specifically those doing dlopen/__libc_init) can
-    // corrupt our stack while we're yielded, so we save lr to the Executor
-    // (heap-allocated, immune to stack corruption) and restore it after yield.
+    // Save lr directly from x30 register to the Executor (heap-allocated,
+    // immune to stack corruption from dlopen/__libc_init in other coroutines).
     unsafe {
-        let sp_val: usize;
-        std::arch::asm!("mov {}, sp", out(reg) sp_val);
-        let lr_addr = (sp_val + 24) as *mut u64;
-        let lr_value = *lr_addr;
-        (*crate::executor::get_global_executor()).saved_fork_lr = Some((lr_value, lr_addr));
+        let lr_value: u64;
+        std::arch::asm!("mov {}, x30", out(reg) lr_value);
+        (*crate::executor::get_global_executor()).saved_fork_lr = Some(lr_value);
     }
 
     crate::spawn_front(Box::new(move || {
@@ -304,12 +314,12 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
     crate::executor::do_yield();
 
     // Phase 3: restore lr if corrupted during yield by dlopen/__libc_init.
-    // Read from Executor (heap) rather than local stack vars.
     unsafe {
-        let ex = &mut *crate::executor::get_global_executor();
-        if let Some((lr_val, lr_addr)) = ex.saved_fork_lr.take() {
-            if *lr_addr != lr_val {
-                *lr_addr = lr_val;
+        if let Some(lr_val) = (*crate::executor::get_global_executor()).saved_fork_lr.take() {
+            let current_lr: u64;
+            std::arch::asm!("mov {}, x30", out(reg) current_lr);
+            if current_lr != lr_val {
+                std::arch::asm!("mov x30, {}", in(reg) lr_val);
             }
         }
     }

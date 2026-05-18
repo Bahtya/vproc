@@ -249,6 +249,29 @@ impl Coroutine {
         let sp_offset = parent.sp.offset_from(parent.stack_base) as usize;
         let child_sp = child_stack_base.add(sp_offset);
 
+        // Remap frame pointers and stack references: scan all 8-byte values
+        // in the child's stack that point into the parent's stack range and
+        // adjust them to point to the equivalent location in the child's stack.
+        let parent_base = parent.stack_base as usize;
+        let parent_end = parent_base + parent.stack_size;
+        let child_base = child_stack_base as usize;
+        let delta = child_base as isize - parent_base as isize;
+
+        // Scan from sp to stack_top (the active region).
+        // Values below sp are uninitialized and don't need remapping.
+        let scan_start = child_sp;
+        let scan_end = child_stack_base.add(parent.stack_size);
+        let mut p = scan_start as *mut u64;
+        let end = scan_end as *mut u64;
+        while p < end {
+            let val = p.read();
+            if val >= parent_base as u64 && val < parent_end as u64 {
+                let remapped = (val as i64 + delta as i64) as u64;
+                p.write(remapped);
+            }
+            p = p.add(1);
+        }
+
         Coroutine {
             id: child_id,
             ppid: parent.id,

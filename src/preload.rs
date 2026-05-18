@@ -1,5 +1,6 @@
 //! LD_PRELOAD interception layer for vproc.
 
+use std::cell::UnsafeCell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -64,7 +65,6 @@ extern "C" fn crash_handler(
         fp = unsafe { std::ptr::read_unaligned(fp as *const usize) };
     }
 
-    // Re-raise to get core dump / default behavior
     unsafe {
         libc::_exit(128 + sig);
     }
@@ -83,8 +83,9 @@ fn enabled() -> bool {
     if v == 1 {
         return true;
     }
-    // Check env every time until we see "1" — the env var may be set
-    // after program start (e.g. std::env::set_var in main).
+    // Keep checking env until we see "1" — VPROC may be set after
+    // program start (e.g. std::env::set_var in main), or during
+    // early init before the env var is visible.
     let val = unsafe { libc::getenv(b"VPROC\0".as_ptr() as *const c_char) };
     let on = !val.is_null() && unsafe { *val == b'1' as _ };
     if on {
@@ -95,13 +96,21 @@ fn enabled() -> bool {
 }
 
 /// Resolve a real libc function via dlsym(RTLD_NEXT).
-unsafe fn real(sym: &'static str) -> *mut c_void {
-    static mut CACHE: [(*const u8, *mut c_void); 32] = [(std::ptr::null(), std::ptr::null_mut()); 32];
-    static mut COUNT: usize = 0;
+/// Uses a dlsym cache with manual synchronization (cooperative scheduling
+/// guarantees single-threaded access; AtomicUsize for count ensures safe init).
+struct DlsymCache(UnsafeCell<[(*const u8, *mut c_void); 32]>);
+unsafe impl Sync for DlsymCache {}
 
-    for i in 0..COUNT {
-        if CACHE[i].0 == sym.as_ptr() {
-            return CACHE[i].1;
+unsafe fn real(sym: &'static str) -> *mut c_void {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CACHE: DlsymCache = DlsymCache(UnsafeCell::new([(std::ptr::null(), std::ptr::null_mut()); 32]));
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    let count = COUNT.load(Ordering::Acquire);
+    let cache = &*CACHE.0.get();
+    for i in 0..count {
+        if cache[i].0 == sym.as_ptr() {
+            return cache[i].1;
         }
     }
 
@@ -112,9 +121,9 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
         libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len());
         libc::_exit(99);
     }
-    if COUNT < 32 {
-        CACHE[COUNT] = (sym.as_ptr(), ptr);
-        COUNT += 1;
+    let idx = COUNT.fetch_add(1, Ordering::AcqRel);
+    if idx < 32 {
+        (*CACHE.0.get())[idx] = (sym.as_ptr(), ptr);
     }
     ptr
 }
@@ -128,12 +137,23 @@ fn current_vpid() -> Option<crate::coroutine::VPid> {
 }
 
 // ---------------------------------------------------------------------------
+// Real fork child flag — set in child after real fork(), checked by all
+// interceptors to pass through to real syscalls.
+// ---------------------------------------------------------------------------
+
+static REAL_FORK_CHILD: AtomicBool = AtomicBool::new(false);
+
+fn is_real_fork_child() -> bool {
+    REAL_FORK_CHILD.load(Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
 // exit() / _exit()
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn _exit(code: c_int) -> ! {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
             f(code);
@@ -154,7 +174,7 @@ pub extern "C" fn _exit(code: c_int) -> ! {
 
 #[no_mangle]
 pub extern "C" fn exit(code: c_int) -> ! {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
             f(code);
@@ -212,7 +232,7 @@ pub extern "C" fn getppid() -> c_int {
     }
     unsafe {
         let ex = &*ptr;
-        match (*ex).current {
+        match ex.current {
             Some(pid) => ex
                 .vprocs
                 .get(&pid)
@@ -227,7 +247,7 @@ pub extern "C" fn getppid() -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// fork() / vfork() — virtual fork
+// fork() / vfork() — use real fork for memory isolation
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
@@ -238,8 +258,16 @@ pub extern "C" fn fork() -> c_int {
             return f();
         }
     }
-    let r = crate::ffi::vproc_ffi_fork() as c_int;
-    r
+    // Use real() (dlsym RTLD_NEXT) to get the true libc fork,
+    // not libc::fork() which would resolve to our own symbol.
+    let pid = unsafe {
+        let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+        f()
+    };
+    if pid == 0 {
+        REAL_FORK_CHILD.store(true, Ordering::SeqCst);
+    }
+    pid
 }
 
 #[no_mangle]
@@ -251,16 +279,37 @@ pub extern "C" fn vfork() -> c_int {
 // waitpid() / wait4()
 // ---------------------------------------------------------------------------
 
+/// Raw wait4 syscall — bypasses libc entirely to avoid waitpid→wait4 recursion.
+#[cfg(target_arch = "aarch64")]
+fn raw_wait4(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
+    let ret = unsafe {
+        libc::syscall(260, pid, status, options, 0usize) // __NR_wait4
+    };
+    if ret < 0 {
+        unsafe { *libc::__errno() = (-ret) as c_int; }
+        return -1;
+    }
+    ret as c_int
+}
+
 #[no_mangle]
 pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
-    if !enabled() {
-        unsafe {
-            let f: extern "C" fn(c_int, *mut c_int, c_int) -> c_int =
-                std::mem::transmute(real("waitpid\0"));
-            return f(pid, status, options);
-        }
+    if !enabled() || is_real_fork_child() {
+        return raw_wait4(pid, status, options);
     }
+    // Check if this is a virtual process (exists in vproc executor)
     let vpid = pid as u32;
+    let is_virtual = {
+        let ptr = crate::executor::get_global_executor();
+        !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
+    };
+    if !is_virtual {
+        // Real child process — use raw wait4 syscall to avoid recursion:
+        // libc waitpid() internally calls wait4(), which we also intercept,
+        // causing waitpid → libc waitpid → libc wait4 → our wait4 → our waitpid.
+        return raw_wait4(pid, status, options);
+    }
+    // Virtual process — spin/yield until done
     loop {
         if let Some(code) = crate::executor::get_exit_code(vpid) {
             if !status.is_null() {
@@ -286,7 +335,9 @@ pub extern "C" fn wait4(
     options: c_int,
     _rusage: *mut c_void,
 ) -> c_int {
-    waitpid(pid, status, options)
+    // Use raw syscall directly — delegating to waitpid() would re-enter
+    // our interceptor and potentially trigger the waitpid→wait4 recursion.
+    raw_wait4(pid, status, options)
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +353,7 @@ pub extern "C" fn execve(
     EXECVE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
 
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         // Use raw syscall to avoid recursion with hook_libc_execve
         unsafe {
             let ret: isize;
@@ -358,20 +409,12 @@ pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
             return f(fds);
         }
     }
-    let vpid = match current_vpid() {
-        Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
-            return f(fds);
-        }
-    };
-    let table = crate::vfd::get_or_create_table(vpid);
-    let (read_fd, write_fd) = table.create_pipe();
+    // Use real pipe() so that real fork() children inherit working pipe fds.
+    // Virtual pipes can't cross real fork() boundaries.
     unsafe {
-        *fds = read_fd as c_int;
-        *fds.add(1) = write_fd as c_int;
+        let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
+        f(fds)
     }
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +423,7 @@ pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
                 std::mem::transmute(real("read\0"));
@@ -433,7 +476,7 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
 
 #[no_mangle]
 pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
                 std::mem::transmute(real("write\0"));
@@ -493,7 +536,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
 
 #[no_mangle]
 pub extern "C" fn close(fd: c_int) -> c_int {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
             return f(fd);
@@ -534,7 +577,7 @@ pub extern "C" fn close(fd: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn dup(old_fd: c_int) -> c_int {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("dup\0"));
             return f(old_fd);
@@ -565,7 +608,7 @@ pub extern "C" fn dup(old_fd: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
-    if !enabled() {
+    if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("dup2\0"));
             return f(old_fd, new_fd);

@@ -234,6 +234,9 @@ pub fn virtual_execve_via_entry(
 
     let vpid = unsafe {
         let ex = &mut *crate::executor::get_global_executor();
+        // Pin executor to global pointer so it survives TLS reinitialization
+        // when __libc_init runs inside the dlopen'd binary's _start.
+        crate::executor::set_global_executor(ex as *mut _);
         ex.spawn_elf(
             entry_addr,
             stack_base,
@@ -432,6 +435,13 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
     for &(got_entry, our_addr) in &patches {
         unsafe { std::ptr::write_unaligned(got_entry, our_addr); }
     }
+
+    // Restore GOT pages to read-only
+    for &page in &pages {
+        unsafe {
+            libc::mprotect(page as *mut c_void, 0x2000, libc::PROT_READ);
+        }
+    }
 }
 
 /// Extract main() address from _start's instruction sequence.
@@ -462,7 +472,7 @@ unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
                 let imm12 = ((ldr_insn >> 10) & 0xFFF) as usize;
                 let got_addr = adrp_page + imm12 * 8;
                 let main_addr = std::ptr::read_unaligned(got_addr as *const usize);
-                if main_addr > 0x10000 {
+                if main_addr != 0 && main_addr % 4 == 0 {
                     return Some(main_addr);
                 }
             }
@@ -517,23 +527,27 @@ unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
     std::ptr::write_unaligned(code.add(1), 0xD61F0200); // br x16
     std::ptr::write_unaligned(code.add(2) as *mut usize, target);
 
-    // Flush instruction cache for all 16 bytes
-    for off in (0..16).step_by(8) {
+    // Flush instruction cache for all 16 bytes (two 8-byte lines)
+    for off in [0, 8] {
         std::arch::asm!(
             "dc cvau, {addr}",
             "dsb ish",
             "ic ivau, {addr}",
             "dsb ish",
+            "isb",
             addr = in(reg) func_addr + off,
         );
     }
-    std::arch::asm!("isb");
     true
 }
 
 /// Inline-hook libc's exit() by overwriting its first instructions
 /// with a branch to our interceptor.
 fn hook_libc_exit() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let rtld_next = -1isize as *mut c_void;
     unsafe {
         let original = libc::dlsym(rtld_next, b"exit\0".as_ptr() as *const std::os::raw::c_char);
@@ -545,6 +559,10 @@ fn hook_libc_exit() {
 /// Inline-hook libc's execve() by overwriting its first instructions
 /// with a branch to our interceptor.
 fn hook_libc_execve() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let rtld_next = -1isize as *mut c_void;
     unsafe {
         let original = libc::dlsym(rtld_next, b"execve\0".as_ptr() as *const std::os::raw::c_char);
