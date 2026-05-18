@@ -1,14 +1,22 @@
 //! Virtual execve — load and execute ELF binaries inside coroutines.
 
 use std::alloc::{alloc, Layout};
+use std::collections::HashMap;
 use std::ffi::c_int;
 use std::os::raw::c_void;
+use std::sync::Mutex;
 
 use crate::coroutine::VPid;
 use crate::elf;
 use crate::loader;
 
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
+
+/// Cache of main() addresses per canonicalized binary path.
+/// After first _start → __libc_init run, we extract main's address from the
+/// GOT so subsequent execve calls skip _start entirely.
+static MAIN_CACHE: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Result of a virtual_execve operation.
 pub struct VirtualExec {
@@ -145,39 +153,9 @@ pub fn virtual_execve_via_entry(
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<VirtualExec, String> {
-    // Parse ELF header to get e_entry
-    let data = std::fs::read(path)
-        .map_err(|e| format!("cannot read {}: {}", path, e))?;
-    let hdr = elf::parse_header(&data)?;
-    let e_entry = hdr.e_entry as usize;
-    let phdrs = elf::program_headers(&data, &hdr)?;
-
-    // dlopen — dynamic linker loads all dependencies and resolves relocations
-    let c_path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
-    let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-    if handle.is_null() {
-        let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) }
-            .to_string_lossy()
-            .into_owned();
-        return Err(format!("dlopen({}): {}", path, err));
-    }
-
-    // Find loaded base address via dl_iterate_phdr
-    let base = find_loaded_base(path).ok_or_else(|| format!(
-        "dlopen({}) succeeded but dl_iterate_phdr cannot find it", path
-    ))?;
-
-    let entry_addr = base + e_entry;
-
-    // Clear DT_INIT_ARRAY / DT_INIT to prevent double constructor execution
-    // (dlopen already called them, _start would call them again)
-    clear_init_arrays(base, &phdrs);
-
-    // Inline-hook libc's exit() and _exit() so that when __libc_init calls
-    // exit(result), it goes to our interceptor instead of killing the process.
-    // GOT patching the binary alone isn't enough because __libc_init is in
-    // libc.so and calls exit() directly (not through PLT).
-    hook_libc_exit();
+    let real_path = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot canonicalize {}: {}", path, e))?;
+    let real_path_str = real_path.to_str().ok_or("invalid path")?.to_string();
 
     // Build C strings (leaked — must survive coroutine lifetime)
     let argv_c: Vec<*const u8> = argv
@@ -188,8 +166,54 @@ pub fn virtual_execve_via_entry(
         .iter()
         .map(|s| std::ffi::CString::new(s.as_str()).unwrap().into_raw() as *const u8)
         .collect();
+    let argc = argv_c.len();
 
-    // Build auxv for the loaded binary
+    // Check if we already have main() cached for this binary
+    let current_pid = unsafe { (*crate::executor::get_global_executor()).current };
+    let cached_main = MAIN_CACHE.lock().unwrap().get(&real_path_str).copied();
+
+    if let Some(main_addr) = cached_main {
+        // Binary already initialized — call main() directly, skip _start/__libc_init
+        let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c);
+        // Inherit fd table from current coroutine (Linux execve preserves fds)
+        if let Some(pid) = current_pid {
+            crate::vfd::fork_fd_table(pid, vpid);
+        }
+        return Ok(VirtualExec { vpid });
+    }
+
+    // First time: need to dlopen and run _start
+    let data = std::fs::read(&real_path)
+        .map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let hdr = elf::parse_header(&data)?;
+    let e_entry = hdr.e_entry as usize;
+    let phdrs = elf::program_headers(&data, &hdr)?;
+
+    let c_path = std::ffi::CString::new(real_path_str.clone()).map_err(|e| e.to_string())?;
+    let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) }
+            .to_string_lossy()
+            .into_owned();
+        return Err(format!("dlopen({}): {}", path, err));
+    }
+
+    let base = find_loaded_base(path).ok_or_else(|| format!(
+        "dlopen({}) succeeded but dl_iterate_phdr cannot find it", path
+    ))?;
+
+    let entry_addr = base + e_entry;
+
+    // Extract main() address from _start instructions before running it
+    if let Some(main_addr) = unsafe { extract_main_addr(entry_addr) } {
+        MAIN_CACHE.lock().unwrap().insert(real_path_str, main_addr);
+    }
+
+    clear_init_arrays(base, &phdrs);
+    hook_libc_exit();
+    hook_libc_execve();
+    patch_got_for_loaded_binary(base, &phdrs);
+
     let image = loader::LoadedImage {
         base,
         total_size: 0,
@@ -201,7 +225,6 @@ pub fn virtual_execve_via_entry(
     };
     let auxv = loader::build_auxv(&image, 0);
 
-    // Allocate stack
     let stack_layout = Layout::from_size_align(ELF_STACK_SIZE, 16)
         .map_err(|e| e.to_string())?;
     let stack_base = unsafe { alloc(stack_layout) };
@@ -209,22 +232,23 @@ pub fn virtual_execve_via_entry(
         return Err("stack allocation failed".into());
     }
 
-    // Spawn ELF coroutine that jumps to the entry point
-    let vpid = crate::executor::EXECUTOR.with(|e| unsafe {
-        let ex = &mut *e.get();
-        // Set global executor pointer so it survives TLS reinitialization
-        // by __libc_init inside the loaded binary
-        crate::executor::set_global_executor(ex as *mut _);
+    let vpid = unsafe {
+        let ex = &mut *crate::executor::get_global_executor();
         ex.spawn_elf(
             entry_addr,
             stack_base,
             ELF_STACK_SIZE,
-            argv_c.len(),
+            argc,
             argv_c,
             envp_c,
             auxv,
         )
-    });
+    };
+
+    // Inherit fd table from current coroutine (Linux execve preserves fds)
+    if let Some(pid) = current_pid {
+        crate::vfd::fork_fd_table(pid, vpid);
+    }
 
     Ok(VirtualExec { vpid })
 }
@@ -301,18 +325,171 @@ fn clear_init_arrays(base: usize, phdrs: &[elf::Phdr]) {
     }
 }
 
-/// Inline-hook libc's exit() and _exit() by overwriting their first instructions
-/// with a branch to our interceptors.
+/// Patch GOT entries in a dlopen'd binary so PLT calls resolve to our interceptors.
 ///
-/// When a loaded binary's _start → __libc_init calls exit(), it goes through
-/// libc.so's internal call (not PLT). GOT patching only works for the loaded
-/// binary's PLT calls. We need to intercept at the libc level by patching
-/// the function code itself.
+/// After dlopen, the loaded binary's PLT stubs resolve through the GOT to libc's
+/// real functions. We overwrite GOT entries for intercepted symbols (fork, execve,
+/// pipe, etc.) so they point to our `#[no_mangle]` overrides instead.
+fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
+    let dyn_phdr = match phdrs.iter().find(|p| p.p_type == elf::PT_DYNAMIC) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let dyn_addr = base + (dyn_phdr.p_vaddr as usize);
+    let dyn_count = dyn_phdr.p_memsz as usize / std::mem::size_of::<elf::Dyn>();
+
+    let mut jmprel: usize = 0;
+    let mut pltrelsz: usize = 0;
+    let mut symtab: usize = 0;
+    let mut strtab: usize = 0;
+
+    for i in 0..dyn_count {
+        let dyn_ptr = (dyn_addr + i * std::mem::size_of::<elf::Dyn>()) as *const elf::Dyn;
+        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_tag)) }.into();
+        let val = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_val)) } as usize;
+        match tag {
+            elf::DT_JMPREL => jmprel = val,
+            elf::DT_PLTRELSZ => pltrelsz = val,
+            elf::DT_SYMTAB => symtab = val,
+            elf::DT_STRTAB => strtab = val,
+            _ => {}
+        }
+    }
+
+    if jmprel == 0 || symtab == 0 || strtab == 0 || pltrelsz == 0 {
+        return;
+    }
+
+    let jmprel = jmprel + base;
+    let symtab = symtab + base;
+    let strtab = strtab + base;
+
+    let rela_count = pltrelsz / std::mem::size_of::<elf::Rela>();
+
+    for i in 0..rela_count {
+        let rela_ptr = (jmprel + i * std::mem::size_of::<elf::Rela>()) as *const elf::Rela;
+        let r_info = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*rela_ptr).r_info)) };
+        let r_offset = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*rela_ptr).r_offset)) };
+
+        if elf::rela_type(r_info) != elf::R_AARCH64_JUMP_SLOT {
+            continue;
+        }
+
+        let sym_idx = elf::rela_sym(r_info) as usize;
+        let sym_ptr = (symtab + sym_idx * std::mem::size_of::<elf::Sym>()) as *const elf::Sym;
+        let st_name = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*sym_ptr).st_name)) } as usize;
+
+        let name_cstr = (strtab + st_name) as *const std::os::raw::c_char;
+        let name = match unsafe { std::ffi::CStr::from_ptr(name_cstr) }.to_str() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Look up our interceptor by name — use direct function references
+        let our_addr: usize = match name {
+            "fork" | "vfork" => crate::preload::fork as *const c_void as usize,
+            "execve" => crate::preload::execve as *const c_void as usize,
+            "waitpid" => crate::preload::waitpid as *const c_void as usize,
+            "wait4" => crate::preload::wait4 as *const c_void as usize,
+            "pipe" => crate::preload::pipe as *const c_void as usize,
+            "dup" => crate::preload::dup as *const c_void as usize,
+            "dup2" => crate::preload::dup2 as *const c_void as usize,
+            "close" => crate::preload::close as *const c_void as usize,
+            "read" => crate::preload::read as *const c_void as usize,
+            "write" => crate::preload::write as *const c_void as usize,
+            "getpid" => crate::preload::getpid as *const c_void as usize,
+            "getppid" => crate::preload::getppid as *const c_void as usize,
+            "exit" => crate::preload::exit as *const c_void as usize,
+            "_exit" => crate::preload::_exit as *const c_void as usize,
+            "kill" => crate::preload::kill as *const c_void as usize,
+            "getpgid" => crate::preload::getpgid as *const c_void as usize,
+            "setpgid" => crate::preload::setpgid as *const c_void as usize,
+            "raise" => crate::preload::raise as *const c_void as usize,
+            _ => continue,
+        };
+
+        let got_entry = (base + r_offset as usize) as *mut usize;
+        let page = (got_entry as usize) & !0xfff;
+
+        unsafe {
+            libc::mprotect(
+                page as *mut c_void,
+                0x2000,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+            std::ptr::write_unaligned(got_entry, our_addr);
+        }
+    }
+}
+
+/// Extract main() address from _start's instruction sequence.
 ///
-/// On aarch64, we write a trampoline at the function entry:
-///   ldr x16, [pc, #8]    // load target address from literal pool
-///   br  x16              // branch to target
-///   .quad target_addr    // 8-byte literal
+/// On bionic aarch64, _start loads main's address into x2 via:
+///   adrp x2, <page>
+///   ... (other instructions setting x0, x1, x3)
+///   ldr  x2, [x2, #<offset>]   // x2 = GOT entry for main
+///   bl   __libc_init@plt
+///
+/// Returns the address of main(), or None if the pattern doesn't match.
+unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
+    let code = entry_addr as *const u32;
+    // Scan first 32 instructions for adrp x2
+    for i in 0..32 {
+        let insn = std::ptr::read_unaligned(code.add(i));
+        // ADRP x2: opcode 1xx1 0000, rd=2
+        if (insn & 0x9F00001F) != 0x90000002 {
+            continue;
+        }
+        let adrp_page = decode_adrp(entry_addr + i * 4, insn);
+        // Scan forward for ldr x2, [x2, #imm]
+        for j in (i + 1)..std::cmp::min(i + 8, 32) {
+            let ldr_insn = std::ptr::read_unaligned(code.add(j));
+            // LDR Xt, [Xn, #imm12]: 11 111 0 01 01 imm12(12) Rn(5) Rt(5)
+            // With Rt=2, Rn=2
+            if (ldr_insn & 0xFFC003FF) == 0xF9400002 {
+                let imm12 = ((ldr_insn >> 10) & 0xFFF) as usize;
+                let got_addr = adrp_page + imm12 * 8;
+                let main_addr = std::ptr::read_unaligned(got_addr as *const usize);
+                if main_addr > 0x10000 {
+                    return Some(main_addr);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Decode an ADRP instruction to get the target page address.
+fn decode_adrp(pc: usize, insn: u32) -> usize {
+    let immlo = (insn >> 29) & 0x3;
+    let immhi = (insn >> 5) & 0x7FFFF;
+    let imm = ((immhi << 2) | immlo) as i32;
+    let imm = (imm << 12) >> 12; // sign extend 21-bit
+    (pc & !0xFFF).wrapping_add((imm as usize) << 12)
+}
+
+/// Spawn a coroutine that directly calls main(argc, argv, envp).
+/// Used when the binary has already been initialized via _start/__libc_init.
+fn spawn_main_coroutine(
+    main_addr: usize,
+    argc: usize,
+    argv: Vec<*const u8>,
+    envp: Vec<*const u8>,
+) -> VPid {
+    crate::spawn(Box::new(move || {
+        let main_fn: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int =
+            unsafe { std::mem::transmute(main_addr) };
+        let result = main_fn(argc as c_int, argv.as_ptr(), envp.as_ptr());
+        crate::executor::vproc_exit_with_code(result);
+    }))
+}
+
+/// Inline-hook libc's exit() by overwriting its first instructions
+/// with a branch to our interceptor.
+///
+/// We hook exit at the libc code level (not GOT) because __libc_init calls
+/// exit() through libc's internal linkage, bypassing PLT/GOT.
 fn hook_libc_exit() {
     let rtld_next = -1isize as *mut c_void;
     unsafe {
@@ -335,10 +512,6 @@ fn hook_libc_exit() {
             );
             if ret != 0 { continue; }
 
-            // Write trampoline:
-            //   ldr x16, [pc, #8]   → 0x58000050
-            //   br  x16             → 0xD61F0200
-            //   .quad target_addr
             let code = func_addr as *mut u32;
             std::ptr::write_unaligned(code, 0x58000050);
             std::ptr::write_unaligned(code.add(1), 0xD61F0200);
@@ -354,6 +527,52 @@ fn hook_libc_exit() {
                 addr = in(reg) func_addr,
             );
         }
+    }
+}
+
+/// Inline-hook libc's execve() by overwriting its first instructions
+/// with a branch to our interceptor.
+///
+/// We hook execve at the libc code level (not GOT/PLT) because PLT/GOT
+/// interception may not work reliably for fork child coroutines.
+fn hook_libc_execve() {
+    let rtld_next = -1isize as *mut c_void;
+    unsafe {
+        let original = libc::dlsym(rtld_next, b"execve\0".as_ptr() as *const std::os::raw::c_char);
+        if original.is_null() {
+            return;
+        }
+
+        let func_addr = original as usize;
+        let page = func_addr & !0xfff;
+        let target = crate::preload::execve as *const c_void as usize;
+
+        let ret = libc::mprotect(
+            page as *mut c_void,
+            0x2000,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        );
+        if ret != 0 {
+            return;
+        }
+
+        let code = func_addr as *mut u32;
+        // ldr x16, [pc, #8]; br x16; .quad target
+        std::ptr::write_unaligned(code, 0x58000050);
+        std::ptr::write_unaligned(code.add(1), 0xD61F0200);
+        std::ptr::write_unaligned(code.add(2) as *mut usize, target);
+
+        // Flush instruction cache for all 16 bytes of the trampoline
+        for off in (0..16).step_by(8) {
+            std::arch::asm!(
+                "dc cvau, {addr}",
+                "dsb ish",
+                "ic ivau, {addr}",
+                "dsb ish",
+                addr = in(reg) func_addr + off,
+            );
+        }
+        std::arch::asm!("isb");
     }
 }
 

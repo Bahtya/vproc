@@ -63,6 +63,18 @@ impl Executor {
         pid
     }
 
+    /// Spawn a coroutine at the front of the ready queue.
+    /// Used for fork helpers that must run before any other coroutine
+    /// to prevent scheduling interleaving that corrupts the parent's stack.
+    pub fn spawn_front(&mut self, f: Box<dyn FnOnce()>) -> VPid {
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        let co = Coroutine::new(pid, f);
+        self.vprocs.insert(pid, co);
+        self.ready_queue.push_front(pid);
+        pid
+    }
+
     /// Spawn a coroutine that will execute a loaded ELF binary.
     pub fn spawn_elf(
         &mut self,
@@ -82,14 +94,13 @@ impl Executor {
         pid
     }
 
-    /// Create a fork child coroutine from the current parent's saved stack state.
+    /// Create a fork child coroutine from the given parent's saved stack state.
     ///
     /// Allocates a new VPid, copies the parent's stack via `Coroutine::fork_from`,
     /// registers the parent-child relationship, and copies the fd table.
     ///
     /// Returns the child's VPid and writes it to the parent's `fork_child_pid` field.
-    pub fn spawn_fork_child(&mut self) -> VPid {
-        let parent_pid = self.current.unwrap();
+    pub fn spawn_fork_child(&mut self, parent_pid: VPid) -> VPid {
         let child_id = self.next_pid;
         self.next_pid += 1;
 

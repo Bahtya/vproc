@@ -12,7 +12,12 @@ use coroutine::VPid;
 
 /// Spawn a new coroutine.
 pub fn spawn(f: Box<dyn FnOnce()>) -> VPid {
-    executor::EXECUTOR.with(|e| unsafe { &mut *e.get() }.spawn(f))
+    unsafe { (*executor::get_global_executor()).spawn(f) }
+}
+
+/// Spawn a coroutine at the front of the ready queue (high priority).
+pub fn spawn_front(f: Box<dyn FnOnce()>) -> VPid {
+    unsafe { (*executor::get_global_executor()).spawn_front(f) }
 }
 
 /// Yield control to the next ready coroutine.
@@ -27,7 +32,7 @@ pub fn block_on_all() {
 
 /// Get total context switch count.
 pub fn switch_count() -> u64 {
-    executor::EXECUTOR.with(|e| unsafe { &mut *e.get() }.switch_count())
+    unsafe { (*executor::get_global_executor()).switch_count() }
 }
 
 /// Terminate the current coroutine with an exit code.

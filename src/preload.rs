@@ -3,6 +3,67 @@
 use std::os::raw::{c_char, c_int, c_void};
 
 // ---------------------------------------------------------------------------
+// SIGSEGV handler — install early for crash diagnosis
+// ---------------------------------------------------------------------------
+
+/// Install a SIGSEGV handler that prints fault address and fp-based backtrace.
+pub fn install_crash_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = crash_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    }
+}
+
+extern "C" fn crash_handler(
+    sig: c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut c_void,
+) {
+    let fault_addr = unsafe { (*info).si_addr() as usize };
+    let mut buf = [0u8; 256];
+    let msg = unsafe {
+        let n = libc::snprintf(
+            buf.as_mut_ptr() as *mut c_char,
+            256,
+            b"\n[SIGSEGV] signal=%d fault_addr=%p\n\0".as_ptr() as *const c_char,
+            sig,
+            fault_addr,
+        );
+        core::str::from_utf8_unchecked(&buf[..n as usize])
+    };
+    unsafe { libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len()); }
+
+    // Walk fp chain for backtrace
+    let mut fp: usize;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp); }
+    for i in 0..16 {
+        if fp == 0 { break; }
+        let lr = unsafe { std::ptr::read_unaligned((fp + 8) as *const usize) };
+        let msg = unsafe {
+            let n = libc::snprintf(
+                buf.as_mut_ptr() as *mut c_char,
+                256,
+                b"  #%d fp=%p lr=%p\n\0".as_ptr() as *const c_char,
+                i,
+                fp,
+                lr,
+            );
+            core::str::from_utf8_unchecked(&buf[..n as usize])
+        };
+        unsafe { libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len()); }
+        fp = unsafe { std::ptr::read_unaligned(fp as *const usize) };
+    }
+
+    // Re-raise to get core dump / default behavior
+    unsafe {
+        libc::_exit(128 + sig);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -21,6 +82,7 @@ fn enabled() -> bool {
     let on = !val.is_null() && unsafe { *val == b'1' as _ };
     if on {
         VPROC_ENABLED.store(1, std::sync::atomic::Ordering::Relaxed);
+        install_crash_handler();
     }
     on
 }
@@ -168,7 +230,8 @@ pub extern "C" fn fork() -> c_int {
             return f();
         }
     }
-    crate::ffi::vproc_ffi_fork() as c_int
+    let r = crate::ffi::vproc_ffi_fork() as c_int;
+    r
 }
 
 #[no_mangle]
@@ -189,7 +252,6 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
             return f(pid, status, options);
         }
     }
-
     let vpid = pid as u32;
     loop {
         if let Some(code) = crate::executor::get_exit_code(vpid) {
@@ -198,9 +260,10 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
             }
             return pid;
         }
-        let exists = crate::executor::EXECUTOR.with(|e| unsafe {
-            (*e.get()).vprocs.contains_key(&vpid)
-        });
+        let exists = {
+            let ptr = crate::executor::get_global_executor();
+            !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
+        };
         if !exists {
             return -1;
         }
@@ -228,21 +291,33 @@ pub extern "C" fn execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
+    EXECVE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
+
     if !enabled() {
+        // Use raw syscall to avoid recursion with hook_libc_execve
         unsafe {
-            let f: extern "C" fn(*const c_char, *const *const c_char, *const *const c_char) -> c_int =
-                std::mem::transmute(real("execve\0"));
-            return f(path, argv, envp);
+            let ret: isize;
+            std::arch::asm!(
+                "mov x8, #221",  // __NR_execve on aarch64
+                "svc #0",
+                lateout("x0") ret,
+                in("x1") argv,
+                in("x2") envp,
+                in("x0") path,
+            );
+            if ret < 0 {
+                *libc::__errno() = (-ret) as c_int;
+                return -1;
+            }
+            return ret as c_int;
         }
     }
 
-    let path_str = unsafe { std::ffi::CStr::from_ptr(path) }
-        .to_string_lossy()
-        .into_owned();
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
-    match crate::vexec::virtual_execve(&path_str, argv_vec, envp_vec) {
+    match crate::vexec::virtual_execve(&*path_str, argv_vec, envp_vec) {
         Ok(_) => {
             crate::executor::vproc_exit_with_code(0);
             unreachable!()
@@ -254,6 +329,13 @@ pub extern "C" fn execve(
         }
     }
 }
+
+/// Get number of times execve interceptor was called (for testing).
+pub fn get_execve_call_count() -> usize {
+    EXECVE_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static EXECVE_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // pipe()

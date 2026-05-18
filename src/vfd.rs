@@ -3,7 +3,6 @@
 //! Each virtual process has its own fd namespace. Real fds (0,1,2) pass through
 //! to the kernel. Virtual pipes are backed by in-process ring buffers.
 
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 
 const PIPE_CAPACITY: usize = 65536; // 64 KiB pipe buffer
@@ -139,7 +138,16 @@ impl VfdTable {
     pub fn close(&mut self, fd: u32) -> Result<(), i32> {
         match self.fds.remove(&fd) {
             Some(Vfd::PipeRead(buf)) | Some(Vfd::PipeWrite(buf)) => {
-                unsafe { (*buf).close() };
+                // Only close the underlying buffer if no other fd in this table
+                // points to the same buffer (dup2 creates shared references).
+                let buf_ptr = buf as usize;
+                let still_referenced = self.fds.values().any(|vfd| match vfd {
+                    Vfd::PipeRead(b) | Vfd::PipeWrite(b) => *b as usize == buf_ptr,
+                    _ => false,
+                });
+                if !still_referenced {
+                    unsafe { (*buf).close() };
+                }
                 Ok(())
             }
             Some(_) => Ok(()),
@@ -213,48 +221,59 @@ impl VfdTable {
 
 impl Drop for VfdTable {
     fn drop(&mut self) {
-        // Clean up any pipe buffers
-        for vfd in self.fds.values() {
-            if let Vfd::PipeRead(buf) | Vfd::PipeWrite(buf) = vfd {
-                unsafe {
-                    let _ = Box::from_raw(*buf);
-                }
-            }
+        // Don't free PipeBuffers here — they're shared across fork'd tables.
+        // The PipeBuffer is cleaned up when close() is called on all references,
+        // or leaked if the table is dropped without proper cleanup.
+        // TODO: use Arc<PipeBuffer> for proper reference counting.
+    }
+}
+
+// Global fd table storage, keyed by VPid.
+// Uses AtomicPtr (like EXECUTOR_PTR) to survive TLS reinitialization
+// when __libc_init runs inside a dlopen'd binary.
+use std::collections::HashMap as StdHashMap;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+static FD_TABLES_PTR: AtomicPtr<StdHashMap<u32, VfdTable>> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Get or initialize the global fd tables map.
+fn get_tables_ptr() -> *mut StdHashMap<u32, VfdTable> {
+    let ptr = FD_TABLES_PTR.load(Ordering::SeqCst);
+    if !ptr.is_null() {
+        return ptr;
+    }
+    let new = Box::into_raw(Box::new(StdHashMap::new()));
+    match FD_TABLES_PTR.compare_exchange(
+        std::ptr::null_mut(),
+        new,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => new,
+        Err(existing) => {
+            unsafe { drop(Box::from_raw(new)); }
+            existing
         }
     }
 }
 
-// Thread-local fd table storage, keyed by VPid.
-use std::collections::HashMap as StdHashMap;
-
-thread_local! {
-    pub static FD_TABLES: UnsafeCell<StdHashMap<u32, VfdTable>> =
-        UnsafeCell::new(StdHashMap::new());
-}
-
 /// Get the fd table for the given virtual process.
 pub fn get_table(vpid: u32) -> Option<&'static mut VfdTable> {
-    FD_TABLES.with(|t| unsafe {
-        (*t.get()).get_mut(&vpid)
-    })
+    unsafe { (*get_tables_ptr()).get_mut(&vpid) }
 }
 
 /// Get or create the fd table for a virtual process.
 pub fn get_or_create_table(vpid: u32) -> &'static mut VfdTable {
-    FD_TABLES.with(|t| unsafe {
-        let tables = &mut *t.get();
-        tables.entry(vpid).or_insert_with(VfdTable::new)
-    })
+    let tables = unsafe { &mut *get_tables_ptr() };
+    tables.entry(vpid).or_insert_with(VfdTable::new)
 }
 
 /// Clone the fd table of parent_vpid for child_vpid (used by virtual fork).
 pub fn fork_fd_table(parent_vpid: u32, child_vpid: u32) {
-    FD_TABLES.with(|t| unsafe {
-        let tables = &mut *t.get();
-        let child_table = match tables.get(&parent_vpid) {
-            Some(parent_table) => parent_table.clone_for_fork(),
-            None => VfdTable::new(),
-        };
-        tables.insert(child_vpid, child_table);
-    });
+    let tables = unsafe { &mut *get_tables_ptr() };
+    let child_table = match tables.get(&parent_vpid) {
+        Some(parent_table) => parent_table.clone_for_fork(),
+        None => VfdTable::new(),
+    };
+    tables.insert(child_vpid, child_table);
 }

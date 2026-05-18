@@ -258,42 +258,68 @@ pub extern "C" fn vproc_ffi_execve(
 /// reads the fork return value (x0 = 0) before calling execve.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_fork() -> u32 {
-    // Phase 1: check if we are a fork child resuming after do_yield.
-    // fork_child_pid was initialized to 0 by fork_from, so children
-    // return 0 from this path. Parents return the actual child pid.
-    let fork_result = crate::executor::EXECUTOR.with(|e| unsafe {
-        let ex = &mut *e.get();
-        let pid = ex.current.unwrap();
+    // Phase 1: check if we are a fork child returning from a call path
+    // that entered vproc_ffi_fork directly (not via do_yield resume).
+    let ex = unsafe { &mut *crate::executor::get_global_executor() };
+    let fork_result = if let Some(pid) = ex.current {
         let co = ex.vprocs.get(&pid).unwrap();
-
         if co.is_fork_child {
-            // First time child runs: reset flag so subsequent calls work
             ex.vprocs.get_mut(&pid).unwrap().is_fork_child = false;
-            return 0u32;
+            0u32
+        } else {
+            u32::MAX
         }
-
-        // Not a child yet — return sentinel to proceed with parent path
+    } else {
         u32::MAX
-    });
+    };
 
     if fork_result != u32::MAX {
         return fork_result;
     }
 
-    // Phase 2 (parent): spawn helper to copy our stack, then yield.
-    crate::spawn(Box::new(move || {
-        crate::executor::EXECUTOR.with(|e| unsafe {
-            (&mut *e.get()).spawn_fork_child();
-        });
+    // Phase 2 (parent): spawn helper at front of queue to copy our stack.
+    // Using spawn_front ensures the helper runs before any other coroutine,
+    // minimizing the window where other coroutines can corrupt our stack.
+    let parent_pid = ex.current.unwrap();
+
+    // Save the return address that our prologue stored on the stack.
+    // Other coroutines (specifically those doing dlopen/__libc_init) can
+    // corrupt our stack while we're yielded, so we verify and restore it.
+    // From assembly: stp x29, x30, [sp, #16] → lr is at sp+24.
+    let saved_lr_addr: *mut u64;
+    let saved_lr_value: u64;
+    unsafe {
+        let sp_val: usize;
+        std::arch::asm!("mov {}, sp", out(reg) sp_val);
+        saved_lr_addr = (sp_val + 24) as *mut u64;
+        saved_lr_value = *saved_lr_addr;
+    }
+
+    crate::spawn_front(Box::new(move || {
+        unsafe {
+            (*crate::executor::get_global_executor()).spawn_fork_child(parent_pid);
+        }
     }));
 
     crate::executor::do_yield();
 
-    // Phase 3: parent resumes — read child pid from our Coroutine.
-    // Children also reach here but fork_child_pid is 0, so they return 0.
-    crate::executor::EXECUTOR.with(|e| unsafe {
-        let ex = &mut *e.get();
-        let pid = ex.current.unwrap();
-        ex.vprocs.get(&pid).unwrap().fork_child_pid
-    })
+    // Phase 3: restore lr if corrupted during yield by dlopen/__libc_init.
+    unsafe {
+        if *saved_lr_addr != saved_lr_value {
+            *saved_lr_addr = saved_lr_value;
+        }
+    }
+
+    // Fork children also resume here (their stack was copied at do_yield).
+    // Distinguish by checking is_fork_child which was set by spawn_fork_child.
+    let ex = unsafe { &mut *crate::executor::get_global_executor() };
+    let pid = ex.current.unwrap();
+    let co = ex.vprocs.get(&pid).unwrap();
+    if co.is_fork_child {
+        ex.vprocs.get_mut(&pid).unwrap().is_fork_child = false;
+        return 0;
+    }
+
+    // Parent: read child pid from our Coroutine.
+    ex.vprocs.get(&pid).unwrap().fork_child_pid
 }
