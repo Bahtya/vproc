@@ -257,6 +257,12 @@ pub extern "C" fn vproc_ffi_execve(
 /// resumes inside this function after do_yield() and returns 0 via
 /// fork_child_pid (initialized to 0 by fork_from).
 ///
+/// Virtual fork — create a child coroutine by copying the parent's stack.
+///
+/// **Deprecated:** preload.rs fork() now uses real OS fork for memory isolation.
+/// This function is retained for the FFI API but is no longer called from the
+/// main interception path.
+///
 /// # Safety limitation
 ///
 /// vproc_switch only saves callee-saved registers (x19-x30, d8-d15).

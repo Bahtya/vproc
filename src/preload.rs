@@ -83,6 +83,9 @@ fn enabled() -> bool {
     if v == 1 {
         return true;
     }
+    // Keep checking env until we see "1" — VPROC may be set after
+    // program start (e.g. std::env::set_var in main), or during
+    // early init before the env var is visible.
     let val = unsafe { libc::getenv(b"VPROC\0".as_ptr() as *const c_char) };
     let on = !val.is_null() && unsafe { *val == b'1' as _ };
     if on {
@@ -276,14 +279,23 @@ pub extern "C" fn vfork() -> c_int {
 // waitpid() / wait4()
 // ---------------------------------------------------------------------------
 
+/// Raw wait4 syscall — bypasses libc entirely to avoid waitpid→wait4 recursion.
+#[cfg(target_arch = "aarch64")]
+fn raw_wait4(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
+    let ret = unsafe {
+        libc::syscall(260, pid, status, options, 0usize) // __NR_wait4
+    };
+    if ret < 0 {
+        unsafe { *libc::__errno() = (-ret) as c_int; }
+        return -1;
+    }
+    ret as c_int
+}
+
 #[no_mangle]
 pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int, *mut c_int, c_int) -> c_int =
-                std::mem::transmute(real("waitpid\0"));
-            return f(pid, status, options);
-        }
+        return raw_wait4(pid, status, options);
     }
     // Check if this is a virtual process (exists in vproc executor)
     let vpid = pid as u32;
@@ -295,20 +307,7 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
         // Real child process — use raw wait4 syscall to avoid recursion:
         // libc waitpid() internally calls wait4(), which we also intercept,
         // causing waitpid → libc waitpid → libc wait4 → our wait4 → our waitpid.
-        let ret = unsafe {
-            libc::syscall(
-                260, // __NR_wait4 on aarch64
-                pid,
-                status,
-                options,
-                0usize, // rusage = NULL
-            )
-        };
-        if ret < 0 {
-            unsafe { *libc::__errno() = (-ret) as c_int; }
-            return -1;
-        }
-        return ret as c_int;
+        return raw_wait4(pid, status, options);
     }
     // Virtual process — spin/yield until done
     loop {
@@ -336,7 +335,9 @@ pub extern "C" fn wait4(
     options: c_int,
     _rusage: *mut c_void,
 ) -> c_int {
-    waitpid(pid, status, options)
+    // Use raw syscall directly — delegating to waitpid() would re-enter
+    // our interceptor and potentially trigger the waitpid→wait4 recursion.
+    raw_wait4(pid, status, options)
 }
 
 // ---------------------------------------------------------------------------

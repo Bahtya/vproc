@@ -140,6 +140,7 @@ impl Executor {
                 if current_pid != MAIN_VPID {
                     let co = self.vprocs.get(&current_pid).unwrap();
                     if co.state == State::Running {
+                        // Yield (not exit): put back in queue
                         self.vprocs.get_mut(&current_pid).unwrap().state = State::Ready;
                         self.ready_queue.push_back(current_pid);
                     }
@@ -228,6 +229,7 @@ pub fn vproc_exit_with_code(code: i32) {
         co.state = State::Done;
         co.exit_code = code;
     }
+    // Don't re-queue — just schedule the next one
     ex.schedule();
 }
 
