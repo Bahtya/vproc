@@ -1,4 +1,4 @@
-//! Integration tests for pipe/fork fix (issue #1).
+//! Integration tests for pipe/fork and sequential execve fixes (issues #1, #3).
 //!
 //! Each test spawns `test_single` as a subprocess with a timeout,
 //! because the tests involve real fork() which is incompatible

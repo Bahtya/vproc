@@ -189,6 +189,7 @@ pub fn virtual_execve_via_entry(
         // Binary already initialized — restore writable segments, call main() directly
         restore_writable_segments(&saved_writable);
         let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c);
+        // Inherit fd table from current coroutine (Linux execve preserves fds)
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
         }
