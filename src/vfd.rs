@@ -180,6 +180,35 @@ impl VfdTable {
         self.fds.insert(write_fd, Vfd::PipeWrite(buf));
         (read_fd, write_fd)
     }
+
+    /// Create a shallow copy of this fd table for fork().
+    ///
+    /// Real fds: copied as-is (share kernel file descriptions).
+    /// Pipe fds: share the same PipeBuffer pointer (matching Linux pipe semantics).
+    ///
+    /// # Safety: shared PipeBuffer lifetime
+    ///
+    /// Both parent and child hold raw pointers to the same PipeBuffer.
+    /// When either VfdTable is dropped, it frees the PipeBuffer via
+    /// Box::from_raw. This is safe only because cooperative scheduling
+    /// guarantees no concurrent access, and for fork-then-execve the child
+    /// gets a fresh fd table from execve. For long-lived parent/child pairs,
+    /// reference counting would be needed.
+    pub fn clone_for_fork(&self) -> Self {
+        let mut new_table = VfdTable {
+            fds: HashMap::new(),
+            next_fd: self.next_fd,
+        };
+        for (&fd_num, vfd) in &self.fds {
+            let cloned = match vfd {
+                Vfd::Real(r) => Vfd::Real(*r),
+                Vfd::PipeRead(buf) => Vfd::PipeRead(*buf),
+                Vfd::PipeWrite(buf) => Vfd::PipeWrite(*buf),
+            };
+            new_table.fds.insert(fd_num, cloned);
+        }
+        new_table
+    }
 }
 
 impl Drop for VfdTable {
@@ -216,4 +245,16 @@ pub fn get_or_create_table(vpid: u32) -> &'static mut VfdTable {
         let tables = &mut *t.get();
         tables.entry(vpid).or_insert_with(VfdTable::new)
     })
+}
+
+/// Clone the fd table of parent_vpid for child_vpid (used by virtual fork).
+pub fn fork_fd_table(parent_vpid: u32, child_vpid: u32) {
+    FD_TABLES.with(|t| unsafe {
+        let tables = &mut *t.get();
+        let child_table = match tables.get(&parent_vpid) {
+            Some(parent_table) => parent_table.clone_for_fork(),
+            None => VfdTable::new(),
+        };
+        tables.insert(child_vpid, child_table);
+    });
 }

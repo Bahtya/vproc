@@ -6,24 +6,28 @@ use std::os::raw::{c_char, c_int, c_void};
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Global enabled flag. -1 = unchecked, 0 = disabled, 1 = enabled.
+/// Must survive TLS reinitialization by __libc_init in dlopen'd binaries.
+static VPROC_ENABLED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
 fn enabled() -> bool {
-    static CHECKED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(0);
-    static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let v = CHECKED.load(std::sync::atomic::Ordering::Relaxed);
-    if v == 0 {
-        let e = std::env::var("VPROC").unwrap_or_default();
-        let on = e == "1";
-        ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
-        CHECKED.store(1, std::sync::atomic::Ordering::Relaxed);
-        on
-    } else {
-        ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    let v = VPROC_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 1 {
+        return true;
     }
+    // Check env every time until we see "1" — the env var may be set
+    // after program start (e.g. std::env::set_var in main).
+    let val = unsafe { libc::getenv(b"VPROC\0".as_ptr() as *const c_char) };
+    let on = !val.is_null() && unsafe { *val == b'1' as _ };
+    if on {
+        VPROC_ENABLED.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    on
 }
 
 /// Resolve a real libc function via dlsym(RTLD_NEXT).
 unsafe fn real(sym: &'static str) -> *mut c_void {
-    static mut CACHE: [(*const u8, *mut c_void); 16] = [(std::ptr::null(), std::ptr::null_mut()); 16];
+    static mut CACHE: [(*const u8, *mut c_void); 32] = [(std::ptr::null(), std::ptr::null_mut()); 32];
     static mut COUNT: usize = 0;
 
     for i in 0..COUNT {
@@ -38,7 +42,7 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
         eprintln!("vproc: cannot resolve {:?}", sym);
         libc::_exit(99);
     }
-    if COUNT < 16 {
+    if COUNT < 32 {
         CACHE[COUNT] = (sym.as_ptr(), ptr);
         COUNT += 1;
     }
@@ -46,7 +50,11 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
 }
 
 fn current_vpid() -> Option<crate::coroutine::VPid> {
-    crate::executor::EXECUTOR.with(|e| unsafe { (*e.get()).current })
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { (*ptr).current }
 }
 
 // ---------------------------------------------------------------------------
@@ -64,10 +72,13 @@ pub extern "C" fn _exit(code: c_int) -> ! {
     if current_vpid().is_some() {
         crate::executor::vproc_exit_with_code(code);
     }
-    // No coroutine context — fall through to real libc _exit
     unsafe {
-        let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
-        f(code);
+        std::arch::asm!(
+            "mov x8, #94",
+            "svc #0",
+            in("x0") code,
+            options(noreturn)
+        );
     }
 }
 
@@ -79,17 +90,74 @@ pub extern "C" fn exit(code: c_int) -> ! {
             f(code);
         }
     }
-    if current_vpid().is_some() {
+    let vpid = current_vpid();
+    if vpid.is_some() {
         crate::executor::vproc_exit_with_code(code);
     }
     unsafe {
-        let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
-        f(code);
+        std::arch::asm!(
+            "mov x8, #94",
+            "svc #0",
+            in("x0") code,
+            options(noreturn)
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
-// fork() — virtual fork returns ENOSYS (needs full stack copy)
+// getpid() / getppid()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn getpid() -> c_int {
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpid\0"));
+            return f();
+        }
+    }
+    match current_vpid() {
+        Some(p) => p as c_int,
+        None => unsafe {
+            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpid\0"));
+            f()
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn getppid() -> c_int {
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
+            return f();
+        }
+    }
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        unsafe {
+            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
+            return f();
+        }
+    }
+    unsafe {
+        let ex = &*ptr;
+        match (*ex).current {
+            Some(pid) => ex
+                .vprocs
+                .get(&pid)
+                .map(|co| co.ppid as c_int)
+                .unwrap_or(0),
+            None => {
+                let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
+                f()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fork() / vfork() — virtual fork
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
@@ -100,8 +168,7 @@ pub extern "C" fn fork() -> c_int {
             return f();
         }
     }
-    unsafe { *libc::__errno() = 38 }; // ENOSYS
-    -1
+    crate::ffi::vproc_ffi_fork() as c_int
 }
 
 #[no_mangle]
@@ -433,5 +500,113 @@ pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
             unsafe { *libc::__errno() = libc::EBADF };
             -1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kill()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("kill\0"));
+            return f(pid, sig);
+        }
+    }
+    // For positive pids, check if it's a virtual process
+    if pid > 0 {
+        let ptr = crate::executor::get_global_executor();
+        let exists = if ptr.is_null() {
+            false
+        } else {
+            unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) }
+        };
+        if exists {
+            // Virtual process — signal delivery not yet implemented, return success
+            return 0;
+        }
+    }
+    // Real process or process group (negative pid / pid=0) — pass through
+    unsafe {
+        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("kill\0"));
+        f(pid, sig)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getpgid() / setpgid()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn getpgid(pid: c_int) -> c_int {
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("getpgid\0"));
+            return f(pid);
+        }
+    }
+    // For virtual pids, return a fake pgid (just the pid itself)
+    if pid > 0 {
+        let ptr = crate::executor::get_global_executor();
+        let exists = !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) };
+        if exists {
+            return pid;
+        }
+    }
+    // pid == 0 means "current process"
+    if pid == 0 {
+        if let Some(vpid) = current_vpid() {
+            return vpid as c_int;
+        }
+    }
+    // Real process — pass through
+    unsafe {
+        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("getpgid\0"));
+        f(pid)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("setpgid\0"));
+            return f(pid, pgid);
+        }
+    }
+    // For virtual pids, stub: return success
+    if pid > 0 {
+        let ptr = crate::executor::get_global_executor();
+        let exists = !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) };
+        if exists {
+            return 0;
+        }
+    }
+    if pid == 0 {
+        if current_vpid().is_some() {
+            return 0;
+        }
+    }
+    // Real process — pass through
+    unsafe {
+        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("setpgid\0"));
+        f(pid, pgid)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// raise()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn raise(sig: c_int) -> c_int {
+    // raise() sends a signal to the current (real) process/thread.
+    // In vproc the "current process" is the real OS process, so always
+    // pass through.
+    unsafe {
+        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("raise\0"));
+        f(sig)
     }
 }

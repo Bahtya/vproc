@@ -36,6 +36,9 @@ struct vproc_ffi {
     int        (*dup)(unsigned, int);
     int        (*dup2)(unsigned, int, int);
     int        (*execve)(const char *, char *const *, char *const *);
+    unsigned   (*fork)(void);
+    unsigned   (*getpid)(void);
+    unsigned   (*getppid)(void);
 };
 
 static struct vproc_ffi g_ffi;
@@ -64,6 +67,9 @@ static const struct vproc_ffi *ffi(void) {
         LOAD(dup);
         LOAD(dup2);
         LOAD(execve);
+        LOAD(fork);
+        LOAD(getpid);
+        LOAD(getppid);
 #undef LOAD
         if (!g_ffi.exit) return NULL; /* nothing found */
     }
@@ -95,6 +101,8 @@ typedef ssize_t (*t_ssize_int_voidp_size)(int, void *, size_t);
 typedef ssize_t (*t_ssize_int_cvoidp_size)(int, const void *, size_t);
 typedef int     (*t_int_int)(int);
 typedef int     (*t_int_int_int)(int, int);
+typedef pid_t   (*t_pid_int)(int);
+typedef int     (*t_int_int_pid)(pid_t, pid_t);
 
 #define REAL(type, name)                       \
     static type real_##name;                    \
@@ -138,6 +146,10 @@ void _exit(int code) {
 
 pid_t fork(void) {
     if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->fork) {
+            return (pid_t)f->fork();
+        }
         errno = ENOSYS;
         return -1;
     }
@@ -147,11 +159,37 @@ pid_t fork(void) {
 
 pid_t vfork(void) {
     if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->fork) {
+            return (pid_t)f->fork();
+        }
         errno = ENOSYS;
         return -1;
     }
     REAL(t_pid_void, vfork);
     return real_vfork();
+}
+
+/* ------------------------------------------------------------------ */
+/* getpid() / getppid()                                               */
+/* ------------------------------------------------------------------ */
+
+pid_t getpid(void) {
+    if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->getpid) return (pid_t)f->getpid();
+    }
+    REAL(t_pid_void, getpid);
+    return real_getpid();
+}
+
+pid_t getppid(void) {
+    if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->getppid) return (pid_t)f->getppid();
+    }
+    REAL(t_pid_void, getppid);
+    return real_getppid();
 }
 
 /* ------------------------------------------------------------------ */
@@ -313,4 +351,70 @@ int dup2(int oldfd, int newfd) {
     }
     REAL(t_int_int_int, dup2);
     return real_dup2(oldfd, newfd);
+}
+
+/* ------------------------------------------------------------------ */
+/* kill() / raise() / getpgid() / setpgid()                           */
+/* ------------------------------------------------------------------ */
+
+int kill(pid_t pid, int sig) {
+    if (enabled()) {
+        /* Check if pid is a virtual process */
+        if (pid > 0) {
+            const struct vproc_ffi *f = ffi();
+            if (f && f->vpid_exists && f->vpid_exists((unsigned)pid)) {
+                /* Virtual process — signal delivery not yet implemented */
+                return 0;
+            }
+        }
+        /* Negative pid (process group) or real pid — pass through */
+    }
+    REAL(t_int_int_int, kill);
+    return real_kill(pid, sig);
+}
+
+int raise(int sig) {
+    /* raise() sends a signal to the current process — always pass through */
+    REAL(t_int_int, raise);
+    return real_raise(sig);
+}
+
+pid_t getpgid(pid_t pid) {
+    if (enabled()) {
+        if (pid > 0) {
+            const struct vproc_ffi *f = ffi();
+            if (f && f->vpid_exists && f->vpid_exists((unsigned)pid)) {
+                /* Virtual process — stub: return pid as pgid */
+                return pid;
+            }
+        }
+        if (pid == 0) {
+            const struct vproc_ffi *f = ffi();
+            if (f && f->current_vpid && f->current_vpid() != 0) {
+                return (pid_t)f->current_vpid();
+            }
+        }
+    }
+    REAL(t_pid_int, getpgid);
+    return real_getpgid(pid);
+}
+
+int setpgid(pid_t pid, pid_t pgid) {
+    if (enabled()) {
+        if (pid > 0) {
+            const struct vproc_ffi *f = ffi();
+            if (f && f->vpid_exists && f->vpid_exists((unsigned)pid)) {
+                /* Virtual process — stub: return success */
+                return 0;
+            }
+        }
+        if (pid == 0) {
+            const struct vproc_ffi *f = ffi();
+            if (f && f->current_vpid && f->current_vpid() != 0) {
+                return 0;
+            }
+        }
+    }
+    REAL(t_int_int_pid, setpgid);
+    return real_setpgid(pid, pgid);
 }

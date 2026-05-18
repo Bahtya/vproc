@@ -15,11 +15,14 @@ pub enum State {
 
 pub struct Coroutine {
     pub id: VPid,
+    pub ppid: VPid,
     pub sp: *mut u8,
     pub stack_base: *mut u8,
     pub stack_size: usize,
     pub state: State,
     pub exit_code: i32,
+    pub is_fork_child: bool,
+    pub fork_child_pid: u32,
 }
 
 // Assembly trampoline: vproc_switch restores x19=f_ptr then `ret` jumps here.
@@ -89,7 +92,7 @@ impl Coroutine {
 
             // x29(fp) = 0, x30(lr) = trampoline
             ptr::write_unaligned(sp_init.add(80) as *mut u64, 0);
-            ptr::write_unaligned(sp_init.add(88) as *mut u64, __vproc_trampoline as usize as u64);
+            ptr::write_unaligned(sp_init.add(88) as *mut u64, __vproc_trampoline as *const () as usize as u64);
 
             // d8-d15: zero
             for i in 0..8 {
@@ -99,11 +102,14 @@ impl Coroutine {
 
         Coroutine {
             id,
+            ppid: 0,
             sp: sp_init,
             stack_base,
             stack_size: STACK_SIZE,
             state: State::Ready,
             exit_code: 0,
+            is_fork_child: false,
+            fork_child_pid: 0,
         }
     }
 
@@ -204,11 +210,55 @@ impl Coroutine {
 
         Coroutine {
             id,
+            ppid: 0,
             sp: frame_sp,
             stack_base,
             stack_size,
             state: State::Ready,
             exit_code: 0,
+            is_fork_child: false,
+            fork_child_pid: 0,
+        }
+    }
+
+    /// Create a child coroutine by copying the parent's stack (virtual fork).
+    ///
+    /// Copies the entire parent stack (including the saved register frame
+    /// at Coroutine::sp). The child resumes at the same execution point
+    /// as the parent when scheduled.
+    ///
+    /// # Safety: caller-saved register limitation
+    ///
+    /// `vproc_switch` only saves callee-saved registers (x19-x30, d8-d15).
+    /// Any variable in a caller-saved register (x0-x18) at the fork point
+    /// will have an undefined value in the child. This is safe only when
+    /// the child immediately calls execve() (which replaces the entire
+    /// execution context) or when the code between fork() return and the
+    /// next function call does not depend on caller-saved register values.
+    pub unsafe fn fork_from(child_id: VPid, parent: &Coroutine) -> Self {
+        let layout = Layout::from_size_align(parent.stack_size, 16).unwrap();
+        let child_stack_base = alloc(layout);
+        assert!(!child_stack_base.is_null(), "fork stack alloc failed");
+
+        ptr::copy_nonoverlapping(
+            parent.stack_base,
+            child_stack_base,
+            parent.stack_size,
+        );
+
+        let sp_offset = parent.sp.offset_from(parent.stack_base) as usize;
+        let child_sp = child_stack_base.add(sp_offset);
+
+        Coroutine {
+            id: child_id,
+            ppid: parent.id,
+            sp: child_sp,
+            stack_base: child_stack_base,
+            stack_size: parent.stack_size,
+            state: State::Ready,
+            exit_code: 0,
+            is_fork_child: true,
+            fork_child_pid: 0,
         }
     }
 }

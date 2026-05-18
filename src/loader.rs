@@ -90,7 +90,7 @@ pub fn load_pie(data: &[u8]) -> Result<LoadedImage, String> {
     }
 
     // Calculate total span
-    let (min_vaddr, span) = elf::load_span(&phdrs);
+    let (_min_vaddr, span) = elf::load_span(&phdrs);
     let total_mapped = page_align_up(span as usize);
 
     // Allocate a slot

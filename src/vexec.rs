@@ -173,6 +173,12 @@ pub fn virtual_execve_via_entry(
     // (dlopen already called them, _start would call them again)
     clear_init_arrays(base, &phdrs);
 
+    // Inline-hook libc's exit() and _exit() so that when __libc_init calls
+    // exit(result), it goes to our interceptor instead of killing the process.
+    // GOT patching the binary alone isn't enough because __libc_init is in
+    // libc.so and calls exit() directly (not through PLT).
+    hook_libc_exit();
+
     // Build C strings (leaked — must survive coroutine lifetime)
     let argv_c: Vec<*const u8> = argv
         .iter()
@@ -205,7 +211,11 @@ pub fn virtual_execve_via_entry(
 
     // Spawn ELF coroutine that jumps to the entry point
     let vpid = crate::executor::EXECUTOR.with(|e| unsafe {
-        (&mut *e.get()).spawn_elf(
+        let ex = &mut *e.get();
+        // Set global executor pointer so it survives TLS reinitialization
+        // by __libc_init inside the loaded binary
+        crate::executor::set_global_executor(ex as *mut _);
+        ex.spawn_elf(
             entry_addr,
             stack_base,
             ELF_STACK_SIZE,
@@ -287,6 +297,62 @@ fn clear_init_arrays(base: usize, phdrs: &[elf::Phdr]) {
                 unsafe { std::ptr::write_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_val), 0) };
             }
             _ => {}
+        }
+    }
+}
+
+/// Inline-hook libc's exit() and _exit() by overwriting their first instructions
+/// with a branch to our interceptors.
+///
+/// When a loaded binary's _start → __libc_init calls exit(), it goes through
+/// libc.so's internal call (not PLT). GOT patching only works for the loaded
+/// binary's PLT calls. We need to intercept at the libc level by patching
+/// the function code itself.
+///
+/// On aarch64, we write a trampoline at the function entry:
+///   ldr x16, [pc, #8]    // load target address from literal pool
+///   br  x16              // branch to target
+///   .quad target_addr    // 8-byte literal
+fn hook_libc_exit() {
+    let rtld_next = -1isize as *mut c_void;
+    unsafe {
+        let targets: &[(&[u8], *const c_void)] = &[
+            (b"exit\0", crate::preload::exit as *const c_void),
+        ];
+
+        for &(name, target) in targets {
+            let name_c = std::ffi::CStr::from_ptr(name.as_ptr() as *const std::os::raw::c_char);
+            let original = libc::dlsym(rtld_next, name_c.as_ptr());
+            if original.is_null() { continue; }
+
+            let func_addr = original as usize;
+            let page = func_addr & !0xfff;
+
+            let ret = libc::mprotect(
+                page as *mut c_void,
+                0x2000,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            );
+            if ret != 0 { continue; }
+
+            // Write trampoline:
+            //   ldr x16, [pc, #8]   → 0x58000050
+            //   br  x16             → 0xD61F0200
+            //   .quad target_addr
+            let code = func_addr as *mut u32;
+            std::ptr::write_unaligned(code, 0x58000050);
+            std::ptr::write_unaligned(code.add(1), 0xD61F0200);
+            let target_ptr = code.add(2) as *mut usize;
+            std::ptr::write_unaligned(target_ptr, target as usize);
+
+            std::arch::asm!(
+                "dc cvau, {addr}",
+                "dsb ish",
+                "ic ivau, {addr}",
+                "dsb ish",
+                "isb",
+                addr = in(reg) func_addr,
+            );
         }
     }
 }

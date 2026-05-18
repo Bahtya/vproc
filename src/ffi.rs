@@ -7,7 +7,11 @@ use std::os::raw::{c_char, c_int, c_void};
 /// Returns the current virtual process ID, or 0 if not in a coroutine.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_current_vpid() -> u32 {
-    crate::executor::EXECUTOR.with(|e| unsafe { (*e.get()).current.unwrap_or(0) })
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe { (*ptr).current.unwrap_or(0) }
 }
 
 /// Exit the current virtual process. Does not return.
@@ -177,6 +181,33 @@ pub extern "C" fn vproc_ffi_dup2(vpid: u32, old_fd: c_int, new_fd: c_int) -> c_i
     }
 }
 
+/// Get the current virtual process ID. Returns real PID if not in a coroutine.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_getpid() -> u32 {
+    crate::executor::EXECUTOR.with(|e| unsafe {
+        match (*e.get()).current {
+            Some(pid) => pid,
+            None => libc::getpid() as u32,
+        }
+    })
+}
+
+/// Get the parent virtual process ID. Returns real PPID if not in a coroutine.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_getppid() -> u32 {
+    crate::executor::EXECUTOR.with(|e| unsafe {
+        let ex = &*e.get();
+        match ex.current {
+            Some(pid) => ex
+                .vprocs
+                .get(&pid)
+                .map(|co| co.ppid)
+                .unwrap_or(0),
+            None => libc::getppid() as u32,
+        }
+    })
+}
+
 /// Virtual execve — load and execute an ELF binary in a coroutine.
 /// On success, terminates the calling coroutine (does not return).
 /// Returns -1 on error.
@@ -203,4 +234,66 @@ pub extern "C" fn vproc_ffi_execve(
             -1
         }
     }
+}
+
+/// Perform virtual fork.
+///
+/// Returns child's VPid to the parent. The child (when scheduled later)
+/// returns 0 from this function.
+///
+/// Mechanism: spawn a tiny helper coroutine, yield to it. The helper
+/// copies the parent's stack (including the saved register frame that
+/// vproc_switch just wrote), creates the child coroutine, and exits.
+/// The parent resumes and reads the child pid. The child, when scheduled,
+/// resumes inside this function after do_yield() and returns 0 via
+/// fork_child_pid (initialized to 0 by fork_from).
+///
+/// # Safety limitation
+///
+/// vproc_switch only saves callee-saved registers (x19-x30, d8-d15).
+/// Variables in caller-saved registers (x0-x18) at the fork point are
+/// NOT preserved in the child. Code between fork() and execve() must
+/// not rely on caller-saved register values. For the fork-then-execve
+/// pattern (the primary use case), this is safe because the child only
+/// reads the fork return value (x0 = 0) before calling execve.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_fork() -> u32 {
+    // Phase 1: check if we are a fork child resuming after do_yield.
+    // fork_child_pid was initialized to 0 by fork_from, so children
+    // return 0 from this path. Parents return the actual child pid.
+    let fork_result = crate::executor::EXECUTOR.with(|e| unsafe {
+        let ex = &mut *e.get();
+        let pid = ex.current.unwrap();
+        let co = ex.vprocs.get(&pid).unwrap();
+
+        if co.is_fork_child {
+            // First time child runs: reset flag so subsequent calls work
+            ex.vprocs.get_mut(&pid).unwrap().is_fork_child = false;
+            return 0u32;
+        }
+
+        // Not a child yet — return sentinel to proceed with parent path
+        u32::MAX
+    });
+
+    if fork_result != u32::MAX {
+        return fork_result;
+    }
+
+    // Phase 2 (parent): spawn helper to copy our stack, then yield.
+    crate::spawn(Box::new(move || {
+        crate::executor::EXECUTOR.with(|e| unsafe {
+            (&mut *e.get()).spawn_fork_child();
+        });
+    }));
+
+    crate::executor::do_yield();
+
+    // Phase 3: parent resumes — read child pid from our Coroutine.
+    // Children also reach here but fork_child_pid is 0, so they return 0.
+    crate::executor::EXECUTOR.with(|e| unsafe {
+        let ex = &mut *e.get();
+        let pid = ex.current.unwrap();
+        ex.vprocs.get(&pid).unwrap().fork_child_pid
+    })
 }
