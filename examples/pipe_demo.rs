@@ -36,18 +36,18 @@ fn main() {
         println!("  pipe: read={}, write={}", read_fd, write_fd);
 
         let pipe_buf_w = match table.get(write_fd) {
-            Some(vproc::vfd::Vfd::PipeWrite(buf)) => *buf,
+            Some(vproc::vfd::Vfd::PipeWrite(buf)) => buf.clone(),
             _ => panic!("no write fd"),
         };
         let pipe_buf_r = match table.get(read_fd) {
-            Some(vproc::vfd::Vfd::PipeRead(buf)) => *buf,
+            Some(vproc::vfd::Vfd::PipeRead(buf)) => buf.clone(),
             _ => panic!("no read fd"),
         };
 
         let writer = vproc::spawn(Box::new(move || {
             let msg = b"hello pipe!\n";
             loop {
-                let n = unsafe { (*pipe_buf_w).write_to(msg) };
+                let n = pipe_buf_w.write_to(msg);
                 if n > 0 { print!("  [writer] wrote {} bytes\n", n); break; }
                 vproc::r#yield();
             }
@@ -56,7 +56,7 @@ fn main() {
         let reader = vproc::spawn(Box::new(move || {
             let mut buf = [0u8; 64];
             loop {
-                let n = unsafe { (*pipe_buf_r).read_from(&mut buf) };
+                let n = pipe_buf_r.read_from(&mut buf);
                 if n > 0 {
                     let s = std::str::from_utf8(&buf[..n as usize]).unwrap();
                     print!("  [reader] got: {}", s);

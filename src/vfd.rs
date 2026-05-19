@@ -1,29 +1,44 @@
 //! Virtual file descriptor table for vproc.
 //!
 //! Each virtual process has its own fd namespace. Real fds (0,1,2) pass through
-//! to the kernel. Virtual pipes are backed by in-process ring buffers.
+//! to the kernel. Virtual pipes are backed by in-process ring buffers shared
+//! via Arc reference counting.
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const PIPE_CAPACITY: usize = 65536; // 64 KiB pipe buffer
 
-/// A virtual file descriptor.
-pub enum Vfd {
-    /// Pass-through to a real kernel fd.
-    Real(i32),
-    /// Reading end of a virtual pipe.
-    PipeRead(*mut PipeBuffer),
-    /// Writing end of a virtual pipe.
-    PipeWrite(*mut PipeBuffer),
+/// Reference to a real kernel fd opened by a virtual process.
+/// Arc reference counting ensures the real fd is closed only when all
+/// virtual fd table entries (from dup/fork) are gone.
+pub struct FileRef {
+    pub real_fd: i32,
+    pub cloexec: bool,
 }
 
-// Safety: PipeBuffer is only accessed through &mut within a single coroutine
-// context (cooperative scheduling means no concurrent access).
-unsafe impl Send for Vfd {}
-unsafe impl Sync for Vfd {}
+/// A virtual file descriptor.
+pub enum Vfd {
+    /// Pass-through to a real kernel fd (stdin/stdout/stderr).
+    Real(i32),
+    /// A real kernel fd opened by the virtual process.
+    File(Arc<FileRef>),
+    /// Reading end of a virtual pipe.
+    PipeRead(Arc<PipeBuffer>),
+    /// Writing end of a virtual pipe.
+    PipeWrite(Arc<PipeBuffer>),
+}
 
-/// Shared pipe buffer (ring buffer).
+/// Shared pipe buffer (ring buffer) with interior mutability.
+///
+/// Safe under cooperative scheduling: only one coroutine executes at a time,
+/// so mutable access through `UnsafeCell` cannot race.
 pub struct PipeBuffer {
+    inner: UnsafeCell<PipeBufferInner>,
+}
+
+struct PipeBufferInner {
     buf: Vec<u8>,
     read_pos: usize,
     write_pos: usize,
@@ -31,64 +46,76 @@ pub struct PipeBuffer {
     closed: bool,
 }
 
+// Safe: cooperative scheduling guarantees no concurrent access.
+unsafe impl Send for PipeBuffer {}
+unsafe impl Sync for PipeBuffer {}
+
 impl PipeBuffer {
     fn new() -> Self {
         PipeBuffer {
-            buf: vec![0; PIPE_CAPACITY],
-            read_pos: 0,
-            write_pos: 0,
-            len: 0,
-            closed: false,
+            inner: UnsafeCell::new(PipeBufferInner {
+                buf: vec![0; PIPE_CAPACITY],
+                read_pos: 0,
+                write_pos: 0,
+                len: 0,
+                closed: false,
+            }),
         }
     }
 
-    pub fn read_from(&mut self, dst: &mut [u8]) -> isize {
-        if self.len == 0 {
-            if self.closed {
+    fn inner(&self) -> &mut PipeBufferInner {
+        unsafe { &mut *self.inner.get() }
+    }
+
+    pub fn read_from(&self, dst: &mut [u8]) -> isize {
+        let inner = self.inner();
+        if inner.len == 0 {
+            if inner.closed {
                 return 0; // EOF
             }
             return -1; // EAGAIN
         }
-        let n = dst.len().min(self.len);
+        let n = dst.len().min(inner.len);
         for i in 0..n {
-            dst[i] = self.buf[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % PIPE_CAPACITY;
+            dst[i] = inner.buf[inner.read_pos];
+            inner.read_pos = (inner.read_pos + 1) % PIPE_CAPACITY;
         }
-        self.len -= n;
+        inner.len -= n;
         n as isize
     }
 
-    pub fn write_to(&mut self, src: &[u8]) -> isize {
-        if self.closed {
+    pub fn write_to(&self, src: &[u8]) -> isize {
+        let inner = self.inner();
+        if inner.closed {
             return -1; // EPIPE
         }
-        let available = PIPE_CAPACITY - self.len;
+        let available = PIPE_CAPACITY - inner.len;
         if available == 0 {
             return -1; // EAGAIN
         }
         let n = src.len().min(available);
         for i in 0..n {
-            self.buf[self.write_pos] = src[i];
-            self.write_pos = (self.write_pos + 1) % PIPE_CAPACITY;
+            inner.buf[inner.write_pos] = src[i];
+            inner.write_pos = (inner.write_pos + 1) % PIPE_CAPACITY;
         }
-        self.len += n;
+        inner.len += n;
         n as isize
     }
 
-    pub fn close(&mut self) {
-        self.closed = true;
+    pub fn close(&self) {
+        self.inner().closed = true;
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed
+        self.inner().closed
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.inner().len == 0
     }
 
     pub fn is_full(&self) -> bool {
-        self.len == PIPE_CAPACITY
+        self.inner().len == PIPE_CAPACITY
     }
 }
 
@@ -104,7 +131,6 @@ impl VfdTable {
             fds: HashMap::new(),
             next_fd: 3, // 0=stdin, 1=stdout, 2=stderr reserved
         };
-        // Inherit standard fds from the host process
         table.fds.insert(0, Vfd::Real(0));
         table.fds.insert(1, Vfd::Real(1));
         table.fds.insert(2, Vfd::Real(2));
@@ -125,7 +151,6 @@ impl VfdTable {
     fn alloc_fd(&mut self) -> u32 {
         let fd = self.next_fd;
         self.next_fd += 1;
-        // Skip over any already-used fds
         while self.fds.contains_key(&self.next_fd) {
             self.next_fd += 1;
         }
@@ -148,22 +173,63 @@ impl VfdTable {
 
     pub fn close(&mut self, fd: u32) -> Result<(), i32> {
         match self.fds.remove(&fd) {
-            Some(Vfd::PipeRead(buf)) | Some(Vfd::PipeWrite(buf)) => {
-                // Only close the underlying buffer if no other fd in this table
-                // points to the same buffer (dup2 creates shared references).
-                let buf_ptr = buf as usize;
+            Some(Vfd::PipeRead(arc)) | Some(Vfd::PipeWrite(arc)) => {
+                // Close the buffer when no fd in this table still references it.
                 let still_referenced = self.fds.values().any(|vfd| match vfd {
-                    Vfd::PipeRead(b) | Vfd::PipeWrite(b) => *b as usize == buf_ptr,
+                    Vfd::PipeRead(a) | Vfd::PipeWrite(a) => Arc::ptr_eq(a, &arc),
                     _ => false,
                 });
                 if !still_referenced {
-                    unsafe { (*buf).close() };
+                    arc.close();
                 }
+                // Arc drops here — if ref count reaches zero, PipeBuffer is freed.
                 Ok(())
             }
             Some(_) => Ok(()),
             None => Err(9), // EBADF
         }
+    }
+
+    /// Insert a real kernel fd as a File entry. Returns the virtual fd number.
+    pub fn insert_file(&mut self, real_fd: i32, cloexec: bool) -> u32 {
+        let fd = self.alloc_fd();
+        self.fds.insert(fd, Vfd::File(Arc::new(FileRef { real_fd, cloexec })));
+        fd
+    }
+
+    /// Remove a File entry from the table. Returns the real fd if no other
+    /// virtual fd in this table still references it (caller should close it).
+    /// Returns None if the fd was not a File entry or is still referenced.
+    pub fn close_file_fd(&mut self, fd: u32) -> Option<i32> {
+        let arc = match self.fds.get(&fd) {
+            Some(Vfd::File(arc)) => Arc::clone(arc),
+            _ => return None,
+        };
+        self.fds.remove(&fd);
+        let still_referenced = self.fds.values().any(|vfd| match vfd {
+            Vfd::File(a) => Arc::ptr_eq(a, &arc),
+            _ => false,
+        });
+        if still_referenced {
+            None
+        } else {
+            Some(arc.real_fd)
+        }
+    }
+
+    /// Close all fds marked close-on-exec. Returns real fds that should be closed.
+    pub fn close_cloexec(&mut self) -> Vec<i32> {
+        let cloexec_fds: Vec<u32> = self.fds.iter()
+            .filter(|(_, vfd)| matches!(vfd, Vfd::File(f) if f.cloexec))
+            .map(|(&fd, _)| fd)
+            .collect();
+        let mut real_fds = Vec::new();
+        for fd in cloexec_fds {
+            if let Some(rfd) = self.close_file_fd(fd) {
+                real_fds.push(rfd);
+            }
+        }
+        real_fds
     }
 
     pub fn dup(&mut self, old_fd: u32) -> Result<u32, i32> {
@@ -172,7 +238,6 @@ impl VfdTable {
     }
 
     pub fn dup2(&mut self, old_fd: u32, new_fd: u32) -> Result<u32, i32> {
-        // Close new_fd if it's already open
         if self.fds.contains_key(&new_fd) {
             let _ = self.close(new_fd);
         }
@@ -180,8 +245,9 @@ impl VfdTable {
             Some(vfd) => {
                 let clone = match vfd {
                     Vfd::Real(fd) => Vfd::Real(*fd),
-                    Vfd::PipeRead(buf) => Vfd::PipeRead(*buf),
-                    Vfd::PipeWrite(buf) => Vfd::PipeWrite(*buf),
+                    Vfd::File(arc) => Vfd::File(Arc::clone(arc)),
+                    Vfd::PipeRead(arc) => Vfd::PipeRead(Arc::clone(arc)),
+                    Vfd::PipeWrite(arc) => Vfd::PipeWrite(Arc::clone(arc)),
                 };
                 self.fds.insert(new_fd, clone);
                 Ok(new_fd)
@@ -192,27 +258,16 @@ impl VfdTable {
 
     /// Create a virtual pipe. Returns (read_fd, write_fd).
     pub fn create_pipe(&mut self) -> (u32, u32) {
-        let buf = Box::into_raw(Box::new(PipeBuffer::new()));
+        let buf = Arc::new(PipeBuffer::new());
         let read_fd = self.alloc_fd();
         let write_fd = self.alloc_fd();
-        self.fds.insert(read_fd, Vfd::PipeRead(buf));
+        self.fds.insert(read_fd, Vfd::PipeRead(Arc::clone(&buf)));
         self.fds.insert(write_fd, Vfd::PipeWrite(buf));
         (read_fd, write_fd)
     }
 
-    /// Create a shallow copy of this fd table for fork().
-    ///
-    /// Real fds: copied as-is (share kernel file descriptions).
-    /// Pipe fds: share the same PipeBuffer pointer (matching Linux pipe semantics).
-    ///
-    /// # Safety: shared PipeBuffer lifetime
-    ///
-    /// Both parent and child hold raw pointers to the same PipeBuffer.
-    /// When either VfdTable is dropped, it frees the PipeBuffer via
-    /// Box::from_raw. This is safe only because cooperative scheduling
-    /// guarantees no concurrent access, and for fork-then-execve the child
-    /// gets a fresh fd table from execve. For long-lived parent/child pairs,
-    /// reference counting would be needed.
+    /// Clone fd table for fork(). Arc reference counts are incremented,
+    /// so PipeBuffer is freed only when all tables drop their references.
     pub fn clone_for_fork(&self) -> Self {
         let mut new_table = VfdTable {
             fds: HashMap::new(),
@@ -221,8 +276,9 @@ impl VfdTable {
         for (&fd_num, vfd) in &self.fds {
             let cloned = match vfd {
                 Vfd::Real(r) => Vfd::Real(*r),
-                Vfd::PipeRead(buf) => Vfd::PipeRead(*buf),
-                Vfd::PipeWrite(buf) => Vfd::PipeWrite(*buf),
+                Vfd::File(arc) => Vfd::File(Arc::clone(arc)),
+                Vfd::PipeRead(arc) => Vfd::PipeRead(Arc::clone(arc)),
+                Vfd::PipeWrite(arc) => Vfd::PipeWrite(Arc::clone(arc)),
             };
             new_table.fds.insert(fd_num, cloned);
         }
@@ -232,24 +288,29 @@ impl VfdTable {
 
 impl Drop for VfdTable {
     fn drop(&mut self) {
-        // Intentionally leak PipeBuffers. After fork(), parent and child fd tables
-        // share the same PipeBuffer pointers (via clone_for_fork). Dropping one table
-        // and calling Box::from_raw on a still-referenced PipeBuffer would be UB.
-        // PipeBuffers are freed when close() detects no other fd in the same table
-        // references them, or intentionally leaked if the table is dropped first.
-        // TODO: use Arc<PipeBuffer> for proper cross-table reference counting.
+        // Mark all pipe buffers as closed so any waiting coroutine can detect EOF.
+        // Deduplicate by Arc identity to avoid redundant close() calls.
+        let mut seen: Vec<*const PipeBuffer> = Vec::new();
+        for vfd in self.fds.values() {
+            let arc = match vfd {
+                Vfd::PipeRead(a) | Vfd::PipeWrite(a) => a,
+                _ => continue,
+            };
+            let ptr = Arc::as_ptr(arc);
+            if seen.iter().all(|&p| p != ptr) {
+                arc.close();
+                seen.push(ptr);
+            }
+        }
     }
 }
 
 // Global fd table storage, keyed by VPid.
-// Uses AtomicPtr (like EXECUTOR_PTR) to survive TLS reinitialization
-// when __libc_init runs inside a dlopen'd binary.
 use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 static FD_TABLES_PTR: AtomicPtr<StdHashMap<u32, VfdTable>> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Get or initialize the global fd tables map.
 fn get_tables_ptr() -> *mut StdHashMap<u32, VfdTable> {
     let ptr = FD_TABLES_PTR.load(Ordering::SeqCst);
     if !ptr.is_null() {
@@ -270,18 +331,15 @@ fn get_tables_ptr() -> *mut StdHashMap<u32, VfdTable> {
     }
 }
 
-/// Get the fd table for the given virtual process.
 pub fn get_table(vpid: u32) -> Option<&'static mut VfdTable> {
     unsafe { (*get_tables_ptr()).get_mut(&vpid) }
 }
 
-/// Get or create the fd table for a virtual process.
 pub fn get_or_create_table(vpid: u32) -> &'static mut VfdTable {
     let tables = unsafe { &mut *get_tables_ptr() };
     tables.entry(vpid).or_insert_with(VfdTable::new)
 }
 
-/// Clone the fd table of parent_vpid for child_vpid (used by virtual fork).
 pub fn fork_fd_table(parent_vpid: u32, child_vpid: u32) {
     let tables = unsafe { &mut *get_tables_ptr() };
     let child_table = match tables.get(&parent_vpid) {
@@ -289,6 +347,48 @@ pub fn fork_fd_table(parent_vpid: u32, child_vpid: u32) {
         None => VfdTable::new(),
     };
     tables.insert(child_vpid, child_table);
+}
+
+/// Remove a virtual process's fd table. Called when the coroutine exits.
+pub fn remove_table(vpid: u32) {
+    let ptr = get_tables_ptr();
+    if !ptr.is_null() {
+        unsafe { (*ptr).remove(&vpid); }
+    }
+}
+
+/// Remove a virtual process's fd table and return all real kernel fds
+/// from File entries that should be closed by the caller.
+/// Deduplicates by Arc identity so dup'd fds are not double-closed.
+pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
+    let ptr = get_tables_ptr();
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let table = match unsafe { (*ptr).remove(&vpid) } {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let mut fds = Vec::new();
+    let mut seen: Vec<*const FileRef> = Vec::new();
+    for vfd in table.fds.values() {
+        if let Vfd::File(arc) = vfd {
+            let ptr = Arc::as_ptr(arc);
+            if seen.iter().all(|&p| p != ptr) {
+                fds.push(arc.real_fd);
+                seen.push(ptr);
+            }
+        }
+    }
+    fds
+}
+
+/// Clean up the global fd tables map. Called during shutdown.
+pub fn cleanup() {
+    let ptr = FD_TABLES_PTR.swap(std::ptr::null_mut(), Ordering::SeqCst);
+    if !ptr.is_null() {
+        unsafe { drop(Box::from_raw(ptr)); }
+    }
 }
 
 /// Create a fd table for a virtual process with custom real fd mappings.
