@@ -154,6 +154,49 @@ pub unsafe fn real_close(fd: c_int) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Path resolution for per-coroutine cwd
+// ---------------------------------------------------------------------------
+
+fn resolve_path(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    let mut parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => { parts.pop(); }
+            _ => parts.push(component),
+        }
+    }
+    if parts.is_empty() { "/".to_string() } else { format!("/{}", parts.join("/")) }
+}
+
+/// Get the current coroutine's cwd, or None if using process cwd.
+fn get_cwd() -> Option<String> {
+    let vpid = current_vpid()?;
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() { return None; }
+    unsafe { (*ptr).vprocs.get(&vpid).and_then(|co| co.cwd.clone()) }
+}
+
+/// Get the process's real cwd via real libc getcwd.
+fn process_cwd() -> String {
+    let mut buf = [0u8; 4096];
+    unsafe {
+        let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
+            std::mem::transmute(real("getcwd\0"));
+        let ptr = f(buf.as_mut_ptr() as *mut c_char, buf.len());
+        if !ptr.is_null() {
+            let len = libc::strlen(buf.as_ptr() as *const c_char);
+            std::str::from_utf8(&buf[..len]).unwrap_or("/").to_string()
+        } else {
+            "/".to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // exit() / _exit()
 // ---------------------------------------------------------------------------
 
@@ -538,7 +581,8 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
                 }
                 if pipe_buf.is_closed() {
                     unsafe { *libc::__errno() = libc::EPIPE };
-                    return -1;
+                    crate::executor::vproc_exit_with_code(128 + libc::SIGPIPE as i32);
+                    unreachable!()
                 }
                 crate::executor::do_yield();
             } else {
@@ -680,13 +724,13 @@ pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
     // For positive pids, check if it's a virtual process
     if pid > 0 {
         let ptr = crate::executor::get_global_executor();
-        let exists = if ptr.is_null() {
-            false
-        } else {
-            unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) }
-        };
-        if exists {
-            // Virtual process — signal delivery not yet implemented, return success
+        if !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) } {
+            // Virtual process — queue the signal for delivery at next schedule
+            unsafe {
+                if let Some(co) = (*ptr).vprocs.get_mut(&(pid as u32)) {
+                    co.pending_signals.push(sig);
+                }
+            }
             return 0;
         }
     }
@@ -764,12 +808,141 @@ pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn raise(sig: c_int) -> c_int {
-    // raise() sends a signal to the current (real) process/thread.
-    // In vproc the "current process" is the real OS process, so always
-    // pass through.
+    if enabled() {
+        let vpid = current_vpid();
+        if vpid.is_some() {
+            let ptr = crate::executor::get_global_executor();
+            if !ptr.is_null() {
+                unsafe {
+                    if let Some(co) = (*ptr).vprocs.get_mut(&vpid.unwrap()) {
+                        match sig {
+                            libc::SIGKILL | libc::SIGTERM => {
+                                crate::executor::vproc_exit_with_code(128 + sig);
+                                unreachable!()
+                            }
+                            _ => co.pending_signals.push(sig),
+                        }
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+    // Not in a coroutine or not enabled — pass through to real raise
     unsafe {
         let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("raise\0"));
         f(sig)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// chdir() / getcwd()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn chdir(path: *const c_char) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(*const c_char) -> c_int =
+                std::mem::transmute(real("chdir\0"));
+            return f(path);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(*const c_char) -> c_int =
+                std::mem::transmute(real("chdir\0"));
+            return f(path);
+        }
+    };
+
+    let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
+
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        unsafe {
+            let f: extern "C" fn(*const c_char) -> c_int =
+                std::mem::transmute(real("chdir\0"));
+            return f(path);
+        }
+    }
+
+    unsafe {
+        let ex = &mut *ptr;
+        if let Some(co) = ex.vprocs.get_mut(&vpid) {
+            let resolved = match &co.cwd {
+                Some(cwd) => resolve_path(cwd, &path_str),
+                None => resolve_path(&process_cwd(), &path_str),
+            };
+            let c_resolved = match std::ffi::CString::new(resolved.clone()) {
+                Ok(s) => s,
+                Err(_) => {
+                    *libc::__errno() = libc::EINVAL;
+                    return -1;
+                }
+            };
+            // Call real chdir so that real fork() children inherit the correct cwd.
+            // Cooperative scheduling guarantees only one coroutine runs at a time,
+            // so the real process cwd always matches the currently-running coroutine's cwd.
+            let f: extern "C" fn(*const c_char) -> c_int =
+                std::mem::transmute(real("chdir\0"));
+            let ret = f(c_resolved.as_ptr());
+            if ret == 0 {
+                co.cwd = Some(resolved);
+            }
+            return ret;
+        }
+    }
+
+    unsafe {
+        let f: extern "C" fn(*const c_char) -> c_int =
+            std::mem::transmute(real("chdir\0"));
+        f(path)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
+                std::mem::transmute(real("getcwd\0"));
+            return f(buf, size);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
+                std::mem::transmute(real("getcwd\0"));
+            return f(buf, size);
+        }
+    };
+
+    let ptr = crate::executor::get_global_executor();
+    if !ptr.is_null() {
+        unsafe {
+            if let Some(co) = (*ptr).vprocs.get(&vpid) {
+                if let Some(ref cwd) = co.cwd {
+                    let bytes = cwd.as_bytes();
+                    if bytes.len() + 1 > size {
+                        *libc::__errno() = libc::ERANGE;
+                        return std::ptr::null_mut();
+                    }
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                    *buf.add(bytes.len()) = 0;
+                    return buf;
+                }
+            }
+        }
+    }
+
+    // No per-coroutine cwd — fall back to real getcwd
+    unsafe {
+        let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
+            std::mem::transmute(real("getcwd\0"));
+        f(buf, size)
     }
 }
 
@@ -795,10 +968,32 @@ pub extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int 
         }
     };
 
+    // Resolve relative paths against per-coroutine cwd
+    let resolved_path = match get_cwd() {
+        Some(ref cwd) => {
+            let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
+            if path_str.starts_with('/') {
+                None // absolute path, use as-is
+            } else {
+                match std::ffi::CString::new(resolve_path(cwd, &path_str)) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        unsafe { *libc::__errno() = libc::EINVAL; }
+                        return -1;
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+    let open_path = resolved_path.as_ref()
+        .map(|cs| cs.as_ptr())
+        .unwrap_or(path);
+
     let real_fd = unsafe {
         let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
             std::mem::transmute(real("open\0"));
-        f(path, flags, mode)
+        f(open_path, flags, mode)
     };
     if real_fd < 0 {
         return real_fd;
@@ -827,10 +1022,37 @@ pub extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: 
         }
     };
 
+    // Resolve relative paths against per-coroutine cwd when dirfd == AT_FDCWD
+    let at_fdcwd: c_int = -100; // libc::AT_FDCWD
+    let resolved_path = if dirfd == at_fdcwd {
+        match get_cwd() {
+            Some(ref cwd) => {
+                let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
+                if path_str.starts_with('/') {
+                    None
+                } else {
+                    match std::ffi::CString::new(resolve_path(cwd, &path_str)) {
+                        Ok(s) => Some(s),
+                        Err(_) => {
+                            unsafe { *libc::__errno() = libc::EINVAL; }
+                            return -1;
+                        }
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let open_path = resolved_path.as_ref()
+        .map(|cs| cs.as_ptr())
+        .unwrap_or(path);
+
     let real_fd = unsafe {
         let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
             std::mem::transmute(real("openat\0"));
-        f(dirfd, path, flags, mode)
+        f(dirfd, open_path, flags, mode)
     };
     if real_fd < 0 {
         return real_fd;
