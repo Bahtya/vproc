@@ -31,6 +31,9 @@ pub struct Coroutine {
     pub pending_signals: Vec<i32>,
     /// Per-coroutine working directory. None = use process cwd.
     pub cwd: Option<String>,
+    /// Path of the cached binary this coroutine is executing.
+    /// Used to track active users for auto-dlclose when the coroutine exits.
+    pub binary_path: Option<String>,
 }
 
 // Assembly trampoline: vproc_switch restores x19=f_ptr then `ret` jumps here.
@@ -131,6 +134,7 @@ impl Coroutine {
             mapped_regions: Vec::new(),
             pending_signals: Vec::new(),
             cwd: None,
+            binary_path: None,
         }
     }
 
@@ -243,6 +247,7 @@ impl Coroutine {
             mapped_regions: Vec::new(),
             pending_signals: Vec::new(),
             cwd: None,
+            binary_path: None,
         }
     }
 
@@ -311,6 +316,7 @@ impl Coroutine {
             mapped_regions: Vec::new(),
             pending_signals: Vec::new(),
             cwd: parent.cwd.clone(),
+            binary_path: None,
         }
     }
 }
