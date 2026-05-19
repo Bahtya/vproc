@@ -111,6 +111,17 @@ impl VfdTable {
         table
     }
 
+    pub fn new_with_fds(stdin: i32, stdout: i32, stderr: i32) -> Self {
+        let mut table = VfdTable {
+            fds: HashMap::new(),
+            next_fd: 3,
+        };
+        table.fds.insert(0, Vfd::Real(stdin));
+        table.fds.insert(1, Vfd::Real(stdout));
+        table.fds.insert(2, Vfd::Real(stderr));
+        table
+    }
+
     fn alloc_fd(&mut self) -> u32 {
         let fd = self.next_fd;
         self.next_fd += 1;
@@ -278,4 +289,12 @@ pub fn fork_fd_table(parent_vpid: u32, child_vpid: u32) {
         None => VfdTable::new(),
     };
     tables.insert(child_vpid, child_table);
+}
+
+/// Create a fd table for a virtual process with custom real fd mappings.
+/// Used by vproc_ffi_create_process to map fd 0/1/2 to specific real fds (e.g. PTY slave).
+pub fn create_table_with_fds(vpid: u32, stdin: i32, stdout: i32, stderr: i32) -> &'static mut VfdTable {
+    let tables = unsafe { &mut *get_tables_ptr() };
+    tables.insert(vpid, VfdTable::new_with_fds(stdin, stdout, stderr));
+    tables.get_mut(&vpid).unwrap()
 }
