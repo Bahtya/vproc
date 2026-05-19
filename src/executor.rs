@@ -120,7 +120,7 @@ impl Executor {
         self.current
     }
 
-    fn pick_next(&mut self) -> Option<VPid> {
+    pub fn pick_next(&mut self) -> Option<VPid> {
         while let Some(pid) = self.ready_queue.pop_front() {
             if let Some(co) = self.vprocs.get(&pid) {
                 if !co.is_done() {
@@ -209,12 +209,8 @@ impl Executor {
             kids.retain(|k| self.vprocs.contains_key(k));
             !kids.is_empty()
         });
-        let mut released_binaries: Vec<String> = Vec::new();
         self.vprocs.retain(|&pid, co| {
             if co.is_done() {
-                if let Some(ref path) = co.binary_path {
-                    released_binaries.push(path.clone());
-                }
                 let real_fds = crate::vfd::remove_table_and_get_fds(pid);
                 for fd in real_fds {
                     unsafe { crate::preload::real_close(fd); }
@@ -224,7 +220,10 @@ impl Executor {
                 true
             }
         });
-        crate::vexec::release_binaries(&released_binaries);
+        // Don't release binary cache here — dlclose triggers __libc_init
+        // which resets minicoro's thread-local _mco_main_ctx, breaking
+        // subsequent coroutine context switching. Binary cache is managed
+        // explicitly via unload_binary/unload_all_binaries.
     }
 
     pub fn block_on_all(&mut self) {
@@ -268,8 +267,6 @@ pub fn vproc_exit_with_code(code: i32) {
         co.exit_code = code;
     }
     ex.exit_codes.insert(pid, code);
-    // Yield back to the driver thread via minicoro.
-    // Use mco_running() to avoid double-&mut on vprocs.
     unsafe {
         let co = mco_running_raw();
         if !co.is_null() {
@@ -344,7 +341,6 @@ impl Executor {
         self.current = Some(next_pid);
         self.switch_count += 1;
         self.vprocs.get_mut(&next_pid).unwrap().resume();
-        // Clear current so do_yield knows we're back on the driver thread.
         self.current = None;
     }
 }
