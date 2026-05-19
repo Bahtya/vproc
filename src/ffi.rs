@@ -379,22 +379,24 @@ pub extern "C" fn vproc_ffi_create_process(
 
 /// Drive the scheduler until the given vpid exits.
 /// Returns the exit code. Blocks the calling thread.
+///
+/// Mutex is released before do_yield() to prevent deadlock when multiple
+/// sessions' waiter threads call this concurrently.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
     loop {
-        let _guard = EXECUTOR_MUTEX.lock().unwrap();
-        match crate::executor::get_exit_code(vpid) {
-            Some(code) => return code,
-            None => {}
+        {
+            let _guard = EXECUTOR_MUTEX.lock().unwrap();
+            match crate::executor::get_exit_code(vpid) {
+                Some(code) => return code,
+                None => {}
+            }
+            let ptr = crate::executor::get_global_executor();
+            if ptr.is_null() || !unsafe { (*ptr).vprocs.contains_key(&vpid) } {
+                return -1;
+            }
         }
-        // Check if vpid still exists
-        let ptr = crate::executor::get_global_executor();
-        if ptr.is_null() {
-            return -1;
-        }
-        if !unsafe { (*ptr).vprocs.contains_key(&vpid) } {
-            return -1;
-        }
+        // Mutex released — safe to yield (may switch to coroutine)
         crate::executor::do_yield();
     }
 }
