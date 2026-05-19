@@ -210,6 +210,7 @@ pub extern "C" fn _exit(code: c_int) -> ! {
     }
     if current_vpid().is_some() {
         crate::executor::vproc_exit_with_code(code);
+        loop { std::hint::spin_loop(); }
     }
     unsafe {
         std::arch::asm!(
@@ -232,6 +233,11 @@ pub extern "C" fn exit(code: c_int) -> ! {
     let vpid = current_vpid();
     if vpid.is_some() {
         crate::executor::vproc_exit_with_code(code);
+        // vproc_exit_with_code yields via mco_yield_raw. After it returns,
+        // the coroutine has been re-resumed by the scheduler (shouldn't happen
+        // for Done coroutines). But the caller expects exit() to never return.
+        // Loop forever as a safety net.
+        loop { std::hint::spin_loop(); }
     }
     unsafe {
         std::arch::asm!(

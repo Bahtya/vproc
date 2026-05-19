@@ -6,6 +6,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::sync::Arc;
 
 const PIPE_CAPACITY: usize = 65536; // 64 KiB pipe buffer
@@ -136,6 +137,27 @@ impl VfdTable {
         table.fds.insert(1, Vfd::Real(1));
         table.fds.insert(2, Vfd::Real(2));
         table
+    }
+
+    /// Get the real kernel fds for virtual fds 0, 1, 2.
+    /// Returns None if any of them is missing or not a real fd.
+    pub fn get_real_fds_012(&self) -> Option<[c_int; 3]> {
+        let fd0 = match self.fds.get(&0)? {
+            Vfd::Real(r) => *r,
+            Vfd::File(f) => f.real_fd,
+            _ => return None,
+        };
+        let fd1 = match self.fds.get(&1)? {
+            Vfd::Real(r) => *r,
+            Vfd::File(f) => f.real_fd,
+            _ => return None,
+        };
+        let fd2 = match self.fds.get(&2)? {
+            Vfd::Real(r) => *r,
+            Vfd::File(f) => f.real_fd,
+            _ => return None,
+        };
+        Some([fd0, fd1, fd2])
     }
 
     pub fn new_with_fds(stdin: i32, stdout: i32, stderr: i32) -> Self {
@@ -398,4 +420,9 @@ pub fn create_table_with_fds(vpid: u32, stdin: i32, stdout: i32, stderr: i32) ->
     let tables = unsafe { &mut *get_tables_ptr() };
     tables.insert(vpid, VfdTable::new_with_fds(stdin, stdout, stderr));
     tables.get_mut(&vpid).unwrap()
+}
+
+/// Get real kernel fds [stdin, stdout, stderr] for a vpid.
+pub fn get_real_fds(vpid: u32) -> Option<[i32; 3]> {
+    get_table(vpid).and_then(|t| t.get_real_fds_012())
 }

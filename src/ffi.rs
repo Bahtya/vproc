@@ -477,7 +477,42 @@ fn start_driver_once() {
     });
 }
 
+/// Raw dup3 syscall — bypasses LD_PRELOAD interceptors.
+/// aarch64 has no __NR_dup2; dup3(old, new, 0) is equivalent.
+#[cfg(target_arch = "aarch64")]
+unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) {
+    if old_fd < 0 || old_fd == new_fd {
+        return;
+    }
+    let ret: isize;
+    std::arch::asm!(
+        "mov x8, #24",
+        "svc #0",
+        lateout("x0") ret,
+        in("x0") old_fd,
+        in("x1") new_fd,
+        in("x2") 0usize,
+    );
+    if ret < 0 {
+        let msg = format!("vproc: raw_dup3({}, {}) failed\n", old_fd, new_fd);
+        libc::syscall(64, 2, msg.as_ptr(), msg.len());
+    }
+}
+
+/// Save driver thread's real fd 0/1/2, install the coroutine's real fds
+/// (from vfd table), run one scheduler step, then restore original fds.
+/// This ensures real fork children inherit the correct fds from the
+/// currently-running coroutine's fd table.
 fn run_driver_loop() {
+    // Save driver thread's original fds on first iteration.
+    let saved_fds: [c_int; 3] = unsafe {
+        [
+            libc::dup(0),
+            libc::dup(1),
+            libc::dup(2),
+        ]
+    };
+
     loop {
         // 1. Drain spawn queue — driver owns the Executor exclusively
         let requests: Vec<SpawnRequest> = SPAWN_QUEUE.lock().unwrap().drain(..).collect();
@@ -498,10 +533,27 @@ fn run_driver_loop() {
             cvar.notify_all();
         }
 
-        // 2. Drive the scheduler (runs coroutines via context_switch)
+        // 2. Drive the scheduler — swap fds around each coroutine resume
         let ptr = crate::executor::get_global_executor();
         if !ptr.is_null() {
-            crate::executor::do_yield();
+            unsafe {
+                let ex = &mut *ptr;
+                if let Some(next_pid) = ex.pick_next() {
+                    // Install the coroutine's real fds so fork children inherit them
+                    if let Some(real_fds) = crate::vfd::get_real_fds(next_pid) {
+                        raw_dup3(real_fds[0], 0);
+                        raw_dup3(real_fds[1], 1);
+                        raw_dup3(real_fds[2], 2);
+                    }
+                    ex.current = Some(next_pid);
+                    ex.vprocs.get_mut(&next_pid).unwrap().resume();
+                    ex.current = None;
+                    // Restore driver's original fds
+                    raw_dup3(saved_fds[0], 0);
+                    raw_dup3(saved_fds[1], 1);
+                    raw_dup3(saved_fds[2], 2);
+                }
+            }
         }
 
         // 3. Check waiters — signal completed ones
@@ -524,8 +576,7 @@ fn run_driver_loop() {
             cvar.notify_all();
         }
 
-        // 3b. Reap done coroutines — clean up fd tables, mapped regions,
-        //     binary cache entries. Prevents resource leaks across sessions.
+        // 3b. Reap done coroutines
         let ptr = crate::executor::get_global_executor();
         if !ptr.is_null() {
             unsafe { (*ptr).reap_done_coroutines(); }
@@ -534,7 +585,6 @@ fn run_driver_loop() {
         // 4. Block until new work arrives (spawn request or waiter registration)
         if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
             let guard = DRIVER_LOCK.lock().unwrap();
-            // Re-check after acquiring lock to avoid missed wakeup
             if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
                 let _guard = DRIVER_WAKE.wait(guard);
             }
