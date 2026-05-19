@@ -446,10 +446,17 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
         .unwrap_or(false);
 
     if !is_virtual {
+        let real_fd = crate::vfd::get_table(vpid)
+            .and_then(|t| t.get(fd as u32))
+            .map(|vfd| match vfd {
+                crate::vfd::Vfd::Real(r) => *r,
+                _ => fd,
+            })
+            .unwrap_or(fd);
         unsafe {
             let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
                 std::mem::transmute(real("read\0"));
-            return f(fd, buf, count);
+            return f(real_fd, buf, count);
         }
     }
 
@@ -498,10 +505,17 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
         .unwrap_or(false);
 
     if !is_virtual {
+        let real_fd = crate::vfd::get_table(vpid)
+            .and_then(|t| t.get(fd as u32))
+            .map(|vfd| match vfd {
+                crate::vfd::Vfd::Real(r) => *r,
+                _ => fd,
+            })
+            .unwrap_or(fd);
         unsafe {
             let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
                 std::mem::transmute(real("write\0"));
-            return f(fd, buf, count);
+            return f(real_fd, buf, count);
         }
     }
 
@@ -557,9 +571,9 @@ pub extern "C" fn close(fd: c_int) -> c_int {
         }
     };
     match table.get(fd as u32) {
-        Some(crate::vfd::Vfd::Real(_)) => unsafe {
+        Some(crate::vfd::Vfd::Real(real_fd)) => unsafe {
             let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            f(fd)
+            f(*real_fd)
         },
         Some(_) => match table.close(fd as u32) {
             Ok(()) => 0,
