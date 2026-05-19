@@ -98,12 +98,12 @@ fn enabled() -> bool {
 /// Resolve a real libc function via dlsym(RTLD_NEXT).
 /// Uses a dlsym cache with manual synchronization (cooperative scheduling
 /// guarantees single-threaded access; AtomicUsize for count ensures safe init).
-struct DlsymCache(UnsafeCell<[(*const u8, *mut c_void); 32]>);
+struct DlsymCache(UnsafeCell<[(*const u8, *mut c_void); 64]>);
 unsafe impl Sync for DlsymCache {}
 
 unsafe fn real(sym: &'static str) -> *mut c_void {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    static CACHE: DlsymCache = DlsymCache(UnsafeCell::new([(std::ptr::null(), std::ptr::null_mut()); 32]));
+    static CACHE: DlsymCache = DlsymCache(UnsafeCell::new([(std::ptr::null(), std::ptr::null_mut()); 64]));
     static COUNT: AtomicUsize = AtomicUsize::new(0);
 
     let count = COUNT.load(Ordering::Acquire);
@@ -122,7 +122,7 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
         libc::_exit(99);
     }
     let idx = COUNT.fetch_add(1, Ordering::AcqRel);
-    if idx < 32 {
+    if idx < 64 {
         (*CACHE.0.get())[idx] = (sym.as_ptr(), ptr);
     }
     ptr
@@ -145,6 +145,12 @@ static REAL_FORK_CHILD: AtomicBool = AtomicBool::new(false);
 
 fn is_real_fork_child() -> bool {
     REAL_FORK_CHILD.load(Ordering::SeqCst)
+}
+
+/// Call the real libc close() bypassing our interceptor.
+pub unsafe fn real_close(fd: c_int) -> c_int {
+    let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
+    f(fd)
 }
 
 // ---------------------------------------------------------------------------
@@ -439,10 +445,10 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
         }
     };
 
-    // Check if this is a virtual fd
+    // Check if this is a virtual pipe fd
     let is_virtual = crate::vfd::get_table(vpid)
         .and_then(|t| t.get(fd as u32))
-        .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
+        .map(|vfd| matches!(vfd, crate::vfd::Vfd::PipeRead(_) | crate::vfd::Vfd::PipeWrite(_)))
         .unwrap_or(false);
 
     if !is_virtual {
@@ -450,6 +456,7 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
             .and_then(|t| t.get(fd as u32))
             .map(|vfd| match vfd {
                 crate::vfd::Vfd::Real(r) => *r,
+                crate::vfd::Vfd::File(f) => f.real_fd,
                 _ => fd,
             })
             .unwrap_or(fd);
@@ -501,7 +508,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
 
     let is_virtual = crate::vfd::get_table(vpid)
         .and_then(|t| t.get(fd as u32))
-        .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
+        .map(|vfd| matches!(vfd, crate::vfd::Vfd::PipeRead(_) | crate::vfd::Vfd::PipeWrite(_)))
         .unwrap_or(false);
 
     if !is_virtual {
@@ -509,6 +516,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
             .and_then(|t| t.get(fd as u32))
             .map(|vfd| match vfd {
                 crate::vfd::Vfd::Real(r) => *r,
+                crate::vfd::Vfd::File(f) => f.real_fd,
                 _ => fd,
             })
             .unwrap_or(fd);
@@ -575,6 +583,12 @@ pub extern "C" fn close(fd: c_int) -> c_int {
             let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
             f(*real_fd)
         },
+        Some(crate::vfd::Vfd::File(_)) => {
+            if let Some(real_fd) = table.close_file_fd(fd as u32) {
+                unsafe { real_close(real_fd); }
+            }
+            0
+        }
         Some(_) => match table.close(fd as u32) {
             Ok(()) => 0,
             Err(_) => {
@@ -756,5 +770,206 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
     unsafe {
         let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("raise\0"));
         f(sig)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// open() / openat() / creat()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
+                std::mem::transmute(real("open\0"));
+            return f(path, flags, mode);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
+                std::mem::transmute(real("open\0"));
+            return f(path, flags, mode);
+        }
+    };
+
+    let real_fd = unsafe {
+        let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
+            std::mem::transmute(real("open\0"));
+        f(path, flags, mode)
+    };
+    if real_fd < 0 {
+        return real_fd;
+    }
+
+    let cloexec = (flags & libc::O_CLOEXEC) != 0;
+    let table = crate::vfd::get_or_create_table(vpid);
+    table.insert_file(real_fd, cloexec) as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
+                std::mem::transmute(real("openat\0"));
+            return f(dirfd, path, flags, mode);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
+                std::mem::transmute(real("openat\0"));
+            return f(dirfd, path, flags, mode);
+        }
+    };
+
+    let real_fd = unsafe {
+        let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
+            std::mem::transmute(real("openat\0"));
+        f(dirfd, path, flags, mode)
+    };
+    if real_fd < 0 {
+        return real_fd;
+    }
+
+    let cloexec = (flags & libc::O_CLOEXEC) != 0;
+    let table = crate::vfd::get_or_create_table(vpid);
+    table.insert_file(real_fd, cloexec) as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn creat(path: *const c_char, mode: c_int) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(*const c_char, c_int) -> c_int =
+                std::mem::transmute(real("creat\0"));
+            return f(path, mode);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(*const c_char, c_int) -> c_int =
+                std::mem::transmute(real("creat\0"));
+            return f(path, mode);
+        }
+    };
+
+    let real_fd = unsafe {
+        let f: extern "C" fn(*const c_char, c_int) -> c_int =
+            std::mem::transmute(real("creat\0"));
+        f(path, mode)
+    };
+    if real_fd < 0 {
+        return real_fd;
+    }
+
+    let table = crate::vfd::get_or_create_table(vpid);
+    table.insert_file(real_fd, false) as c_int
+}
+
+// ---------------------------------------------------------------------------
+// fstat() / lseek()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
+                std::mem::transmute(real("fstat\0"));
+            return f(fd, buf);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
+                std::mem::transmute(real("fstat\0"));
+            return f(fd, buf);
+        }
+    };
+
+    let table = match crate::vfd::get_table(vpid) {
+        Some(t) => t,
+        None => unsafe {
+            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
+                std::mem::transmute(real("fstat\0"));
+            return f(fd, buf);
+        }
+    };
+
+    match table.get(fd as u32) {
+        Some(crate::vfd::Vfd::Real(real_fd)) => unsafe {
+            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
+                std::mem::transmute(real("fstat\0"));
+            f(*real_fd, buf)
+        },
+        Some(crate::vfd::Vfd::File(file_ref)) => unsafe {
+            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
+                std::mem::transmute(real("fstat\0"));
+            f(file_ref.real_fd, buf)
+        },
+        Some(_) => {
+            unsafe { *libc::__errno() = libc::ESPIPE; }
+            -1
+        },
+        None => {
+            unsafe { *libc::__errno() = libc::EBADF; }
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lseek(fd: c_int, offset: isize, whence: c_int) -> isize {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(c_int, isize, c_int) -> isize =
+                std::mem::transmute(real("lseek\0"));
+            return f(fd, offset, whence);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(c_int, isize, c_int) -> isize =
+                std::mem::transmute(real("lseek\0"));
+            return f(fd, offset, whence);
+        }
+    };
+
+    let table = match crate::vfd::get_table(vpid) {
+        Some(t) => t,
+        None => unsafe {
+            let f: extern "C" fn(c_int, isize, c_int) -> isize =
+                std::mem::transmute(real("lseek\0"));
+            return f(fd, offset, whence);
+        }
+    };
+
+    match table.get(fd as u32) {
+        Some(crate::vfd::Vfd::Real(real_fd)) => unsafe {
+            let f: extern "C" fn(c_int, isize, c_int) -> isize =
+                std::mem::transmute(real("lseek\0"));
+            f(*real_fd, offset, whence)
+        },
+        Some(crate::vfd::Vfd::File(file_ref)) => unsafe {
+            let f: extern "C" fn(c_int, isize, c_int) -> isize =
+                std::mem::transmute(real("lseek\0"));
+            f(file_ref.real_fd, offset, whence)
+        },
+        Some(_) => {
+            unsafe { *libc::__errno() = libc::ESPIPE; }
+            -1
+        },
+        None => {
+            unsafe { *libc::__errno() = libc::EBADF; }
+            -1
+        }
     }
 }

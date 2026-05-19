@@ -208,7 +208,10 @@ impl Executor {
         });
         self.vprocs.retain(|&pid, co| {
             if co.is_done() {
-                crate::vfd::remove_table(pid);
+                let real_fds = crate::vfd::remove_table_and_get_fds(pid);
+                for fd in real_fds {
+                    unsafe { crate::preload::real_close(fd); }
+                }
                 false
             } else {
                 true

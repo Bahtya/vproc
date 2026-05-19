@@ -248,6 +248,13 @@ pub fn virtual_execve_via_entry(
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
         }
+        // Close fds marked close-on-exec in the new process
+        if let Some(child_table) = crate::vfd::get_table(vpid) {
+            let real_fds = child_table.close_cloexec();
+            for rfd in real_fds {
+                unsafe { crate::preload::real_close(rfd); }
+            }
+        }
         return Ok(VirtualExec { vpid });
     }
 
@@ -331,6 +338,13 @@ pub fn virtual_execve_via_entry(
     // Inherit fd table from current coroutine (Linux execve preserves fds)
     if let Some(pid) = current_pid {
         crate::vfd::fork_fd_table(pid, vpid);
+    }
+    // Close fds marked close-on-exec in the new process
+    if let Some(child_table) = crate::vfd::get_table(vpid) {
+        let real_fds = child_table.close_cloexec();
+        for rfd in real_fds {
+            unsafe { crate::preload::real_close(rfd); }
+        }
     }
 
     Ok(VirtualExec { vpid })
@@ -563,6 +577,11 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
             "getpgid" => crate::preload::getpgid as *const c_void as usize,
             "setpgid" => crate::preload::setpgid as *const c_void as usize,
             "raise" => crate::preload::raise as *const c_void as usize,
+            "open" => crate::preload::open as *const c_void as usize,
+            "openat" => crate::preload::openat as *const c_void as usize,
+            "creat" => crate::preload::creat as *const c_void as usize,
+            "fstat" => crate::preload::fstat as *const c_void as usize,
+            "lseek" => crate::preload::lseek as *const c_void as usize,
             _ => continue,
         };
 

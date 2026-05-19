@@ -10,10 +10,20 @@ use std::sync::Arc;
 
 const PIPE_CAPACITY: usize = 65536; // 64 KiB pipe buffer
 
+/// Reference to a real kernel fd opened by a virtual process.
+/// Arc reference counting ensures the real fd is closed only when all
+/// virtual fd table entries (from dup/fork) are gone.
+pub struct FileRef {
+    pub real_fd: i32,
+    pub cloexec: bool,
+}
+
 /// A virtual file descriptor.
 pub enum Vfd {
-    /// Pass-through to a real kernel fd.
+    /// Pass-through to a real kernel fd (stdin/stdout/stderr).
     Real(i32),
+    /// A real kernel fd opened by the virtual process.
+    File(Arc<FileRef>),
     /// Reading end of a virtual pipe.
     PipeRead(Arc<PipeBuffer>),
     /// Writing end of a virtual pipe.
@@ -180,6 +190,48 @@ impl VfdTable {
         }
     }
 
+    /// Insert a real kernel fd as a File entry. Returns the virtual fd number.
+    pub fn insert_file(&mut self, real_fd: i32, cloexec: bool) -> u32 {
+        let fd = self.alloc_fd();
+        self.fds.insert(fd, Vfd::File(Arc::new(FileRef { real_fd, cloexec })));
+        fd
+    }
+
+    /// Remove a File entry from the table. Returns the real fd if no other
+    /// virtual fd in this table still references it (caller should close it).
+    /// Returns None if the fd was not a File entry or is still referenced.
+    pub fn close_file_fd(&mut self, fd: u32) -> Option<i32> {
+        let arc = match self.fds.get(&fd) {
+            Some(Vfd::File(arc)) => Arc::clone(arc),
+            _ => return None,
+        };
+        self.fds.remove(&fd);
+        let still_referenced = self.fds.values().any(|vfd| match vfd {
+            Vfd::File(a) => Arc::ptr_eq(a, &arc),
+            _ => false,
+        });
+        if still_referenced {
+            None
+        } else {
+            Some(arc.real_fd)
+        }
+    }
+
+    /// Close all fds marked close-on-exec. Returns real fds that should be closed.
+    pub fn close_cloexec(&mut self) -> Vec<i32> {
+        let cloexec_fds: Vec<u32> = self.fds.iter()
+            .filter(|(_, vfd)| matches!(vfd, Vfd::File(f) if f.cloexec))
+            .map(|(&fd, _)| fd)
+            .collect();
+        let mut real_fds = Vec::new();
+        for fd in cloexec_fds {
+            if let Some(rfd) = self.close_file_fd(fd) {
+                real_fds.push(rfd);
+            }
+        }
+        real_fds
+    }
+
     pub fn dup(&mut self, old_fd: u32) -> Result<u32, i32> {
         let new_fd = self.alloc_fd();
         self.dup2(old_fd, new_fd)
@@ -193,6 +245,7 @@ impl VfdTable {
             Some(vfd) => {
                 let clone = match vfd {
                     Vfd::Real(fd) => Vfd::Real(*fd),
+                    Vfd::File(arc) => Vfd::File(Arc::clone(arc)),
                     Vfd::PipeRead(arc) => Vfd::PipeRead(Arc::clone(arc)),
                     Vfd::PipeWrite(arc) => Vfd::PipeWrite(Arc::clone(arc)),
                 };
@@ -223,6 +276,7 @@ impl VfdTable {
         for (&fd_num, vfd) in &self.fds {
             let cloned = match vfd {
                 Vfd::Real(r) => Vfd::Real(*r),
+                Vfd::File(arc) => Vfd::File(Arc::clone(arc)),
                 Vfd::PipeRead(arc) => Vfd::PipeRead(Arc::clone(arc)),
                 Vfd::PipeWrite(arc) => Vfd::PipeWrite(Arc::clone(arc)),
             };
@@ -301,6 +355,26 @@ pub fn remove_table(vpid: u32) {
     if !ptr.is_null() {
         unsafe { (*ptr).remove(&vpid); }
     }
+}
+
+/// Remove a virtual process's fd table and return all real kernel fds
+/// from File entries that should be closed by the caller.
+pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
+    let ptr = get_tables_ptr();
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let table = match unsafe { (*ptr).remove(&vpid) } {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let mut fds = Vec::new();
+    for vfd in table.fds.values() {
+        if let Vfd::File(arc) = vfd {
+            fds.push(arc.real_fd);
+        }
+    }
+    fds
 }
 
 /// Clean up the global fd tables map. Called during shutdown.

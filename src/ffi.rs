@@ -149,10 +149,20 @@ pub extern "C" fn vproc_ffi_pipe_is_closed(vpid: u32, fd: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn vproc_ffi_close(vpid: u32, fd: c_int) -> c_int {
     match crate::vfd::get_table(vpid) {
-        Some(t) => match t.close(fd as u32) {
-            Ok(()) => 0,
-            Err(_) => -1,
-        },
+        Some(t) => {
+            match t.get(fd as u32) {
+                Some(crate::vfd::Vfd::File(_)) => {
+                    if let Some(real_fd) = t.close_file_fd(fd as u32) {
+                        unsafe { crate::preload::real_close(real_fd); }
+                    }
+                    0
+                }
+                _ => match t.close(fd as u32) {
+                    Ok(()) => 0,
+                    Err(_) => -1,
+                }
+            }
+        }
         None => -1,
     }
 }
