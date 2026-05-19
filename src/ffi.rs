@@ -410,3 +410,30 @@ pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
         crate::executor::do_yield();
     }
 }
+
+/// Get the per-coroutine working directory.
+/// Returns 0 on success, -1 if no cwd set or vpid not found.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return -1;
+    }
+    unsafe {
+        match (*ptr).vprocs.get(&vpid) {
+            Some(co) => match &co.cwd {
+                Some(cwd) => {
+                    let bytes = cwd.as_bytes();
+                    if bytes.len() + 1 > size {
+                        return -1;
+                    }
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                    *buf.add(bytes.len()) = 0;
+                    0
+                }
+                None => -1,
+            },
+            None => -1,
+        }
+    }
+}

@@ -167,6 +167,18 @@ impl Executor {
                 };
 
                 self.vprocs.get_mut(&next_pid).unwrap().state = State::Running;
+
+                // Deliver pending signals before executing the coroutine
+                if self.deliver_signals(next_pid) {
+                    // Signal killed it — don't context-switch, re-schedule
+                    self.current = None;
+                    if current_pid != MAIN_VPID {
+                        self.ready_queue.push_back(current_pid);
+                    }
+                    self.schedule();
+                    return;
+                }
+
                 self.current = Some(next_pid);
                 self.switch_count += 1;
 
@@ -228,6 +240,36 @@ impl Executor {
             }
         }
         None
+    }
+
+    /// Deliver pending signals to a coroutine. Returns true if the coroutine was killed.
+    fn deliver_signals(&mut self, pid: VPid) -> bool {
+        let signals: Vec<i32> = self.vprocs.get(&pid)
+            .map(|co| co.pending_signals.clone())
+            .unwrap_or_default();
+        if signals.is_empty() {
+            return false;
+        }
+        for sig in &signals {
+            match *sig {
+                9 | 15 => {
+                    // SIGKILL/SIGTERM: terminate the coroutine
+                    if let Some(co) = self.vprocs.get_mut(&pid) {
+                        co.state = State::Done;
+                        co.exit_code = 128 + sig;
+                        co.pending_signals.clear();
+                    }
+                    return true;
+                }
+                _ => {
+                    // Other signals: ignore (no sigaction handler support yet)
+                }
+            }
+        }
+        if let Some(co) = self.vprocs.get_mut(&pid) {
+            co.pending_signals.clear();
+        }
+        false
     }
 
     pub fn switch_count(&self) -> u64 {

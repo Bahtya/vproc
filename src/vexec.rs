@@ -582,6 +582,8 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
             "creat" => crate::preload::creat as *const c_void as usize,
             "fstat" => crate::preload::fstat as *const c_void as usize,
             "lseek" => crate::preload::lseek as *const c_void as usize,
+            "chdir" => crate::preload::chdir as *const c_void as usize,
+            "getcwd" => crate::preload::getcwd as *const c_void as usize,
             _ => continue,
         };
 

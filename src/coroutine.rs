@@ -27,6 +27,10 @@ pub struct Coroutine {
     pub c_strings: Vec<*mut u8>,
     /// mmap'd regions to munmap on Drop (base, size).
     pub mapped_regions: Vec<(usize, usize)>,
+    /// Queued signals to deliver before next context switch.
+    pub pending_signals: Vec<i32>,
+    /// Per-coroutine working directory. None = use process cwd.
+    pub cwd: Option<String>,
 }
 
 // Assembly trampoline: vproc_switch restores x19=f_ptr then `ret` jumps here.
@@ -125,6 +129,8 @@ impl Coroutine {
             fork_child_pid: 0,
             c_strings: Vec::new(),
             mapped_regions: Vec::new(),
+            pending_signals: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -235,6 +241,8 @@ impl Coroutine {
             fork_child_pid: 0,
             c_strings: Vec::new(),
             mapped_regions: Vec::new(),
+            pending_signals: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -301,6 +309,8 @@ impl Coroutine {
             fork_child_pid: 0,
             c_strings: Vec::new(),
             mapped_regions: Vec::new(),
+            pending_signals: Vec::new(),
+            cwd: parent.cwd.clone(),
         }
     }
 }
