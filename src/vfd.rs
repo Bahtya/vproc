@@ -224,13 +224,17 @@ impl VfdTable {
 impl Drop for VfdTable {
     fn drop(&mut self) {
         // Mark all pipe buffers as closed so any waiting coroutine can detect EOF.
-        // Arc handles deallocation when the last reference is dropped.
+        // Deduplicate by Arc identity to avoid redundant close() calls.
+        let mut seen: Vec<*const PipeBuffer> = Vec::new();
         for vfd in self.fds.values() {
-            match vfd {
-                Vfd::PipeRead(arc) | Vfd::PipeWrite(arc) => {
-                    arc.close();
-                }
-                _ => {}
+            let arc = match vfd {
+                Vfd::PipeRead(a) | Vfd::PipeWrite(a) => a,
+                _ => continue,
+            };
+            let ptr = Arc::as_ptr(arc);
+            if seen.iter().all(|&p| p != ptr) {
+                arc.close();
+                seen.push(ptr);
             }
         }
     }

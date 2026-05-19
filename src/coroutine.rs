@@ -61,7 +61,7 @@ unsafe extern "C" fn __vproc_entry(f_ptr: *mut u8) {
         f();
     }));
 
-    if let Err(_) = result {
+    if result.is_err() {
         // Panic caught — exit with 134 (128 + SIGABRT). This context-switches
         // away and never returns, so the trampoline's `bl vproc_exit` is never reached.
         crate::executor::vproc_exit_with_code(134);

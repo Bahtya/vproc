@@ -10,7 +10,7 @@ const TIMEOUT_SECS: u64 = 10;
 fn run_vproc(cmd: &str) -> (bool, String, String) {
     let bin = std::env::current_dir()
         .unwrap()
-        .join("target/release/examples/test_single");
+        .join("target/debug/examples/test_single");
     let output = Command::new("timeout")
         .arg(format!("{}s", TIMEOUT_SECS))
         .arg(&bin)

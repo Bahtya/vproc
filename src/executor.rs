@@ -206,7 +206,14 @@ impl Executor {
             kids.retain(|k| self.vprocs.contains_key(k));
             !kids.is_empty()
         });
-        self.vprocs.retain(|_, co| !co.is_done());
+        self.vprocs.retain(|&pid, co| {
+            if co.is_done() {
+                crate::vfd::remove_table(pid);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn pick_next(&mut self) -> Option<VPid> {

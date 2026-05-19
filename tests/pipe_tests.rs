@@ -15,7 +15,7 @@ fn run_vproc(cmd: &str) -> (bool, String, String) {
 fn run_vproc_multi(cmds: &[&str]) -> (bool, String, String) {
     let bin = std::env::current_dir()
         .unwrap()
-        .join("target/release/examples/test_single");
+        .join("target/debug/examples/test_single");
     let mut cmd = Command::new("timeout");
     cmd.arg(format!("{}s", TIMEOUT_SECS))
         .arg(&bin)

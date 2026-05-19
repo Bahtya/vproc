@@ -41,7 +41,10 @@ static BINARY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, BinaryCacheEntry>
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Remove a binary from the cache and dlclose its handle.
-/// Returns true if the binary was found and unloaded.
+///
+/// # Safety
+/// Must only be called when no coroutine is executing code from this binary.
+/// Calling while a coroutine is inside the binary's code is undefined behavior.
 pub fn unload_binary(path: &str) -> bool {
     let real_path = match std::fs::canonicalize(path) {
         Ok(p) => p.to_str().map(|s| s.to_string()),
@@ -62,6 +65,9 @@ pub fn unload_binary(path: &str) -> bool {
 }
 
 /// Remove all binaries from the cache and dlclose their handles.
+///
+/// # Safety
+/// Must only be called when no coroutine is executing code from any cached binary.
 pub fn unload_all_binaries() {
     let mut cache = BINARY_CACHE.lock().unwrap();
     for (_, entry) in cache.drain() {
