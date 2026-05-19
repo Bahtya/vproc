@@ -376,6 +376,69 @@ test_pipe_with_grep ........... ok   (printf 'foo\nbar\nbaz\n' | grep ba)
 test_sequential_pipe_invocations ... ok  (echo hello | cat → echo world | cat)
 ```
 
+### Phase 11: 基础设施健壮化 ✅
+
+PR #6, #9, #10 — 资源管理、文件系统拦截、信号、per-coroutine cwd、二进制缓存生命周期。
+
+**资源管理** (PR #6):
+- `Coroutine::mapped_regions` — 协程退出时自动 munmap 加载的 ELF 段
+- `Coroutine::c_strings` — 协程退出时释放 C 字符串内存
+- `VfdTable::Drop` — 自动关闭所有虚拟管道，标记 EOF
+- `remove_table_and_get_fds()` — 协程退出时关闭真实内核 fd，Arc 去重避免 double-close
+
+**文件系统拦截** (PR #6):
+- `open()` → 拦截，创建 `Vfd::File(Arc<FileRef>)` 真实 fd 映射
+- `fstat()` → 拦截，透传到真实 fd
+- `lseek()` → 拦截，透传到真实 fd
+- `close-on-exec` — `VfdTable::close_cloexec()` execve 时关闭标记的 fd
+
+**信号 + per-coroutine cwd** (PR #9):
+- `Coroutine::pending_signals` — 每协程信号队列
+- `Executor::deliver_signals()` — 调度前投递，SIGKILL/SIGTERM 立即终止协程
+- `Coroutine::cwd` — 每协程工作目录，`chdir`/`getcwd` 虚拟化
+- `SIGPIPE` — pipe 写端关闭后写操作触发 SIGPIPE 信号投递
+
+**二进制缓存生命周期** (PR #10):
+- `BinaryCacheEntry::active_users: AtomicU32` — 引用计数跟踪
+- `Coroutine::binary_path` — 记录协程使用的二进制路径
+- `track_binary_user()` — spawn 时递增 refcount
+- `release_binaries()` — 协程退出时递减，zero-users 自动 dlclose
+- `DlGuard` RAII — 防止 error path 的 dlopen handle 泄漏
+- `reap_done_coroutines()` — 统一清理：children map、fd table、mapped regions、binary cache
+
+### Phase 12: hermux 集成 FFI ✅
+
+PR #13 — 多会话并发安全（Issue #11, #12）。
+
+**Spawn Queue 架构**:
+```
+Java Thread A ──→ SPAWN_QUEUE ──→ Driver Thread ──→ Executor (exclusive)
+Java Thread B ──→ SPAWN_QUEUE ──↗     │
+Java Thread C ──→ WAITERS ────────── yield → check waiters → signal Condvar
+```
+
+- `SpawnRequest` + `SPAWN_QUEUE` — Java 线程提交 spawn 请求，不直接修改 Executor
+- `DRIVER_WAKE` Condvar — 有新工作时唤醒 driver thread，空闲时阻塞（非轮询）
+- `vproc_ffi_create_process()` — 提交队列请求 → 阻塞等待 Condvar → 返回 vpid
+- `vproc_ffi_run_until_exit()` — 注册 waiter → 阻塞等待 Condvar → 返回 exit code
+- `run_driver_loop()` — drain queue → spawn → yield → reap done coroutines → check waiters → block
+
+**修复**:
+- Issue #12: 数据竞争 — driver thread 独占 Executor，消除并发修改
+- Issue #11 Bug 2: 协程泄漏 — `reap_done_coroutines()` 在 driver loop 中清理资源
+- Issue #11 Bug 1: signal 118 crash — 同 #12 根因，消除数据竞争后解决
+
+### Phase 13: CI Release ✅
+
+PR #14, #15, #16 — 推送 `v*` tag 自动构建发布。
+
+**GitHub Actions Workflow** (`.github/workflows/release.yml`):
+- 触发: `push tags: ["v*"]`
+- 构建: `nttld/setup-ndk@v1` + `cargo-ndk` + `aarch64-linux-android`
+- 产出: `vproc-{version}-aarch64-linux-android.tar.gz`（内含 `libvproc.so`）
+- 发布: `softprops/action-gh-release@v2` 自动创建 Release + release notes
+- `build.rs` 移除 hardcoded `gcc`，让 `cc` crate 自动使用 NDK clang
+
 ## 当前状态
 
 ### 已验证
@@ -394,12 +457,19 @@ test_sequential_pipe_invocations ... ok  (echo hello | cat → echo world | cat)
 - ✅ **同一二进制连续 execve**: 可写段快照/恢复 + GOT re-patch
 - ✅ **多阶段管道**: `echo hello | cat | cat` 三级管道通过
 - ✅ **子 shell 管道**: `(echo a; echo b) | cat` 通过
+- ✅ **hermux 集成 FFI**: `create_process` + `run_until_exit`（spawn queue 并发安全）
+- ✅ **多会话并发**: driver thread 独占 Executor，Java 线程通过队列提交
+- ✅ **文件系统拦截**: open/fstat/lseek + `Vfd::File` fd 表管理
+- ✅ **per-coroutine cwd**: `chdir`/`getcwd` 虚拟化
+- ✅ **信号传递**: SIGPIPE/SIGKILL/SIGTERM 虚拟化
+- ✅ **二进制缓存生命周期**: 引用计数 + auto-dlclose
+- ✅ **CI Release**: 推送 `v*` tag 自动构建并发布 `libvproc.so`
+- ✅ **40 项集成测试**: pipe/file/cwd/signal/stress 全部通过
 
 ### 待解决
 
-1. **hermux 集成**: 需要新 FFI 函数 `vproc_ffi_create_process()` 接入 termux.c
-2. **命令替换 `$()`**: 需要验证管道修复是否同时解决了命令替换
-3. **静态 PIE raw syscall**: 直接 `svc #0` 系统调用无法拦截
+1. **setsid/作业控制** (Issue #8): 拦截 setsid/getpgrp/tcsetpgrp 返回虚拟值，或回退真实 fork
+2. **静态 PIE raw syscall**: 直接 `svc #0` 系统调用无法拦截
 
 ## 文件结构
 
@@ -407,6 +477,8 @@ test_sequential_pipe_invocations ... ok  (echo hello | cat → echo world | cat)
 vproc/
 ├── Cargo.toml
 ├── build.rs                  # 编译 asm/*.S
+├── .github/workflows/
+│   └── release.yml           # CI: tag 触发构建 + GitHub Release
 ├── asm/
 │   ├── switch.S              # aarch64 上下文切换 (160B 帧)
 │   └── elf_entry.S           # ELF 入口跳板
@@ -417,13 +489,13 @@ vproc/
 ├── src/
 │   ├── lib.rs                # 公开 API + c_array_to_vec 工具函数
 │   ├── coroutine.rs          # Coroutine struct + trampoline + new_elf() + fork_from()
-│   ├── executor.rs           # UnsafeCell 调度器 + spawn_fork_child() + children 追踪
+│   ├── executor.rs           # UnsafeCell 调度器 + reap_done_coroutines()
 │   ├── elf.rs                # ELF64 解析器 (纯安全 Rust)
-│   ├── ffi.rs                # C FFI 接口 (15 个 vproc_ffi_* 导出函数，含 fork)
+│   ├── ffi.rs                # C FFI 接口 + spawn queue + driver thread
 │   ├── loader.rs             # PIE 加载器 (mmap + 重定位) + build_auxv()
-│   ├── vexec.rs              # virtual_execve (static + dlsym + via_entry)
+│   ├── vexec.rs              # virtual_execve + binary cache lifecycle
 │   ├── vfd.rs                # 虚拟 fd 表 + 环形缓冲区管道 + clone_for_fork()
-│   ├── preload.rs            # Rust LD_PRELOAD 拦截层 (18 函数，含 kill/getpgid/setpgid/raise)
+│   ├── preload.rs            # Rust LD_PRELOAD 拦截层 (18 函数)
 │   └── arch/
 │       ├── mod.rs
 │       └── aarch64.rs        # context_switch FFI
@@ -441,6 +513,11 @@ vproc/
 │   └── test_single.rs        # 测试工具，支持多命令顺序执行
 └── tests/
     ├── pipe_tests.rs         # 管道 + 连续 execve 集成测试 (8 项)
+    ├── infra_tests.rs        # 基础设施测试 (8 项)
+    ├── file_tests.rs         # 文件系统测试 (8 项)
+    ├── cwd_tests.rs          # 工作目录测试 (4 项)
+    ├── signal_tests.rs       # 信号测试 (3 项)
+    ├── stress_tests.rs       # 压力测试 (6 项)
     ├── test_static_pie.S     # 最小 aarch64 静态 PIE (write+exit)
     └── test_fork.c           # fork/waitpid 拦截测试
 ```
@@ -456,6 +533,17 @@ cd preload && make e2e                     # C preload E2E 测试
 ```
 
 需要 aarch64 Linux/Android 环境。
+
+### 预编译 Release
+
+从 [GitHub Releases](https://github.com/Bahtya/vproc/releases) 下载 `vproc-{version}-aarch64-linux-android.tar.gz`：
+
+```bash
+tar -xzf vproc-v0.1.0-aarch64-linux-android.tar.gz
+# 得到 libvproc.so
+```
+
+推送 `v*` tag 自动触发 CI 构建并发布。
 
 ## 关联
 
