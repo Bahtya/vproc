@@ -281,10 +281,12 @@ pub fn virtual_execve_via_entry(
 
     if let Some((main_addr, saved_writable, _handle)) = cached {
         if main_addr == 0 {
-            // main() address couldn't be extracted on first load — cannot use
-            // the optimized cache-hit path. Fall through to re-dlopen + _start.
-            // The handle is already in cache and will be dlclose'd by release_binaries.
-        } else {
+            // main() address couldn't be extracted on first load — this binary
+            // is not compatible with the optimized cache path. The handle stays
+            // cached and will be dlclose'd by release_binaries when no coroutines
+            // reference it.
+            return Err(format!("cannot extract main() from {}", path));
+        }
         // Binary already initialized — restore writable segments and re-patch GOT,
         // then call main() directly, skipping _start/__libc_init.
         restore_writable_segments(&saved_writable);
@@ -314,7 +316,6 @@ pub fn virtual_execve_via_entry(
             }
         }
         return Ok(VirtualExec { vpid });
-        }
     }
 
     // First time: need to dlopen and run _start

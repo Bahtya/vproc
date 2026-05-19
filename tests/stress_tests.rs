@@ -61,8 +61,9 @@ fn test_sequential_different_commands() {
 
 #[test]
 fn test_nested_subshells() {
-    let (ok, stdout, stderr) = run_vproc("echo $(( (echo deep) | cat ) | cat)");
+    let (ok, stdout, stderr) = run_vproc("echo $( (echo deep) | cat )");
     assert!(ok, "exit != 0\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("deep"), "missing 'deep': {stdout}");
 }
 
 #[test]
