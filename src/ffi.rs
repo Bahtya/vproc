@@ -524,6 +524,13 @@ fn run_driver_loop() {
             cvar.notify_all();
         }
 
+        // 3b. Reap done coroutines — clean up fd tables, mapped regions,
+        //     binary cache entries. Prevents resource leaks across sessions.
+        let ptr = crate::executor::get_global_executor();
+        if !ptr.is_null() {
+            unsafe { (*ptr).reap_done_coroutines(); }
+        }
+
         // 4. Block until new work arrives (spawn request or waiter registration)
         if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
             let guard = DRIVER_LOCK.lock().unwrap();

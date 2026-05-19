@@ -207,12 +207,9 @@ impl Executor {
         self.schedule();
     }
 
-    pub fn block_on_all(&mut self) {
-        set_global_executor(self as *mut Executor);
-        while self.vprocs.values().any(|c| !c.is_done()) {
-            self.r#yield();
-        }
-        // Clean up children entries for removed coroutines
+    /// Reap all finished coroutines: clean up children maps, fd tables,
+    /// mapped regions, and release binary cache entries.
+    pub fn reap_done_coroutines(&mut self) {
         let done_pids: Vec<VPid> = self.vprocs.iter()
             .filter(|(_, co)| co.is_done())
             .map(|(&pid, _)| pid)
@@ -240,6 +237,14 @@ impl Executor {
             }
         });
         crate::vexec::release_binaries(&released_binaries);
+    }
+
+    pub fn block_on_all(&mut self) {
+        set_global_executor(self as *mut Executor);
+        while self.vprocs.values().any(|c| !c.is_done()) {
+            self.r#yield();
+        }
+        self.reap_done_coroutines();
     }
 
     fn pick_next(&mut self) -> Option<VPid> {
