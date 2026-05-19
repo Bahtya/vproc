@@ -674,11 +674,7 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 
     // Apply all GOT patches
     for &(got_entry, our_addr) in &patches {
-        let old_val = unsafe { std::ptr::read_unaligned(got_entry) };
         unsafe { std::ptr::write_unaligned(got_entry, our_addr); }
-        let new_val = unsafe { std::ptr::read_unaligned(got_entry) };
-        eprintln!("[vexec] GOT patch: {:#x} old={:#x} new={:#x} (verify={:#x})",
-            got_entry as usize, old_val, our_addr, new_val);
     }
 
     // Restore GOT pages to read-only
