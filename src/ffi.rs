@@ -411,6 +411,8 @@ pub extern "C" fn vproc_ffi_create_process(
     });
 
     start_driver_once();
+    // Wake driver thread to process the new request
+    DRIVER_WAKE.notify_one();
 
     // Block until driver processes our request
     let (lock, cvar) = &*result;
@@ -437,6 +439,8 @@ pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
     });
 
     start_driver_once();
+    // Wake driver thread to check for completion
+    DRIVER_WAKE.notify_one();
 
     // Block until the driver signals completion
     let (lock, cvar) = &*result;
@@ -458,6 +462,11 @@ struct Waiter {
 
 static WAITERS: std::sync::Mutex<Vec<Waiter>> = std::sync::Mutex::new(Vec::new());
 static DRIVER_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// Condvar for waking the driver thread when new work arrives.
+/// Both SPAWN_QUEUE pushes and WAITERS pushes signal this.
+static DRIVER_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static DRIVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn start_driver_once() {
     DRIVER_STARTED.call_once(|| {
@@ -515,9 +524,13 @@ fn run_driver_loop() {
             cvar.notify_all();
         }
 
-        // 4. Sleep if no work
+        // 4. Block until new work arrives (spawn request or waiter registration)
         if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let guard = DRIVER_LOCK.lock().unwrap();
+            // Re-check after acquiring lock to avoid missed wakeup
+            if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
+                let _guard = DRIVER_WAKE.wait(guard);
+            }
         }
     }
 }

@@ -37,6 +37,8 @@ struct BinaryCacheEntry {
     saved_writable: Arc<Vec<WritableSegment>>,
     /// Number of coroutines currently executing code from this binary.
     /// When this drops to zero, the entry is eligible for dlclose.
+    /// Relaxed is sufficient: BINARY_CACHE Mutex provides happens-before
+    /// for all fetch_add / fetch_sub operations on this field.
     active_users: AtomicU32,
 }
 
@@ -282,9 +284,14 @@ pub fn virtual_execve_via_entry(
     if let Some((main_addr, saved_writable, _handle)) = cached {
         if main_addr == 0 {
             // main() address couldn't be extracted on first load — this binary
-            // is not compatible with the optimized cache path. The handle stays
-            // cached and will be dlclose'd by release_binaries when no coroutines
-            // reference it.
+            // is not compatible. Remove the cache entry and dlclose the handle
+            // since no coroutine will ever reference it (active_users == 0).
+            let mut cache = BINARY_CACHE.lock().unwrap();
+            if let Some(entry) = cache.remove(&real_path_str) {
+                if !entry.handle.0.is_null() {
+                    unsafe { libc::dlclose(entry.handle.0); }
+                }
+            }
             return Err(format!("cannot extract main() from {}", path));
         }
         // Binary already initialized — restore writable segments and re-patch GOT,
