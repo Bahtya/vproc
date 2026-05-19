@@ -95,12 +95,14 @@ impl Coroutine {
         //   sp+128: d12, d13
         //   sp+144: d14, d15
         let frame_size: usize = 160;
+        // SAFETY: frame_size (160) << STACK_SIZE (2 MiB), so this is in bounds.
         let sp_init = unsafe { stack_top.sub(frame_size) };
         // Double-box: Box<Box<dyn FnOnce()>> gives a thin pointer
         let f_ptr = Box::into_raw(Box::new(f)) as *mut u8;
 
+        // SAFETY: sp_init is within a freshly allocated, exclusively owned stack.
+        // Offsets are within frame_size bytes of sp_init, all in bounds.
         unsafe {
-            // x19 = f_ptr, x20 = 0
             ptr::write_unaligned(sp_init as *mut u64, f_ptr as u64);
             ptr::write_unaligned(sp_init.add(8) as *mut u64, 0);
 

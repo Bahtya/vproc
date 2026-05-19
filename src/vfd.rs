@@ -64,6 +64,7 @@ impl PipeBuffer {
     }
 
     fn inner(&self) -> &mut PipeBufferInner {
+        // SAFETY: cooperative scheduling guarantees only one coroutine accesses this at a time.
         unsafe { &mut *self.inner.get() }
     }
 

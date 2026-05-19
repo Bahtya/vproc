@@ -5,6 +5,7 @@
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Returns the current virtual process ID, or 0 if not in a coroutine.
+/// No mutex: called from every syscall interceptor in coroutines (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_current_vpid() -> u32 {
     let ptr = crate::executor::get_global_executor();
@@ -50,15 +51,14 @@ pub extern "C" fn vproc_ffi_get_exit_code(vpid: u32) -> c_int {
 }
 
 /// Check if a virtual process exists.
+/// No mutex: read-only, stale data is acceptable.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_vpid_exists(vpid: u32) -> c_int {
-    crate::executor::EXECUTOR.with(|e| unsafe {
-        if (*e.get()).vprocs.contains_key(&vpid) {
-            1
-        } else {
-            0
-        }
-    })
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return 0;
+    }
+    if unsafe { (*ptr).vprocs.contains_key(&vpid) } { 1 } else { 0 }
 }
 
 /// Create a virtual pipe. Returns 0 on success, -1 on error.
@@ -192,6 +192,7 @@ pub extern "C" fn vproc_ffi_dup2(vpid: u32, old_fd: c_int, new_fd: c_int) -> c_i
 }
 
 /// Get the current virtual process ID. Returns real PID if not in a coroutine.
+/// No mutex: called from GOT-patched code inside coroutines (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_getpid() -> u32 {
     let ptr = crate::executor::get_global_executor();
@@ -207,6 +208,7 @@ pub extern "C" fn vproc_ffi_getpid() -> u32 {
 }
 
 /// Get the parent virtual process ID. Returns real PPID if not in a coroutine.
+/// No mutex: called from GOT-patched code inside coroutines (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_getppid() -> u32 {
     let ptr = crate::executor::get_global_executor();
@@ -229,6 +231,8 @@ pub extern "C" fn vproc_ffi_getppid() -> u32 {
 /// Virtual execve — load and execute an ELF binary in a coroutine.
 /// On success, terminates the calling coroutine (does not return).
 /// Returns -1 on error.
+///
+/// No mutex: called from inside a coroutine (driver thread), already serialized.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_execve(
     path: *const c_char,
@@ -350,13 +354,31 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
 
 // ---------------------------------------------------------------------------
 // High-level process creation (for hermux integration)
+//
+// Thread safety: Java threads never touch the Executor directly.
+// They submit spawn requests to SPAWN_QUEUE and register exit waiters
+// in WAITERS. The driver thread is the sole owner of the Executor —
+// it drains the queue, spawns coroutines, and signals completion.
 // ---------------------------------------------------------------------------
 
-static EXECUTOR_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A spawn request submitted by a Java thread, processed by the driver thread.
+struct SpawnRequest {
+    path: String,
+    argv: Vec<String>,
+    envp: Vec<String>,
+    stdin_fd: c_int,
+    stdout_fd: c_int,
+    stderr_fd: c_int,
+    /// Driver sets this to Some(vpid) on success or Some(0) on failure.
+    result: std::sync::Arc<(std::sync::Mutex<Option<u32>>, std::sync::Condvar)>,
+}
+
+static SPAWN_QUEUE: std::sync::Mutex<Vec<SpawnRequest>> = std::sync::Mutex::new(Vec::new());
 
 /// Create a virtual process: load binary in coroutine, map fd 0/1/2 to real fds.
 ///
 /// Returns virtual PID (> 0) on success, 0 on error.
+/// Thread-safe: submits spawn request to driver thread via queue.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_create_process(
     path: *const c_char,
@@ -373,59 +395,52 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
-    match crate::vexec::virtual_execve_via_entry(&path_str, argv_vec, envp_vec) {
-        Ok(exec) => {
-            // Replace the default fd table with custom mappings to PTY slave
-            crate::vfd::create_table_with_fds(exec.vpid, stdin_fd, stdout_fd, stderr_fd);
-            exec.vpid
-        }
-        Err(e) => {
-            let msg = format!("vproc_ffi_create_process: {}\n", e);
-            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
-            0
-        }
+    let result = std::sync::Arc::new((
+        std::sync::Mutex::new(None::<u32>),
+        std::sync::Condvar::new(),
+    ));
+
+    SPAWN_QUEUE.lock().unwrap().push(SpawnRequest {
+        path: path_str,
+        argv: argv_vec,
+        envp: envp_vec,
+        stdin_fd,
+        stdout_fd,
+        stderr_fd,
+        result: std::sync::Arc::clone(&result),
+    });
+
+    start_driver_once();
+    // Wake driver thread to process the new request
+    DRIVER_WAKE.notify_one();
+
+    // Block until driver processes our request
+    let (lock, cvar) = &*result;
+    let mut guard = lock.lock().unwrap();
+    while guard.is_none() {
+        guard = cvar.wait(guard).unwrap();
     }
+    guard.take().unwrap()
 }
 
 /// Drive the scheduler until the given vpid exits.
 /// Returns the exit code. Blocks the calling thread.
-///
-/// Uses a dedicated driver thread to call do_yield(), because the caller
-/// (Java waitFor thread) is not a coroutine context. do_yield() saves the
-/// caller's stack pointer as main_sp — if multiple Java threads call it
-/// concurrently they corrupt each other's main_sp. The driver thread is
-/// the single "main" context that drives all coroutines safely.
-///
-/// Completion is signaled via a Condvar so the calling thread just blocks
-/// without touching the scheduler.
+/// Thread-safe: registers a waiter, driver thread signals completion.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
-    // Fast path: already done
-    {
-        let _guard = EXECUTOR_MUTEX.lock().unwrap();
-        if let Some(code) = crate::executor::get_exit_code(vpid) {
-            return code;
-        }
-        let ptr = crate::executor::get_global_executor();
-        if ptr.is_null() || !unsafe { (*ptr).vprocs.contains_key(&vpid) } {
-            return -1;
-        }
-    }
-
-    // Shared state between this thread and the driver
     let result = std::sync::Arc::new((
         std::sync::Mutex::new(None::<i32>),
         std::sync::Condvar::new(),
     ));
 
-    // Register with the driver
     WAITERS.lock().unwrap().push(Waiter {
         vpid,
         result: std::sync::Arc::clone(&result),
     });
 
-    // Ensure the driver thread is running
     start_driver_once();
+    // Wake driver thread to check for completion
+    DRIVER_WAKE.notify_one();
 
     // Block until the driver signals completion
     let (lock, cvar) = &*result;
@@ -437,7 +452,7 @@ pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// Driver thread — single "main" context that safely calls do_yield()
+// Driver thread — sole owner of the Executor
 // ---------------------------------------------------------------------------
 
 struct Waiter {
@@ -447,6 +462,11 @@ struct Waiter {
 
 static WAITERS: std::sync::Mutex<Vec<Waiter>> = std::sync::Mutex::new(Vec::new());
 static DRIVER_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// Condvar for waking the driver thread when new work arrives.
+/// Both SPAWN_QUEUE pushes and WAITERS pushes signal this.
+static DRIVER_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static DRIVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn start_driver_once() {
     DRIVER_STARTED.call_once(|| {
@@ -459,20 +479,32 @@ fn start_driver_once() {
 
 fn run_driver_loop() {
     loop {
-        // Drive the scheduler
-        {
-            let _guard = EXECUTOR_MUTEX.lock().unwrap();
-            let ptr = crate::executor::get_global_executor();
-            if ptr.is_null() {
-                drop(_guard);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                continue;
-            }
+        // 1. Drain spawn queue — driver owns the Executor exclusively
+        let requests: Vec<SpawnRequest> = SPAWN_QUEUE.lock().unwrap().drain(..).collect();
+        for req in requests {
+            let vpid = match crate::vexec::virtual_execve_via_entry(&req.path, req.argv, req.envp) {
+                Ok(exec) => {
+                    crate::vfd::create_table_with_fds(exec.vpid, req.stdin_fd, req.stdout_fd, req.stderr_fd);
+                    exec.vpid
+                }
+                Err(e) => {
+                    let msg = format!("vproc_ffi_create_process: {}\n", e);
+                    unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+                    0
+                }
+            };
+            let (lock, cvar) = &*req.result;
+            *lock.lock().unwrap() = Some(vpid);
+            cvar.notify_all();
         }
-        // Mutex must be released before yield
-        crate::executor::do_yield();
 
-        // Check waiters
+        // 2. Drive the scheduler (runs coroutines via context_switch)
+        let ptr = crate::executor::get_global_executor();
+        if !ptr.is_null() {
+            crate::executor::do_yield();
+        }
+
+        // 3. Check waiters — signal completed ones
         let completed: Vec<(u32, i32, std::sync::Arc<(std::sync::Mutex<Option<i32>>, std::sync::Condvar)>)> = {
             let mut waiters = WAITERS.lock().unwrap();
             let mut done = Vec::new();
@@ -486,23 +518,33 @@ fn run_driver_loop() {
             });
             done
         };
-
-        // Signal completed waiters
         for (_vpid, code, result) in completed {
             let (lock, cvar) = &*result;
             *lock.lock().unwrap() = Some(code);
             cvar.notify_all();
         }
 
-        // If no waiters, sleep briefly to avoid busy-loop
-        if WAITERS.lock().unwrap().is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        // 3b. Reap done coroutines — clean up fd tables, mapped regions,
+        //     binary cache entries. Prevents resource leaks across sessions.
+        let ptr = crate::executor::get_global_executor();
+        if !ptr.is_null() {
+            unsafe { (*ptr).reap_done_coroutines(); }
+        }
+
+        // 4. Block until new work arrives (spawn request or waiter registration)
+        if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
+            let guard = DRIVER_LOCK.lock().unwrap();
+            // Re-check after acquiring lock to avoid missed wakeup
+            if WAITERS.lock().unwrap().is_empty() && SPAWN_QUEUE.lock().unwrap().is_empty() {
+                let _guard = DRIVER_WAKE.wait(guard);
+            }
         }
     }
 }
 
 /// Get the per-coroutine working directory.
 /// Returns 0 on success, -1 if no cwd set or vpid not found.
+/// No mutex: read-only, called from coroutine context (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
     let ptr = crate::executor::get_global_executor();
