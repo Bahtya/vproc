@@ -219,8 +219,12 @@ impl Executor {
             kids.retain(|k| self.vprocs.contains_key(k));
             !kids.is_empty()
         });
+        let mut released_binaries: Vec<String> = Vec::new();
         self.vprocs.retain(|&pid, co| {
             if co.is_done() {
+                if let Some(ref path) = co.binary_path {
+                    released_binaries.push(path.clone());
+                }
                 let real_fds = crate::vfd::remove_table_and_get_fds(pid);
                 for fd in real_fds {
                     unsafe { crate::preload::real_close(fd); }
@@ -230,6 +234,7 @@ impl Executor {
                 true
             }
         });
+        crate::vexec::release_binaries(&released_binaries);
     }
 
     fn pick_next(&mut self) -> Option<VPid> {
