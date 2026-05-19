@@ -6,6 +6,7 @@ use std::ffi::c_int;
 use std::sync::Arc;
 use std::os::raw::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::coroutine::VPid;
 use crate::elf;
@@ -23,6 +24,9 @@ struct BinaryCacheEntry {
     /// Saved writable segment contents and their original mprotect permissions.
     /// Wrapped in Arc so cache lookups don't clone the entire snapshot.
     saved_writable: Arc<Vec<WritableSegment>>,
+    /// Number of coroutines currently executing code from this binary.
+    /// When this drops to zero, the entry is eligible for dlclose.
+    active_users: AtomicU32,
 }
 
 struct WritableSegment {
@@ -78,6 +82,37 @@ pub fn unload_all_binaries() {
 /// Return the number of cached binaries.
 pub fn cached_binary_count() -> usize {
     BINARY_CACHE.lock().unwrap().len()
+}
+
+/// Release references to binaries used by finished coroutines.
+/// Decrements active_users for each path; entries with zero users are dlclose'd.
+pub fn release_binaries(paths: &[String]) {
+    let mut cache = BINARY_CACHE.lock().unwrap();
+    let mut to_remove = Vec::new();
+    for path in paths {
+        if let Some(entry) = cache.get(path) {
+            if entry.active_users.fetch_sub(1, Ordering::Relaxed) == 1 {
+                to_remove.push(path.clone());
+            }
+        }
+    }
+    for path in to_remove {
+        if let Some(entry) = cache.remove(&path) {
+            unsafe { libc::dlclose(entry.handle.0); }
+        }
+    }
+}
+
+/// Associate a spawned coroutine with its cached binary and increment the refcount.
+fn track_binary_user(vpid: VPid, path: &str) {
+    let ex = unsafe { &mut *crate::executor::get_global_executor() };
+    if let Some(co) = ex.vprocs.get_mut(&vpid) {
+        co.binary_path = Some(path.to_string());
+    }
+    let mut cache = BINARY_CACHE.lock().unwrap();
+    if let Some(entry) = cache.get_mut(path) {
+        entry.active_users.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Result of a virtual_execve operation.
@@ -244,6 +279,7 @@ pub fn virtual_execve_via_entry(
         patch_got_for_loaded_binary(re_base, &re_phdrs);
 
         let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c, c_strings);
+        track_binary_user(vpid, &real_path_str);
         // Inherit fd table from current coroutine (Linux execve preserves fds)
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
@@ -297,6 +333,7 @@ pub fn virtual_execve_via_entry(
             main_addr,
             handle: DlHandle(handle),
             saved_writable: Arc::new(saved),
+            active_users: AtomicU32::new(0),
         });
     }
 
@@ -334,6 +371,7 @@ pub fn virtual_execve_via_entry(
         )
     };
     register_elf_c_strings(vpid, c_strings);
+    track_binary_user(vpid, &real_path_str);
 
     // Inherit fd table from current coroutine (Linux execve preserves fds)
     if let Some(pid) = current_pid {
