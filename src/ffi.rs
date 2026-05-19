@@ -5,6 +5,7 @@
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Returns the current virtual process ID, or 0 if not in a coroutine.
+/// No mutex: called from every syscall interceptor in coroutines (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_current_vpid() -> u32 {
     let ptr = crate::executor::get_global_executor();
@@ -50,15 +51,14 @@ pub extern "C" fn vproc_ffi_get_exit_code(vpid: u32) -> c_int {
 }
 
 /// Check if a virtual process exists.
+/// No mutex: read-only, stale data is acceptable.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_vpid_exists(vpid: u32) -> c_int {
-    crate::executor::EXECUTOR.with(|e| unsafe {
-        if (*e.get()).vprocs.contains_key(&vpid) {
-            1
-        } else {
-            0
-        }
-    })
+    let ptr = crate::executor::get_global_executor();
+    if ptr.is_null() {
+        return 0;
+    }
+    if unsafe { (*ptr).vprocs.contains_key(&vpid) } { 1 } else { 0 }
 }
 
 /// Create a virtual pipe. Returns 0 on success, -1 on error.
@@ -192,6 +192,7 @@ pub extern "C" fn vproc_ffi_dup2(vpid: u32, old_fd: c_int, new_fd: c_int) -> c_i
 }
 
 /// Get the current virtual process ID. Returns real PID if not in a coroutine.
+/// No mutex: called from GOT-patched code inside coroutines (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_getpid() -> u32 {
     let ptr = crate::executor::get_global_executor();
@@ -207,6 +208,7 @@ pub extern "C" fn vproc_ffi_getpid() -> u32 {
 }
 
 /// Get the parent virtual process ID. Returns real PPID if not in a coroutine.
+/// No mutex: called from GOT-patched code inside coroutines (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_getppid() -> u32 {
     let ptr = crate::executor::get_global_executor();
@@ -229,6 +231,8 @@ pub extern "C" fn vproc_ffi_getppid() -> u32 {
 /// Virtual execve — load and execute an ELF binary in a coroutine.
 /// On success, terminates the calling coroutine (does not return).
 /// Returns -1 on error.
+///
+/// No mutex: called from inside a coroutine (driver thread), already serialized.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_execve(
     path: *const c_char,
@@ -366,6 +370,7 @@ pub extern "C" fn vproc_ffi_create_process(
     stdout_fd: c_int,
     stderr_fd: c_int,
 ) -> u32 {
+    let _guard = EXECUTOR_MUTEX.lock().unwrap();
     let path_str = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return 0,
@@ -503,6 +508,7 @@ fn run_driver_loop() {
 
 /// Get the per-coroutine working directory.
 /// Returns 0 on success, -1 if no cwd set or vpid not found.
+/// No mutex: read-only, called from coroutine context (driver thread).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
     let ptr = crate::executor::get_global_executor();
