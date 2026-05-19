@@ -358,15 +358,19 @@ pub fn remove_table(vpid: u32) {
     }
 }
 
-/// Remove a virtual process's fd table and return all real kernel fds
+/// Remove a virtual process's fd table and return real kernel fds
 /// from File entries that should be closed by the caller.
 /// Deduplicates by Arc identity so dup'd fds are not double-closed.
+/// Only returns fds whose Arc refcount is 1 (exclusively owned) —
+/// fds shared with other tables (e.g. inherited by fork children) are
+/// not closed here; the last owner is responsible.
 pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
     let ptr = get_tables_ptr();
     if ptr.is_null() {
         return Vec::new();
     }
-    let table = match unsafe { (*ptr).remove(&vpid) } {
+    // Check ref counts BEFORE removing the table, so shared Arcs are still > 1.
+    let table = match unsafe { (*ptr).get(&vpid) } {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -374,13 +378,17 @@ pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
     let mut seen: Vec<*const FileRef> = Vec::new();
     for vfd in table.fds.values() {
         if let Vfd::File(arc) = vfd {
-            let ptr = Arc::as_ptr(arc);
-            if seen.iter().all(|&p| p != ptr) {
-                fds.push(arc.real_fd);
-                seen.push(ptr);
+            let arc_ptr = Arc::as_ptr(arc);
+            if seen.iter().all(|&p| p != arc_ptr) {
+                if Arc::strong_count(arc) == 1 {
+                    fds.push(arc.real_fd);
+                }
+                seen.push(arc_ptr);
             }
         }
     }
+    // Now drop the table (decrements Arc refcounts for shared fds).
+    unsafe { (*ptr).remove(&vpid); }
     fds
 }
 
@@ -398,4 +406,38 @@ pub fn create_table_with_fds(vpid: u32, stdin: i32, stdout: i32, stderr: i32) ->
     let tables = unsafe { &mut *get_tables_ptr() };
     tables.insert(vpid, VfdTable::new_with_fds(stdin, stdout, stderr));
     tables.get_mut(&vpid).unwrap()
+}
+
+/// Sync vfd table entries for fd 0/1/2 to the kernel fd table via dup2,
+/// so real fork() children inherit correct fd mappings.
+/// Returns a list of (old_real_fd, new_fd) pairs that were synced.
+pub fn sync_std_fds(vpid: u32) -> Vec<(i32, i32)> {
+    let table = match get_table(vpid) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let mut synced = Vec::new();
+    for fd in 0..3u32 {
+        let real_fd = match table.get(fd) {
+            Some(Vfd::Real(rfd)) => *rfd,
+            _ => continue,
+        };
+        if real_fd != fd as i32 {
+            synced.push((real_fd, fd as i32));
+            table.fds.insert(fd, Vfd::Real(fd as i32));
+        }
+    }
+    synced
+}
+
+/// Restore vfd table entries for fd 0/1/2 to their original real fd values.
+/// Called in the parent after fork to undo the sync_std_fds changes.
+pub fn restore_std_fds(vpid: u32, original: &[(i32, i32)]) {
+    let table = match get_table(vpid) {
+        Some(t) => t,
+        None => return,
+    };
+    for (old_fd, new_fd) in original {
+        table.fds.insert(*new_fd as u32, Vfd::Real(*old_fd));
+    }
 }
