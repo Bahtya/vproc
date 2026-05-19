@@ -302,19 +302,79 @@ pub extern "C" fn getppid() -> c_int {
 #[no_mangle]
 pub extern "C" fn fork() -> c_int {
     if !enabled() {
+        // Use raw clone syscall — libc fork is inline-hooked so real("fork")
+        // would recurse.  clone with SIGCHLD is equivalent to fork.
+        let ret: isize;
         unsafe {
-            let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
-            return f();
+            std::arch::asm!(
+                "mov x8, #220",   // __NR_clone
+                "mov x0, #17",    // SIGCHLD
+                "mov x1, #0",
+                "svc #0",
+                lateout("x0") ret,
+            );
+        }
+        return if ret >= 0 { ret as c_int } else {
+            unsafe { *libc::__errno() = (-ret) as c_int; }
+            -1
+        };
+    }
+
+    // Before real fork, sync kernel fd 0/1/2 with the vfd table.
+    // Fork children inherit the kernel fd table, not vproc's vfd table.
+    // Without this, fork children get Java's original fds (stdout, etc.)
+    // instead of the PTY slave, so pipe commands like "echo x | cat" break.
+    // Collect fd sync info before fork (read from vfd table).
+    // We'll apply it in the CHILD after fork, where it's safe to change fds.
+    let fd_sync = if let Some(vpid) = current_vpid() {
+        crate::vfd::sync_std_fds(vpid)
+    } else {
+        Vec::new()
+    };
+
+    // Use raw clone syscall to avoid libc fork() deadlock
+    // (libc fork() acquires atfork locks that may be held by other threads)
+    let pid: c_int;
+    unsafe {
+        let ret: isize;
+        std::arch::asm!(
+            "mov x8, #220",   // __NR_clone on aarch64
+            "mov x0, #17",    // SIGCHLD
+            "mov x1, #0",     // stack = 0 (use parent's stack)
+            "svc #0",
+            lateout("x0") ret,
+        );
+        if ret < 0 {
+            *libc::__errno() = (-ret) as c_int;
+            pid = -1;
+        } else {
+            pid = ret as c_int;
         }
     }
-    // Use real() (dlsym RTLD_NEXT) to get the true libc fork,
-    // not libc::fork() which would resolve to our own symbol.
-    let pid = unsafe {
-        let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
-        f()
-    };
+
     if pid == 0 {
         REAL_FORK_CHILD.store(true, Ordering::SeqCst);
+        // In child: sync kernel fds 0/1/2 with vfd table.
+        // The child inherits the parent's kernel fd table.
+        // We need to make sure fds 0/1/2 point to the PTY slave
+        // (not Java's original stdout/stderr).
+        if !fd_sync.is_empty() {
+            let real_dup2_fn: extern "C" fn(c_int, c_int) -> c_int =
+                unsafe { std::mem::transmute(real("dup2\0")) };
+            for (old_fd, new_fd) in &fd_sync {
+                real_dup2_fn(*old_fd, *new_fd);
+            }
+        }
+    } else if pid > 0 {
+        // Parent: undo the vfd table changes from sync_std_fds.
+        // sync_std_fds updated the table entries (e.g., fd 0 → Real(0)),
+        // but in the parent, the kernel fds are unchanged (we only synced in child).
+        // Restore the original mappings so the coroutine continues to work.
+        if !fd_sync.is_empty() {
+            if let Some(vpid) = current_vpid() {
+                crate::vfd::restore_std_fds(vpid, &fd_sync);
+            }
+        }
     }
     pid
 }
@@ -353,10 +413,17 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
         !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
     };
     if !is_virtual {
-        // Real child process — use raw wait4 syscall to avoid recursion:
-        // libc waitpid() internally calls wait4(), which we also intercept,
-        // causing waitpid → libc waitpid → libc wait4 → our wait4 → our waitpid.
-        return raw_wait4(pid, status, options);
+        // Real child process — poll with WNOHANG + yield to avoid blocking
+        // the driver thread. The child is a real OS process, not a vproc coroutine.
+        if options & libc::WNOHANG != 0 {
+            return raw_wait4(pid, status, options);
+        }
+        loop {
+            let ret = raw_wait4(pid, status, libc::WNOHANG);
+            if ret > 0 { return ret; }
+            if ret < 0 { return -1; }
+            crate::executor::do_yield();
+        }
     }
     // Virtual process — spin/yield until done
     loop {
@@ -452,17 +519,24 @@ static EXECVE_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 #[no_mangle]
 pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
-    if !enabled() {
-        unsafe {
-            let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
-            return f(fds);
-        }
+    // Use raw pipe2 syscall to avoid recursion when libc pipe is inline-hooked.
+    let ret = unsafe { libc::syscall(59, fds, 0) as c_int }; // __NR_pipe2 = 59 on aarch64
+    if ret < 0 {
+        unsafe { *libc::__errno() = (-ret) as c_int; }
+        -1
+    } else {
+        0
     }
-    // Use real pipe() so that real fork() children inherit working pipe fds.
-    // Virtual pipes can't cross real fork() boundaries.
-    unsafe {
-        let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
-        f(fds)
+}
+
+#[no_mangle]
+pub extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
+    let ret = unsafe { libc::syscall(59, fds, flags) as c_int }; // __NR_pipe2 = 59
+    if ret < 0 {
+        unsafe { *libc::__errno() = (-ret) as c_int; }
+        -1
+    } else {
+        0
     }
 }
 
@@ -507,10 +581,20 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
                 _ => fd,
             })
             .unwrap_or(fd);
-        unsafe {
-            let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-                std::mem::transmute(real("read\0"));
-            return f(real_fd, buf, count);
+        let real_poll: extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> c_int =
+            unsafe { std::mem::transmute(real("poll\0")) };
+        let real_read: extern "C" fn(c_int, *mut c_void, usize) -> isize =
+            unsafe { std::mem::transmute(real("read\0")) };
+        loop {
+            let mut pfd = libc::pollfd { fd: real_fd, events: libc::POLLIN, revents: 0 };
+            let n = real_poll(&mut pfd, 1, 0);
+            if n < 0 || (pfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
+                return real_read(real_fd, buf, count);
+            }
+            if (pfd.revents & libc::POLLIN) != 0 {
+                return real_read(real_fd, buf, count);
+            }
+            crate::executor::do_yield();
         }
     }
 

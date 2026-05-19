@@ -102,22 +102,13 @@ pub fn cached_binary_count() -> usize {
 }
 
 /// Release references to binaries used by finished coroutines.
-/// Decrements active_users for each path; entries with zero users are dlclose'd.
+/// Decrements active_users for each path. Entries are kept alive for reuse
+/// across sessions — only dlclose when explicitly requested via unload_binary.
 pub fn release_binaries(paths: &[String]) {
-    let mut cache = BINARY_CACHE.lock().unwrap();
-    let mut to_remove = Vec::new();
+    let cache = BINARY_CACHE.lock().unwrap();
     for path in paths {
         if let Some(entry) = cache.get(path) {
-            if entry.active_users.fetch_sub(1, Ordering::Relaxed) == 1 {
-                to_remove.push(path.clone());
-            }
-        }
-    }
-    for path in to_remove {
-        if let Some(entry) = cache.remove(&path) {
-            if !entry.handle.0.is_null() {
-                unsafe { libc::dlclose(entry.handle.0); }
-            }
+            entry.active_users.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -355,6 +346,9 @@ pub fn virtual_execve_via_entry(
     clear_init_arrays(base, &phdrs);
     hook_libc_exit();
     hook_libc_execve();
+    hook_libc_fork();
+    hook_libc_pipe();
+    hook_libc_wait();
     patch_got_for_loaded_binary(base, &phdrs);
 
     // Save writable segment state AFTER clear_init_arrays + GOT patch but
@@ -761,7 +755,9 @@ fn decode_adrp(pc: usize, insn: u32) -> usize {
 }
 
 /// Spawn a coroutine that directly calls main(argc, argv, envp).
-/// Used when the binary has already been initialized via _start/__libc_init.
+/// Uses an assembly trampoline (__vproc_main_call) similar to the ELF entry
+/// path, avoiding Box<dyn FnOnce()> closures which have issues in the driver
+/// thread context.
 fn spawn_main_coroutine(
     main_addr: usize,
     argc: usize,
@@ -769,16 +765,75 @@ fn spawn_main_coroutine(
     envp: Vec<*const u8>,
     c_strings: Vec<*mut u8>,
 ) -> VPid {
-    let vpid = crate::spawn(Box::new(move || {
-        let main_fn: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int =
-            unsafe { std::mem::transmute(main_addr) };
-        let result = main_fn(argc as c_int, argv.as_ptr(), envp.as_ptr());
-        crate::executor::vproc_exit_with_code(result);
-    }));
+    use std::alloc::{alloc, Layout};
+    const STACK_SIZE: usize = 2 * 1024 * 1024;
+
+    let layout = Layout::from_size_align(STACK_SIZE, 16).unwrap();
+    let stack_base = unsafe { alloc(layout) };
+    assert!(!stack_base.is_null(), "stack alloc failed for main coroutine");
+    let stack_top = unsafe { stack_base.add(STACK_SIZE) };
+
+    // vproc_switch frame (160 bytes) at the top of the stack.
+    // Register assignments for __vproc_main_call:
+    //   x19 = main_addr, x20 = argc, x21 = argv ptr, x22 = envp ptr
+    //   x30 = __vproc_main_call
+    let frame_size: usize = 160;
+    let sp_init = unsafe { stack_top.sub(frame_size) };
+
     unsafe {
-        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+        // x19 = main_addr, x20 = argc
+        std::ptr::write_unaligned(sp_init as *mut u64, main_addr as u64);
+        std::ptr::write_unaligned(sp_init.add(8) as *mut u64, argc as u64);
+
+        // x21 = argv.as_ptr(), x22 = envp.as_ptr()
+        // These Vecs are moved into the coroutine's c_strings cleanup list,
+        // but the raw pointer arrays need to stay alive. Leak the Vec buffers
+        // and let c_strings cleanup handle the individual C strings.
+        let argv_ptr = argv.as_ptr() as u64;
+        let envp_ptr = envp.as_ptr() as u64;
+        std::mem::forget(argv);
+        std::mem::forget(envp);
+
+        std::ptr::write_unaligned(sp_init.add(16) as *mut u64, argv_ptr);
+        std::ptr::write_unaligned(sp_init.add(24) as *mut u64, envp_ptr);
+
+        // x23-x28: zero
+        for off in [32usize, 48, 64] {
+            std::ptr::write_unaligned(sp_init.add(off) as *mut u64, 0);
+            std::ptr::write_unaligned(sp_init.add(off + 8) as *mut u64, 0);
+        }
+
+        // x29(fp) = 0, x30(lr) = __vproc_main_call
+        std::ptr::write_unaligned(sp_init.add(80) as *mut u64, 0);
+        std::ptr::write_unaligned(
+            sp_init.add(88) as *mut u64,
+            crate::coroutine::__vproc_main_call as *const () as usize as u64,
+        );
+
+        // d8-d15: zero
+        for i in 0..8 {
+            std::ptr::write_unaligned(sp_init.add(96 + i * 8) as *mut u64, 0);
+        }
     }
-    vpid
+
+    let pid = {
+        let ex = unsafe { &mut *crate::executor::get_global_executor() };
+        let next_pid = ex.next_pid();
+        let co = crate::coroutine::Coroutine::from_raw_parts(
+            next_pid,
+            sp_init,
+            stack_base,
+            STACK_SIZE,
+        );
+        ex.insert_coroutine(next_pid, co);
+        ex.push_ready(next_pid);
+        next_pid
+    };
+
+    unsafe {
+        (*crate::executor::get_global_executor()).register_c_strings(pid, c_strings);
+    }
+    pid
 }
 
 /// Convert Rust strings to C strings, returning both the pointer vec for use
@@ -864,6 +919,73 @@ fn hook_libc_execve() {
         let original = libc::dlsym(rtld_next, b"execve\0".as_ptr() as *const std::os::raw::c_char);
         if original.is_null() { return; }
         write_inline_hook(original as usize, crate::preload::execve as *const c_void as usize);
+    }
+}
+
+/// Inline-hook libc's fork() and vfork() so vproc intercepts process creation.
+/// Essential for Java/JVM environments where GOT patching doesn't work:
+/// the interceptor sets REAL_FORK_CHILD in fork children, which prevents
+/// the execve inline hook from trying virtual_execve in real child processes.
+fn hook_libc_fork() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let rtld_next = -1isize as *mut c_void;
+    let target = crate::preload::fork as *const c_void as usize;
+    unsafe {
+        for name in [b"fork\0".as_ptr(), b"vfork\0".as_ptr()] {
+            let original = libc::dlsym(rtld_next, name as *const std::os::raw::c_char);
+            if original.is_null() {
+                eprintln!("[vexec] hook_libc_fork: dlsym({:?}) = null", name);
+                continue;
+            }
+            let ok = write_inline_hook(original as usize, target);
+            eprintln!("[vexec] hook_libc_fork: {:?} at {:#x} → {:#x} ok={}",
+                std::ffi::CStr::from_ptr(name as *const _), original as usize, target, ok);
+        }
+    }
+}
+
+/// Inline-hook libc's pipe() and pipe2().
+fn hook_libc_pipe() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let rtld_next = -1isize as *mut c_void;
+    unsafe {
+        let orig = libc::dlsym(rtld_next, b"pipe\0".as_ptr() as *const std::os::raw::c_char);
+        if !orig.is_null() {
+            let ok = write_inline_hook(orig as usize, crate::preload::pipe as *const c_void as usize);
+            eprintln!("[vexec] hook_libc_pipe: ok={}", ok);
+        }
+        let orig2 = libc::dlsym(rtld_next, b"pipe2\0".as_ptr() as *const std::os::raw::c_char);
+        if !orig2.is_null() {
+            let ok = write_inline_hook(orig2 as usize, crate::preload::pipe2 as *const c_void as usize);
+            eprintln!("[vexec] hook_libc_pipe2: ok={}", ok);
+        }
+    }
+}
+
+/// Inline-hook libc's wait4() and waitpid().
+fn hook_libc_wait() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let rtld_next = -1isize as *mut c_void;
+    unsafe {
+        let orig = libc::dlsym(rtld_next, b"wait4\0".as_ptr() as *const std::os::raw::c_char);
+        if !orig.is_null() {
+            let ok = write_inline_hook(orig as usize, crate::preload::wait4 as *const c_void as usize);
+            eprintln!("[vexec] hook_libc_wait4: ok={}", ok);
+        }
+        let orig2 = libc::dlsym(rtld_next, b"waitpid\0".as_ptr() as *const std::os::raw::c_char);
+        if !orig2.is_null() {
+            let ok = write_inline_hook(orig2 as usize, crate::preload::waitpid as *const c_void as usize);
+            eprintln!("[vexec] hook_libc_waitpid: ok={}", ok);
+        }
     }
 }
 

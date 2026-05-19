@@ -51,9 +51,27 @@ std::arch::global_asm!(
     ".size __vproc_trampoline, . - __vproc_trampoline",
 );
 
+// Trampoline for calling main() directly in a coroutine.
+// x19 = main_addr, x20 = argc, x21 = argv, x22 = envp
+std::arch::global_asm!(
+    ".text",
+    ".align 2",
+    ".global __vproc_main_call",
+    ".type __vproc_main_call, @function",
+    "__vproc_main_call:",
+    "mov    x0, x20",          // argc
+    "mov    x1, x21",          // argv
+    "mov    x2, x22",          // envp
+    "blr    x19",              // call main(argc, argv, envp)
+    "bl     vproc_exit_with_code", // x0 = main's return value
+    "brk    #1",               // unreachable
+    ".size __vproc_main_call, . - __vproc_main_call",
+);
+
 extern "C" {
     fn __vproc_trampoline();
     fn __vproc_elf_entry();
+    pub fn __vproc_main_call();
 }
 
 /// Rust entry function called by the assembly trampoline.
@@ -142,6 +160,32 @@ impl Coroutine {
 
     pub fn is_done(&self) -> bool {
         self.state == State::Done
+    }
+
+    /// Create a Coroutine from pre-initialized stack state.
+    /// The caller sets up the switch frame (callee-saved registers) directly.
+    pub fn from_raw_parts(
+        id: VPid,
+        sp: *mut u8,
+        stack_base: *mut u8,
+        stack_size: usize,
+    ) -> Self {
+        Coroutine {
+            id,
+            ppid: 0,
+            sp,
+            stack_base,
+            stack_size,
+            state: State::Ready,
+            exit_code: 0,
+            is_fork_child: false,
+            fork_child_pid: 0,
+            c_strings: Vec::new(),
+            mapped_regions: Vec::new(),
+            pending_signals: Vec::new(),
+            cwd: None,
+            binary_path: None,
+        }
     }
 
     /// Create a coroutine whose stack is set up for ELF entry.

@@ -43,6 +43,9 @@ pub struct Executor {
     /// Stored on the heap (Executor is heap-allocated via AtomicPtr),
     /// so it survives stack corruption from dlopen/__libc_init in other coroutines.
     pub saved_fork_lr: Option<u64>,
+    /// Exit codes of reaped coroutines. Survives reap so that late-registered
+    /// waiters (vproc_ffi_run_until_exit) can still retrieve the result.
+    exit_codes: HashMap<VPid, i32>,
 }
 
 impl Executor {
@@ -56,7 +59,22 @@ impl Executor {
             switch_count: 0,
             children: HashMap::new(),
             saved_fork_lr: None,
+            exit_codes: HashMap::new(),
         }
+    }
+
+    pub fn next_pid(&mut self) -> VPid {
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        pid
+    }
+
+    pub fn insert_coroutine(&mut self, pid: VPid, co: Coroutine) {
+        self.vprocs.insert(pid, co);
+    }
+
+    pub fn push_ready(&mut self, pid: VPid) {
+        self.ready_queue.push_back(pid);
     }
 
     pub fn spawn(&mut self, f: Box<dyn FnOnce()>) -> VPid {
@@ -290,6 +308,14 @@ impl Executor {
     pub fn switch_count(&self) -> u64 {
         self.switch_count
     }
+
+    pub fn ready_queue_len(&self) -> usize {
+        self.ready_queue.len()
+    }
+
+    pub fn vproc_count(&self) -> usize {
+        self.vprocs.len()
+    }
 }
 
 /// Called from assembly trampoline when a coroutine finishes normally.
@@ -300,7 +326,9 @@ pub extern "C" fn vproc_exit() {
 }
 
 /// Terminate the current coroutine with an exit code.
-pub fn vproc_exit_with_code(code: i32) {
+/// Also exposed as extern "C" for the __vproc_main_call assembly trampoline.
+#[no_mangle]
+pub extern "C" fn vproc_exit_with_code(code: i32) {
     let ex = unsafe { &mut *get_global_executor() };
     let pid = match ex.current {
         Some(p) => p,
@@ -310,14 +338,19 @@ pub fn vproc_exit_with_code(code: i32) {
         co.state = State::Done;
         co.exit_code = code;
     }
+    ex.exit_codes.insert(pid, code);
     // Don't re-queue — just schedule the next one
     ex.schedule();
 }
 
 /// Get the exit code of a completed coroutine.
 /// Returns None if the coroutine hasn't finished yet or doesn't exist.
+/// Checks the persistent exit_codes map first (survives reap), then vprocs.
 pub fn get_exit_code(pid: VPid) -> Option<i32> {
     let ex = unsafe { &mut *get_global_executor() };
+    if let Some(&code) = ex.exit_codes.get(&pid) {
+        return Some(code);
+    }
     ex.vprocs.get(&pid).and_then(|co| {
         if co.is_done() { Some(co.exit_code) } else { None }
     })
@@ -335,6 +368,12 @@ pub fn reap_child(parent: VPid, child: VPid) {
     if let Some(kids) = ex.children.get_mut(&parent) {
         kids.retain(|&k| k != child);
     }
+}
+
+/// Remove a persisted exit code after its waiter has been satisfied.
+pub fn remove_exit_code(pid: VPid) {
+    let ex = unsafe { &mut *get_global_executor() };
+    ex.exit_codes.remove(&pid);
 }
 
 /// Public API: yield from current coroutine
