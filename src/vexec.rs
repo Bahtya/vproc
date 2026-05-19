@@ -91,7 +91,7 @@ pub fn release_binaries(paths: &[String]) {
     let mut to_remove = Vec::new();
     for path in paths {
         if let Some(entry) = cache.get(path) {
-            if entry.active_users.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if entry.active_users.fetch_sub(1, Ordering::Relaxed) == 1 {
                 to_remove.push(path.clone());
             }
         }
@@ -100,6 +100,18 @@ pub fn release_binaries(paths: &[String]) {
         if let Some(entry) = cache.remove(&path) {
             unsafe { libc::dlclose(entry.handle.0); }
         }
+    }
+}
+
+/// Associate a spawned coroutine with its cached binary and increment the refcount.
+fn track_binary_user(vpid: VPid, path: &str) {
+    let ex = unsafe { &mut *crate::executor::get_global_executor() };
+    if let Some(co) = ex.vprocs.get_mut(&vpid) {
+        co.binary_path = Some(path.to_string());
+    }
+    let mut cache = BINARY_CACHE.lock().unwrap();
+    if let Some(entry) = cache.get_mut(path) {
+        entry.active_users.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -267,17 +279,7 @@ pub fn virtual_execve_via_entry(
         patch_got_for_loaded_binary(re_base, &re_phdrs);
 
         let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c, c_strings);
-        // Track binary usage for auto-dlclose
-        {
-            let ex = unsafe { &mut *crate::executor::get_global_executor() };
-            if let Some(co) = ex.vprocs.get_mut(&vpid) {
-                co.binary_path = Some(real_path_str.clone());
-            }
-            let mut cache = BINARY_CACHE.lock().unwrap();
-            if let Some(entry) = cache.get_mut(&real_path_str) {
-                entry.active_users.fetch_add(1, Ordering::SeqCst);
-            }
-        }
+        track_binary_user(vpid, &real_path_str);
         // Inherit fd table from current coroutine (Linux execve preserves fds)
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
@@ -369,18 +371,7 @@ pub fn virtual_execve_via_entry(
         )
     };
     register_elf_c_strings(vpid, c_strings);
-
-    // Track binary usage for auto-dlclose
-    {
-        let ex = unsafe { &mut *crate::executor::get_global_executor() };
-        if let Some(co) = ex.vprocs.get_mut(&vpid) {
-            co.binary_path = Some(real_path_str.clone());
-        }
-        let mut cache = BINARY_CACHE.lock().unwrap();
-        if let Some(entry) = cache.get_mut(&real_path_str) {
-            entry.active_users.fetch_add(1, Ordering::SeqCst);
-        }
-    }
+    track_binary_user(vpid, &real_path_str);
 
     // Inherit fd table from current coroutine (Linux execve preserves fds)
     if let Some(pid) = current_pid {

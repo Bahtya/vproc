@@ -316,7 +316,7 @@ impl Coroutine {
             mapped_regions: Vec::new(),
             pending_signals: Vec::new(),
             cwd: parent.cwd.clone(),
-            binary_path: parent.binary_path.clone(),
+            binary_path: None,
         }
     }
 }
