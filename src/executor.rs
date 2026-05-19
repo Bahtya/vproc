@@ -146,52 +146,53 @@ impl Executor {
     fn schedule(&mut self) {
         let current_pid = self.current.unwrap_or(MAIN_VPID);
 
-        let next = self.pick_next();
+        loop {
+            let next = self.pick_next();
 
-        match next {
-            Some(next_pid) => {
-                // Re-queue current if it's a coroutine and still alive
-                if current_pid != MAIN_VPID {
-                    let co = self.vprocs.get(&current_pid).unwrap();
-                    if co.state == State::Running {
-                        // Yield (not exit): put back in queue
-                        self.vprocs.get_mut(&current_pid).unwrap().state = State::Ready;
-                        self.ready_queue.push_back(current_pid);
-                    }
-                }
-
-                let old_sp_ptr = if current_pid == MAIN_VPID {
-                    sp_ptr(&mut self.main_sp)
-                } else {
-                    sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp)
-                };
-
-                self.vprocs.get_mut(&next_pid).unwrap().state = State::Running;
-
-                // Deliver pending signals before executing the coroutine
-                if self.deliver_signals(next_pid) {
-                    // Signal killed it — don't context-switch, re-schedule
-                    self.current = None;
+            match next {
+                Some(next_pid) => {
+                    // Re-queue current if it's a coroutine and still alive
                     if current_pid != MAIN_VPID {
-                        self.ready_queue.push_back(current_pid);
+                        let co = self.vprocs.get(&current_pid).unwrap();
+                        if co.state == State::Running {
+                            self.vprocs.get_mut(&current_pid).unwrap().state = State::Ready;
+                            self.ready_queue.push_back(current_pid);
+                        }
                     }
-                    self.schedule();
-                    return;
-                }
 
-                self.current = Some(next_pid);
-                self.switch_count += 1;
+                    let old_sp_ptr = if current_pid == MAIN_VPID {
+                        sp_ptr(&mut self.main_sp)
+                    } else {
+                        sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp)
+                    };
 
-                unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
-            }
-            None => {
-                // No ready coroutine, switch back to main
-                if current_pid != MAIN_VPID {
-                    self.current = None;
+                    self.vprocs.get_mut(&next_pid).unwrap().state = State::Running;
+
+                    // Deliver pending signals before executing the coroutine
+                    if self.deliver_signals(next_pid) {
+                        // Signal killed it — don't context-switch, try next
+                        if current_pid != MAIN_VPID {
+                            self.ready_queue.push_back(current_pid);
+                        }
+                        continue;
+                    }
+
+                    self.current = Some(next_pid);
                     self.switch_count += 1;
 
-                    let old_sp_ptr = sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp);
-                    unsafe { context_switch(old_sp_ptr, self.main_sp) };
+                    unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
+                    break;
+                }
+                None => {
+                    // No ready coroutine, switch back to main
+                    if current_pid != MAIN_VPID {
+                        self.current = None;
+                        self.switch_count += 1;
+
+                        let old_sp_ptr = sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp);
+                        unsafe { context_switch(old_sp_ptr, self.main_sp) };
+                    }
+                    break;
                 }
             }
         }
@@ -244,20 +245,22 @@ impl Executor {
 
     /// Deliver pending signals to a coroutine. Returns true if the coroutine was killed.
     fn deliver_signals(&mut self, pid: VPid) -> bool {
-        let signals: Vec<i32> = self.vprocs.get(&pid)
-            .map(|co| co.pending_signals.clone())
-            .unwrap_or_default();
-        if signals.is_empty() {
-            return false;
-        }
+        let signals = {
+            let co = match self.vprocs.get_mut(&pid) {
+                Some(c) => c,
+                None => return false,
+            };
+            if co.pending_signals.is_empty() {
+                return false;
+            }
+            std::mem::take(&mut co.pending_signals)
+        };
         for sig in &signals {
             match *sig {
-                9 | 15 => {
-                    // SIGKILL/SIGTERM: terminate the coroutine
+                libc::SIGKILL | libc::SIGTERM => {
                     if let Some(co) = self.vprocs.get_mut(&pid) {
                         co.state = State::Done;
                         co.exit_code = 128 + sig;
-                        co.pending_signals.clear();
                     }
                     return true;
                 }
@@ -265,9 +268,6 @@ impl Executor {
                     // Other signals: ignore (no sigaction handler support yet)
                 }
             }
-        }
-        if let Some(co) = self.vprocs.get_mut(&pid) {
-            co.pending_signals.clear();
         }
         false
     }

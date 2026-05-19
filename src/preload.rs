@@ -180,15 +180,19 @@ fn get_cwd() -> Option<String> {
     unsafe { (*ptr).vprocs.get(&vpid).and_then(|co| co.cwd.clone()) }
 }
 
-/// Get the process's real cwd via getcwd syscall.
+/// Get the process's real cwd via real libc getcwd.
 fn process_cwd() -> String {
     let mut buf = [0u8; 4096];
-    let ret = unsafe { libc::syscall(17, buf.as_mut_ptr() as *mut _, buf.len()) }; // __NR_getcwd
-    if ret >= 0 {
-        let len = unsafe { libc::strlen(buf.as_ptr() as *const c_char) };
-        std::str::from_utf8(&buf[..len]).unwrap_or("/").to_string()
-    } else {
-        "/".to_string()
+    unsafe {
+        let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
+            std::mem::transmute(real("getcwd\0"));
+        let ptr = f(buf.as_mut_ptr() as *mut c_char, buf.len());
+        if !ptr.is_null() {
+            let len = libc::strlen(buf.as_ptr() as *const c_char);
+            std::str::from_utf8(&buf[..len]).unwrap_or("/").to_string()
+        } else {
+            "/".to_string()
+        }
     }
 }
 
@@ -577,8 +581,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
                 }
                 if pipe_buf.is_closed() {
                     unsafe { *libc::__errno() = libc::EPIPE };
-                    // Deliver SIGPIPE — default action terminates the process (exit 141)
-                    crate::executor::vproc_exit_with_code(128 + 13);
+                    crate::executor::vproc_exit_with_code(128 + libc::SIGPIPE as i32);
                     unreachable!()
                 }
                 crate::executor::do_yield();
@@ -813,8 +816,7 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
                 unsafe {
                     if let Some(co) = (*ptr).vprocs.get_mut(&vpid.unwrap()) {
                         match sig {
-                            9 | 15 => {
-                                // SIGKILL/SIGTERM terminate immediately
+                            libc::SIGKILL | libc::SIGTERM => {
                                 crate::executor::vproc_exit_with_code(128 + sig);
                                 unreachable!()
                             }
@@ -873,8 +875,16 @@ pub extern "C" fn chdir(path: *const c_char) -> c_int {
                 Some(cwd) => resolve_path(cwd, &path_str),
                 None => resolve_path(&process_cwd(), &path_str),
             };
-            // Verify directory exists via real chdir
-            let c_resolved = std::ffi::CString::new(resolved.clone()).unwrap();
+            let c_resolved = match std::ffi::CString::new(resolved.clone()) {
+                Ok(s) => s,
+                Err(_) => {
+                    *libc::__errno() = libc::EINVAL;
+                    return -1;
+                }
+            };
+            // Call real chdir so that real fork() children inherit the correct cwd.
+            // Cooperative scheduling guarantees only one coroutine runs at a time,
+            // so the real process cwd always matches the currently-running coroutine's cwd.
             let f: extern "C" fn(*const c_char) -> c_int =
                 std::mem::transmute(real("chdir\0"));
             let ret = f(c_resolved.as_ptr());
@@ -965,7 +975,13 @@ pub extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int 
             if path_str.starts_with('/') {
                 None // absolute path, use as-is
             } else {
-                Some(std::ffi::CString::new(resolve_path(cwd, &path_str)).unwrap())
+                match std::ffi::CString::new(resolve_path(cwd, &path_str)) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        unsafe { *libc::__errno() = libc::EINVAL; }
+                        return -1;
+                    }
+                }
             }
         }
         None => None,
@@ -1015,7 +1031,13 @@ pub extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: 
                 if path_str.starts_with('/') {
                     None
                 } else {
-                    Some(std::ffi::CString::new(resolve_path(cwd, &path_str)).unwrap())
+                    match std::ffi::CString::new(resolve_path(cwd, &path_str)) {
+                        Ok(s) => Some(s),
+                        Err(_) => {
+                            unsafe { *libc::__errno() = libc::EINVAL; }
+                            return -1;
+                        }
+                    }
                 }
             }
             None => None,
