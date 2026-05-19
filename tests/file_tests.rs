@@ -7,15 +7,21 @@
 //! so glibc binaries fail. We avoid this by piping to a second command.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const TIMEOUT_SECS: u64 = 10;
 
+static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 /// Temp file path in the writable target/debug directory.
+/// Uses a per-test counter to avoid collisions when tests run in parallel.
 fn tmp_path(name: &str) -> String {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{}/target/debug/vproc_ftest_{}_{}",
+        "{}/target/debug/vproc_ftest_{}_{}_{}",
         std::env::current_dir().unwrap().display(),
         std::process::id(),
+        id,
         name
     )
 }
