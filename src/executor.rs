@@ -180,6 +180,9 @@ impl Executor {
                     self.current = Some(next_pid);
                     self.switch_count += 1;
 
+                    // SAFETY: context_switch saves/restores callee-saved registers (x19-x30, d8-d15).
+                    // Both sp pointers reference valid stack frames owned by their respective coroutines.
+                    // pick_next() returned Some, so vprocs[next_pid] exists.
                     unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
                     break;
                 }
@@ -190,6 +193,8 @@ impl Executor {
                         self.switch_count += 1;
 
                         let old_sp_ptr = sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp);
+                        // SAFETY: current_pid != MAIN_VPID guarantees it's a valid coroutine in vprocs.
+                        // main_sp is set during the first context switch away from main.
                         unsafe { context_switch(old_sp_ptr, self.main_sp) };
                     }
                     break;
@@ -202,12 +207,9 @@ impl Executor {
         self.schedule();
     }
 
-    pub fn block_on_all(&mut self) {
-        set_global_executor(self as *mut Executor);
-        while self.vprocs.values().any(|c| !c.is_done()) {
-            self.r#yield();
-        }
-        // Clean up children entries for removed coroutines
+    /// Reap all finished coroutines: clean up children maps, fd tables,
+    /// mapped regions, and release binary cache entries.
+    pub fn reap_done_coroutines(&mut self) {
         let done_pids: Vec<VPid> = self.vprocs.iter()
             .filter(|(_, co)| co.is_done())
             .map(|(&pid, _)| pid)
@@ -235,6 +237,14 @@ impl Executor {
             }
         });
         crate::vexec::release_binaries(&released_binaries);
+    }
+
+    pub fn block_on_all(&mut self) {
+        set_global_executor(self as *mut Executor);
+        while self.vprocs.values().any(|c| !c.is_done()) {
+            self.r#yield();
+        }
+        self.reap_done_coroutines();
     }
 
     fn pick_next(&mut self) -> Option<VPid> {
