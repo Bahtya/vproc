@@ -848,6 +848,80 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
+// setsid() / getpgrp() / tcsetpgrp() / tcgetpgrp()
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn setsid() -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            return vpid as c_int;
+        }
+    }
+    unsafe {
+        let f: extern "C" fn() -> c_int = std::mem::transmute(real("setsid\0"));
+        f()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn getpgrp() -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            return vpid as c_int;
+        }
+    }
+    unsafe {
+        let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpgrp\0"));
+        f()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            if crate::vfd::get_table(vpid)
+                .and_then(|t| t.get(fd as u32))
+                .map(|vfd| match vfd {
+                    crate::vfd::Vfd::Real(_) => false,
+                    _ => true,
+                })
+                .unwrap_or(false)
+            {
+                return 0;
+            }
+        }
+    }
+    unsafe {
+        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("tcsetpgrp\0"));
+        f(fd, pgid)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            if crate::vfd::get_table(vpid)
+                .and_then(|t| t.get(fd as u32))
+                .map(|vfd| match vfd {
+                    crate::vfd::Vfd::Real(_) => false,
+                    _ => true,
+                })
+                .unwrap_or(false)
+            {
+                return vpid as c_int;
+            }
+        }
+    }
+    unsafe {
+        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("tcgetpgrp\0"));
+        f(fd)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // chdir() / getcwd()
 // ---------------------------------------------------------------------------
 

@@ -418,3 +418,55 @@ int setpgid(pid_t pid, pid_t pgid) {
     REAL(t_int_int_pid, setpgid);
     return real_setpgid(pid, pgid);
 }
+
+/* ------------------------------------------------------------------ */
+/* setsid / getpgrp / tcsetpgrp / tcgetpgrp                           */
+/* ------------------------------------------------------------------ */
+
+pid_t setsid(void) {
+    if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->current_vpid && f->current_vpid() != 0) {
+            return (pid_t)f->current_vpid();
+        }
+    }
+    REAL(t_pid_void, setsid);
+    return real_setsid();
+}
+
+pid_t getpgrp(void) {
+    if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->current_vpid && f->current_vpid() != 0) {
+            return (pid_t)f->current_vpid();
+        }
+    }
+    REAL(t_pid_void, getpgrp);
+    return real_getpgrp();
+}
+
+int tcsetpgrp(int fd, pid_t pgid) {
+    if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->current_vpid && f->current_vpid() != 0) {
+            if (f->is_virtual_fd && f->is_virtual_fd(f->current_vpid(), fd)) {
+                return 0;
+            }
+        }
+    }
+    REAL(t_int_int_pid, tcsetpgrp);
+    return real_tcsetpgrp(fd, pgid);
+}
+
+pid_t tcgetpgrp(int fd) {
+    if (enabled()) {
+        const struct vproc_ffi *f = ffi();
+        if (f && f->current_vpid && f->current_vpid() != 0) {
+            if (f->is_virtual_fd && f->is_virtual_fd(f->current_vpid(), fd)) {
+                return (pid_t)f->current_vpid();
+            }
+        }
+    }
+    REAL(t_pid_int, tcgetpgrp);
+    return real_tcgetpgrp(fd);
+}
