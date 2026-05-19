@@ -390,24 +390,114 @@ pub extern "C" fn vproc_ffi_create_process(
 /// Drive the scheduler until the given vpid exits.
 /// Returns the exit code. Blocks the calling thread.
 ///
-/// Mutex is released before do_yield() to prevent deadlock when multiple
-/// sessions' waiter threads call this concurrently.
+/// Uses a dedicated driver thread to call do_yield(), because the caller
+/// (Java waitFor thread) is not a coroutine context. do_yield() saves the
+/// caller's stack pointer as main_sp — if multiple Java threads call it
+/// concurrently they corrupt each other's main_sp. The driver thread is
+/// the single "main" context that drives all coroutines safely.
+///
+/// Completion is signaled via a Condvar so the calling thread just blocks
+/// without touching the scheduler.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
+    // Fast path: already done
+    {
+        let _guard = EXECUTOR_MUTEX.lock().unwrap();
+        if let Some(code) = crate::executor::get_exit_code(vpid) {
+            return code;
+        }
+        let ptr = crate::executor::get_global_executor();
+        if ptr.is_null() || !unsafe { (*ptr).vprocs.contains_key(&vpid) } {
+            return -1;
+        }
+    }
+
+    // Shared state between this thread and the driver
+    let result = std::sync::Arc::new((
+        std::sync::Mutex::new(None::<i32>),
+        std::sync::Condvar::new(),
+    ));
+
+    // Register with the driver
+    WAITERS.lock().unwrap().push(Waiter {
+        vpid,
+        result: std::sync::Arc::clone(&result),
+    });
+
+    // Ensure the driver thread is running
+    start_driver_once();
+
+    // Block until the driver signals completion
+    let (lock, cvar) = &*result;
+    let mut guard = lock.lock().unwrap();
+    while guard.is_none() {
+        guard = cvar.wait(guard).unwrap();
+    }
+    guard.take().unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Driver thread — single "main" context that safely calls do_yield()
+// ---------------------------------------------------------------------------
+
+struct Waiter {
+    vpid: u32,
+    result: std::sync::Arc<(std::sync::Mutex<Option<i32>>, std::sync::Condvar)>,
+}
+
+static WAITERS: std::sync::Mutex<Vec<Waiter>> = std::sync::Mutex::new(Vec::new());
+static DRIVER_STARTED: std::sync::Once = std::sync::Once::new();
+
+fn start_driver_once() {
+    DRIVER_STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("vproc-driver".into())
+            .spawn(run_driver_loop)
+            .expect("failed to spawn vproc driver thread");
+    });
+}
+
+fn run_driver_loop() {
     loop {
+        // Drive the scheduler
         {
             let _guard = EXECUTOR_MUTEX.lock().unwrap();
-            match crate::executor::get_exit_code(vpid) {
-                Some(code) => return code,
-                None => {}
-            }
             let ptr = crate::executor::get_global_executor();
-            if ptr.is_null() || !unsafe { (*ptr).vprocs.contains_key(&vpid) } {
-                return -1;
+            if ptr.is_null() {
+                drop(_guard);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
             }
         }
-        // Mutex released — safe to yield (may switch to coroutine)
+        // Mutex must be released before yield
         crate::executor::do_yield();
+
+        // Check waiters
+        let completed: Vec<(u32, i32, std::sync::Arc<(std::sync::Mutex<Option<i32>>, std::sync::Condvar)>)> = {
+            let mut waiters = WAITERS.lock().unwrap();
+            let mut done = Vec::new();
+            waiters.retain(|w| {
+                if let Some(code) = crate::executor::get_exit_code(w.vpid) {
+                    done.push((w.vpid, code, std::sync::Arc::clone(&w.result)));
+                    false
+                } else {
+                    true
+                }
+            });
+            done
+        };
+
+        // Signal completed waiters
+        for (_vpid, code, result) in completed {
+            let (lock, cvar) = &*result;
+            *lock.lock().unwrap() = Some(code);
+            cvar.notify_all();
+        }
+
+        // If no waiters, sleep briefly to avoid busy-loop
+        if WAITERS.lock().unwrap().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
