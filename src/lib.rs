@@ -45,6 +45,26 @@ pub fn get_exit_code(pid: VPid) -> Option<i32> {
     executor::get_exit_code(pid)
 }
 
+/// Remove a binary from the cache and dlclose its handle.
+pub fn unload_binary(path: &str) -> bool {
+    vexec::unload_binary(path)
+}
+
+/// Remove all binaries from the cache and dlclose their handles.
+pub fn unload_all_binaries() {
+    vexec::unload_all_binaries()
+}
+
+/// Return the number of cached binaries.
+pub fn cached_binary_count() -> usize {
+    vexec::cached_binary_count()
+}
+
+/// Clean up global fd tables. Call after all coroutines have finished.
+pub fn cleanup_fd_tables() {
+    vfd::cleanup();
+}
+
 /// Convert a C `*const *const c_char` array (NULL-terminated) to `Vec<String>`.
 pub(crate) unsafe fn c_array_to_vec(arr: *const *const std::os::raw::c_char) -> Vec<String> {
     let mut vec = Vec::new();
