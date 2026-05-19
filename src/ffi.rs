@@ -518,10 +518,11 @@ fn run_driver_loop() {
             });
             done
         };
-        for (_vpid, code, result) in completed {
+        for (vpid, code, result) in completed {
             let (lock, cvar) = &*result;
             *lock.lock().unwrap() = Some(code);
             cvar.notify_all();
+            crate::executor::remove_exit_code(vpid);
         }
 
         // 3b. Reap done coroutines — clean up fd tables, mapped regions,
