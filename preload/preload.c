@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 /* ------------------------------------------------------------------ */
 /* Runtime function pointers, resolved lazily from libvproc.so        */
@@ -103,6 +104,7 @@ typedef int     (*t_int_int)(int);
 typedef int     (*t_int_int_int)(int, int);
 typedef pid_t   (*t_pid_int)(int);
 typedef int     (*t_int_int_pid)(pid_t, pid_t);
+typedef int     (*t_int_pollfd_nfds_int)(struct pollfd *, nfds_t, int);
 
 #define REAL(type, name)                       \
     static type real_##name;                    \
@@ -263,17 +265,31 @@ ssize_t read(int fd, void *buf, size_t count) {
         const struct vproc_ffi *f = ffi();
         if (f && f->current_vpid) {
             unsigned vpid = f->current_vpid();
-            if (vpid != 0 && f->is_virtual_fd && f->is_virtual_fd(vpid, fd)) {
-                if (f->read) {
-                    for (;;) {
-                        ssize_t n = f->read(vpid, fd, buf, count);
-                        if (n >= 0) return n;
-                        /* EAGAIN — yield and retry */
-                        if (f->yield) f->yield();
+            if (vpid != 0) {
+                if (f->is_virtual_fd && f->is_virtual_fd(vpid, fd)) {
+                    /* Virtual pipe fd — yield-based read */
+                    if (f->read) {
+                        for (;;) {
+                            ssize_t n = f->read(vpid, fd, buf, count);
+                            if (n >= 0) return n;
+                            if (f->yield) f->yield();
+                        }
                     }
+                    errno = EBADF;
+                    return -1;
                 }
-                errno = EBADF;
-                return -1;
+                /* Real fd — poll + yield to avoid blocking the driver thread */
+                REAL(t_int_pollfd_nfds_int, poll);
+                REAL(t_ssize_int_voidp_size, read);
+                for (;;) {
+                    struct pollfd pfd = { fd, POLLIN, 0 };
+                    int ret = real_poll(&pfd, 1, 0);
+                    if (ret < 0 || (pfd.revents & (POLLERR | POLLNVAL)))
+                        return real_read(fd, buf, count);
+                    if (pfd.revents & POLLIN)
+                        return real_read(fd, buf, count);
+                    if (f->yield) f->yield();
+                }
             }
         }
     }

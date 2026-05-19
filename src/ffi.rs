@@ -501,6 +501,10 @@ fn run_driver_loop() {
         // 2. Drive the scheduler (runs coroutines via context_switch)
         let ptr = crate::executor::get_global_executor();
         if !ptr.is_null() {
+            let ex = unsafe { &*ptr };
+            let rq = ex.ready_queue_len();
+            let vp = ex.vproc_count();
+            eprintln!("[driver] do_yield: ready_queue={} vprocs={}", rq, vp);
             crate::executor::do_yield();
         }
 
@@ -518,10 +522,11 @@ fn run_driver_loop() {
             });
             done
         };
-        for (_vpid, code, result) in completed {
+        for (vpid, code, result) in completed {
             let (lock, cvar) = &*result;
             *lock.lock().unwrap() = Some(code);
             cvar.notify_all();
+            crate::executor::remove_exit_code(vpid);
         }
 
         // 3b. Reap done coroutines — clean up fd tables, mapped regions,
