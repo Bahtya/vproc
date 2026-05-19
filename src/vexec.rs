@@ -18,6 +18,17 @@ struct DlHandle(*mut c_void);
 unsafe impl Send for DlHandle {}
 unsafe impl Sync for DlHandle {}
 
+/// RAII guard that dlclose's a dlopen handle on drop.
+/// Used to prevent handle leaks on early error returns.
+struct DlGuard(*mut c_void);
+impl Drop for DlGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libc::dlclose(self.0); }
+        }
+    }
+}
+
 struct BinaryCacheEntry {
     main_addr: usize,
     handle: DlHandle,
@@ -269,6 +280,11 @@ pub fn virtual_execve_via_entry(
     };
 
     if let Some((main_addr, saved_writable, _handle)) = cached {
+        if main_addr == 0 {
+            // main() address couldn't be extracted on first load — cannot use
+            // the optimized cache-hit path. Fall through to re-dlopen + _start.
+            // The handle is already in cache and will be dlclose'd by release_binaries.
+        } else {
         // Binary already initialized — restore writable segments and re-patch GOT,
         // then call main() directly, skipping _start/__libc_init.
         restore_writable_segments(&saved_writable);
@@ -298,6 +314,7 @@ pub fn virtual_execve_via_entry(
             }
         }
         return Ok(VirtualExec { vpid });
+        }
     }
 
     // First time: need to dlopen and run _start
@@ -315,6 +332,8 @@ pub fn virtual_execve_via_entry(
             .into_owned();
         return Err(format!("dlopen({}): {}", path, err));
     }
+    // Guard dlclose's on early return; forgotten when handle is cached.
+    let guard = DlGuard(handle);
 
     let base = find_loaded_base(path).ok_or_else(|| format!(
         "dlopen({}) succeeded but dl_iterate_phdr cannot find it", path
@@ -333,15 +352,19 @@ pub fn virtual_execve_via_entry(
     // Save writable segment state AFTER clear_init_arrays + GOT patch but
     // BEFORE _start runs. The snapshot has zeroed init_arrays and patched GOT,
     // which is exactly what subsequent calls need restored before calling main().
-    if let Some(main_addr) = extracted {
-        let saved = save_writable_segments(base, &phdrs);
-        BINARY_CACHE.lock().unwrap().insert(real_path_str.clone(), BinaryCacheEntry {
-            main_addr,
-            handle: DlHandle(handle),
-            saved_writable: Arc::new(saved),
-            active_users: AtomicU32::new(0),
-        });
-    }
+    // Always cache the entry so the handle is tracked for auto-dlclose.
+    // main_addr=0 means we couldn't extract main() — cache-hit path will
+    // skip the optimized main() call and fall through to _start instead.
+    let main_addr = extracted.unwrap_or(0);
+    let saved = save_writable_segments(base, &phdrs);
+    BINARY_CACHE.lock().unwrap().insert(real_path_str.clone(), BinaryCacheEntry {
+        main_addr,
+        handle: DlHandle(handle),
+        saved_writable: Arc::new(saved),
+        active_users: AtomicU32::new(0),
+    });
+    // Handle is now owned by the cache — prevent guard from dlclose'ing it.
+    std::mem::forget(guard);
 
     let image = loader::LoadedImage {
         base,

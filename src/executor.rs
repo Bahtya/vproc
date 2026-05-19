@@ -180,6 +180,9 @@ impl Executor {
                     self.current = Some(next_pid);
                     self.switch_count += 1;
 
+                    // SAFETY: context_switch saves/restores callee-saved registers (x19-x30, d8-d15).
+                    // Both sp pointers reference valid stack frames owned by their respective coroutines.
+                    // pick_next() returned Some, so vprocs[next_pid] exists.
                     unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
                     break;
                 }
@@ -190,6 +193,8 @@ impl Executor {
                         self.switch_count += 1;
 
                         let old_sp_ptr = sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp);
+                        // SAFETY: current_pid != MAIN_VPID guarantees it's a valid coroutine in vprocs.
+                        // main_sp is set during the first context switch away from main.
                         unsafe { context_switch(old_sp_ptr, self.main_sp) };
                     }
                     break;
