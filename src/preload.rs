@@ -301,8 +301,6 @@ pub extern "C" fn getppid() -> c_int {
 
 #[no_mangle]
 pub extern "C" fn fork() -> c_int {
-    unsafe { libc::syscall(64, 2, b"[vproc] fork interceptor called\n\0".as_ptr() as *const _, 35); }
-    trace_log("fork");
     if !enabled() {
         // Use raw clone syscall — libc fork is inline-hooked so real("fork")
         // would recurse.  clone with SIGCHLD is equivalent to fork.
@@ -462,17 +460,6 @@ pub extern "C" fn wait4(
 // execve()
 // ---------------------------------------------------------------------------
 
-fn trace_log(tag: &str) {
-    let path = format!("/data/data/com.termux/files/home/vproc_{}.log\0", tag);
-    // openat(dirfd=AT_FDCWD, pathname, flags, mode) — args are x0=dirfd, x1=path, x2=flags, x3=mode
-    let fd = unsafe { libc::syscall(56, -100i64, path.as_ptr() as *const _, 577, 0o666) };
-    if fd >= 0 {
-        let msg = format!("[vproc] {} called\n\0", tag);
-        let _ = unsafe { libc::syscall(64, fd, msg.as_ptr(), msg.len()) };
-        let _ = unsafe { libc::syscall(57, fd) };
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn execve(
     path: *const c_char,
@@ -532,7 +519,6 @@ static EXECVE_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 #[no_mangle]
 pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
-    trace_log("pipe");
     // Use raw pipe2 syscall to avoid recursion when libc pipe is inline-hooked.
     let ret = unsafe { libc::syscall(59, fds, 0) as c_int }; // __NR_pipe2 = 59 on aarch64
     if ret < 0 {
@@ -545,7 +531,6 @@ pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
-    trace_log("pipe2");
     let ret = unsafe { libc::syscall(59, fds, flags) as c_int }; // __NR_pipe2 = 59
     if ret < 0 {
         unsafe { *libc::__errno() = (-ret) as c_int; }
@@ -636,7 +621,6 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
 
 #[no_mangle]
 pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
-    trace_log("write");
     if !enabled() || is_real_fork_child() {
         unsafe {
             let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
