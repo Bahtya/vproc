@@ -61,7 +61,9 @@ pub fn unload_binary(path: &str) -> bool {
     let mut cache = BINARY_CACHE.lock().unwrap();
     match cache.remove(&real_path) {
         Some(entry) => {
-            unsafe { libc::dlclose(entry.handle.0); }
+            if !entry.handle.0.is_null() {
+                unsafe { libc::dlclose(entry.handle.0); }
+            }
             true
         }
         None => false,
@@ -75,7 +77,9 @@ pub fn unload_binary(path: &str) -> bool {
 pub fn unload_all_binaries() {
     let mut cache = BINARY_CACHE.lock().unwrap();
     for (_, entry) in cache.drain() {
-        unsafe { libc::dlclose(entry.handle.0); }
+        if !entry.handle.0.is_null() {
+            unsafe { libc::dlclose(entry.handle.0); }
+        }
     }
 }
 
@@ -98,7 +102,9 @@ pub fn release_binaries(paths: &[String]) {
     }
     for path in to_remove {
         if let Some(entry) = cache.remove(&path) {
-            unsafe { libc::dlclose(entry.handle.0); }
+            if !entry.handle.0.is_null() {
+                unsafe { libc::dlclose(entry.handle.0); }
+            }
         }
     }
 }

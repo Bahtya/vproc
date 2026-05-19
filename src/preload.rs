@@ -479,6 +479,10 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
             return f(fd, buf, count);
         }
     }
+    if fd < 0 {
+        unsafe { *libc::__errno() = libc::EBADF };
+        return -1;
+    }
     let vpid = match current_vpid() {
         Some(p) => p,
         None => unsafe {
@@ -539,6 +543,10 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
                 std::mem::transmute(real("write\0"));
             return f(fd, buf, count);
         }
+    }
+    if fd < 0 {
+        unsafe { *libc::__errno() = libc::EBADF };
+        return -1;
     }
     let vpid = match current_vpid() {
         Some(p) => p,
@@ -607,6 +615,10 @@ pub extern "C" fn close(fd: c_int) -> c_int {
             let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
             return f(fd);
         }
+    }
+    if fd < 0 {
+        unsafe { *libc::__errno() = libc::EBADF };
+        return -1;
     }
     let vpid = match current_vpid() {
         Some(p) => p,
