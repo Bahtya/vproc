@@ -12,7 +12,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-      - uses: nICKNAME0402/setup-ndk@v2
+      - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
           ndk-version: r27c
