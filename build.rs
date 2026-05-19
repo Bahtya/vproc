@@ -3,13 +3,11 @@ fn main() {
     println!("cargo::rerun-if-changed=asm/elf_entry.S");
     cc::Build::new()
         .file("asm/switch.S")
-        .compiler("gcc")
         .flag("-std=c11")
         .flag("-O2")
         .compile("vproc_switch");
     cc::Build::new()
         .file("asm/elf_entry.S")
-        .compiler("gcc")
         .flag("-std=c11")
         .flag("-O2")
         .compile("vproc_elf_entry");
