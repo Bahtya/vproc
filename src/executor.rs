@@ -3,46 +3,37 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::arch::aarch64::context_switch;
 use crate::coroutine::{Coroutine, State, VPid};
 
 thread_local! {
     pub static EXECUTOR: UnsafeCell<Executor> = UnsafeCell::new(Executor::new());
 }
 
-/// Global pointer to the executor, set when block_on_all starts.
-/// Survives TLS reinitialization (e.g. when __libc_init runs inside a dlopen'd binary).
 static EXECUTOR_PTR: AtomicPtr<Executor> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Set the global executor pointer (called from block_on_all).
 pub fn set_global_executor(ptr: *mut Executor) {
     EXECUTOR_PTR.store(ptr, Ordering::SeqCst);
 }
 
-/// Get the executor via the global pointer. Returns null if not set.
 pub fn get_global_executor() -> *mut Executor {
     let ptr = EXECUTOR_PTR.load(Ordering::SeqCst);
     if !ptr.is_null() {
         return ptr;
     }
-    // Fallback to thread-local
     EXECUTOR.with(|e| e.get())
 }
 
-const MAIN_VPID: VPid = 0;
+const _MAIN_VPID: VPid = 0;
 
 pub struct Executor {
     pub vprocs: HashMap<VPid, Coroutine>,
     ready_queue: VecDeque<VPid>,
     next_pid: VPid,
     pub current: Option<VPid>,
-    main_sp: *mut u8,
     switch_count: u64,
     pub children: HashMap<VPid, Vec<VPid>>,
-    /// Saved lr (x30) value for fork LR restoration.
-    /// Stored on the heap (Executor is heap-allocated via AtomicPtr),
-    /// so it survives stack corruption from dlopen/__libc_init in other coroutines.
     pub saved_fork_lr: Option<u64>,
+    exit_codes: HashMap<VPid, i32>,
 }
 
 impl Executor {
@@ -52,10 +43,10 @@ impl Executor {
             ready_queue: VecDeque::new(),
             next_pid: 1,
             current: None,
-            main_sp: std::ptr::null_mut(),
             switch_count: 0,
             children: HashMap::new(),
             saved_fork_lr: None,
+            exit_codes: HashMap::new(),
         }
     }
 
@@ -68,9 +59,6 @@ impl Executor {
         pid
     }
 
-    /// Spawn a coroutine at the front of the ready queue.
-    /// Used for fork helpers that must run before any other coroutine
-    /// to prevent scheduling interleaving that corrupts the parent's stack.
     pub fn spawn_front(&mut self, f: Box<dyn FnOnce()>) -> VPid {
         let pid = self.next_pid;
         self.next_pid += 1;
@@ -80,7 +68,6 @@ impl Executor {
         pid
     }
 
-    /// Spawn a coroutine that will execute a loaded ELF binary.
     pub fn spawn_elf(
         &mut self,
         entry: usize,
@@ -99,26 +86,18 @@ impl Executor {
         pid
     }
 
-    /// Register C strings for a coroutine. They will be freed when the coroutine is dropped.
     pub fn register_c_strings(&mut self, vpid: VPid, strings: Vec<*mut u8>) {
         if let Some(co) = self.vprocs.get_mut(&vpid) {
             co.c_strings = strings;
         }
     }
 
-    /// Register a mmap'd region to be unmapped when the coroutine is dropped.
     pub fn register_mapped_region(&mut self, vpid: VPid, base: usize, size: usize) {
         if let Some(co) = self.vprocs.get_mut(&vpid) {
             co.mapped_regions.push((base, size));
         }
     }
 
-    /// Create a fork child coroutine from the given parent's saved stack state.
-    ///
-    /// Allocates a new VPid, copies the parent's stack via `Coroutine::fork_from`,
-    /// registers the parent-child relationship, and copies the fd table.
-    ///
-    /// Returns the child's VPid and writes it to the parent's `fork_child_pid` field.
     pub fn spawn_fork_child(&mut self, parent_pid: VPid) -> VPid {
         let child_id = self.next_pid;
         self.next_pid += 1;
@@ -137,78 +116,87 @@ impl Executor {
         child_id
     }
 
-    /// Returns the current coroutine's VPid, or None if on the main stack.
     pub fn current_pid(&self) -> Option<VPid> {
         self.current
     }
 
-    /// Switch to the next ready coroutine, or back to main.
-    fn schedule(&mut self) {
-        let current_pid = self.current.unwrap_or(MAIN_VPID);
-
-        loop {
-            let next = self.pick_next();
-
-            match next {
-                Some(next_pid) => {
-                    // Re-queue current if it's a coroutine and still alive
-                    if current_pid != MAIN_VPID {
-                        let co = self.vprocs.get(&current_pid).unwrap();
-                        if co.state == State::Running {
-                            self.vprocs.get_mut(&current_pid).unwrap().state = State::Ready;
-                            self.ready_queue.push_back(current_pid);
-                        }
-                    }
-
-                    let old_sp_ptr = if current_pid == MAIN_VPID {
-                        sp_ptr(&mut self.main_sp)
-                    } else {
-                        sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp)
-                    };
-
-                    self.vprocs.get_mut(&next_pid).unwrap().state = State::Running;
-
-                    // Deliver pending signals before executing the coroutine
-                    if self.deliver_signals(next_pid) {
-                        // Signal killed it — don't context-switch, try next
-                        if current_pid != MAIN_VPID {
-                            self.ready_queue.push_back(current_pid);
-                        }
-                        continue;
-                    }
-
-                    self.current = Some(next_pid);
-                    self.switch_count += 1;
-
-                    // SAFETY: context_switch saves/restores callee-saved registers (x19-x30, d8-d15).
-                    // Both sp pointers reference valid stack frames owned by their respective coroutines.
-                    // pick_next() returned Some, so vprocs[next_pid] exists.
-                    unsafe { context_switch(old_sp_ptr, self.vprocs.get(&next_pid).unwrap().sp) };
-                    break;
-                }
-                None => {
-                    // No ready coroutine, switch back to main
-                    if current_pid != MAIN_VPID {
-                        self.current = None;
-                        self.switch_count += 1;
-
-                        let old_sp_ptr = sp_ptr(&mut self.vprocs.get_mut(&current_pid).unwrap().sp);
-                        // SAFETY: current_pid != MAIN_VPID guarantees it's a valid coroutine in vprocs.
-                        // main_sp is set during the first context switch away from main.
-                        unsafe { context_switch(old_sp_ptr, self.main_sp) };
-                    }
-                    break;
+    fn pick_next(&mut self) -> Option<VPid> {
+        while let Some(pid) = self.ready_queue.pop_front() {
+            if let Some(co) = self.vprocs.get(&pid) {
+                if !co.is_done() {
+                    return Some(pid);
                 }
             }
         }
+        None
+    }
+
+    fn deliver_signals(&mut self, pid: VPid) -> bool {
+        let signals = {
+            let co = match self.vprocs.get_mut(&pid) {
+                Some(c) => c,
+                None => return false,
+            };
+            if co.pending_signals.is_empty() {
+                return false;
+            }
+            std::mem::take(&mut co.pending_signals)
+        };
+        for sig in &signals {
+            match *sig {
+                libc::SIGKILL | libc::SIGTERM => {
+                    if let Some(co) = self.vprocs.get_mut(&pid) {
+                        co.set_done(128 + sig);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Run one scheduler step: resume the next ready coroutine.
+    /// Returns true if work was done, false if nothing to run.
+    fn step(&mut self) -> bool {
+        let next_pid = match self.pick_next() {
+            Some(pid) => pid,
+            None => return false,
+        };
+
+        if self.deliver_signals(next_pid) {
+            if let Some(cur) = self.current {
+                self.ready_queue.push_back(cur);
+            }
+            return true;
+        }
+
+        // Re-queue current if still alive
+        if let Some(cur) = self.current {
+            if let Some(co) = self.vprocs.get(&cur) {
+                if !co.is_done() {
+                    self.ready_queue.push_back(cur);
+                }
+            }
+        }
+
+        self.current = Some(next_pid);
+        self.switch_count += 1;
+        self.vprocs.get_mut(&next_pid).unwrap().resume();
+        true
     }
 
     pub fn r#yield(&mut self) {
-        self.schedule();
+        if let Some(pid) = self.current {
+            let co = self.vprocs.get(&pid).unwrap();
+            if !co.is_done() {
+                self.vprocs.get_mut(&pid).unwrap().state = State::Ready;
+                self.ready_queue.push_back(pid);
+            }
+        }
+        self.step();
     }
 
-    /// Reap all finished coroutines: clean up children maps, fd tables,
-    /// mapped regions, and release binary cache entries.
     pub fn reap_done_coroutines(&mut self) {
         let done_pids: Vec<VPid> = self.vprocs.iter()
             .filter(|(_, co)| co.is_done())
@@ -242,49 +230,21 @@ impl Executor {
     pub fn block_on_all(&mut self) {
         set_global_executor(self as *mut Executor);
         while self.vprocs.values().any(|c| !c.is_done()) {
-            self.r#yield();
+            let next_pid = match self.pick_next() {
+                Some(pid) => pid,
+                None => break,
+            };
+            self.deliver_signals(next_pid);
+            self.current = Some(next_pid);
+            self.switch_count += 1;
+            self.vprocs.get_mut(&next_pid).unwrap().resume();
+            if let Some(co) = self.vprocs.get(&next_pid) {
+                if !co.is_done() {
+                    self.ready_queue.push_back(next_pid);
+                }
+            }
         }
         self.reap_done_coroutines();
-    }
-
-    fn pick_next(&mut self) -> Option<VPid> {
-        while let Some(pid) = self.ready_queue.pop_front() {
-            if let Some(co) = self.vprocs.get(&pid) {
-                if !co.is_done() {
-                    return Some(pid);
-                }
-            }
-        }
-        None
-    }
-
-    /// Deliver pending signals to a coroutine. Returns true if the coroutine was killed.
-    fn deliver_signals(&mut self, pid: VPid) -> bool {
-        let signals = {
-            let co = match self.vprocs.get_mut(&pid) {
-                Some(c) => c,
-                None => return false,
-            };
-            if co.pending_signals.is_empty() {
-                return false;
-            }
-            std::mem::take(&mut co.pending_signals)
-        };
-        for sig in &signals {
-            match *sig {
-                libc::SIGKILL | libc::SIGTERM => {
-                    if let Some(co) = self.vprocs.get_mut(&pid) {
-                        co.state = State::Done;
-                        co.exit_code = 128 + sig;
-                    }
-                    return true;
-                }
-                _ => {
-                    // Other signals: ignore (no sigaction handler support yet)
-                }
-            }
-        }
-        false
     }
 
     pub fn switch_count(&self) -> u64 {
@@ -292,14 +252,11 @@ impl Executor {
     }
 }
 
-/// Called from assembly trampoline when a coroutine finishes normally.
-/// Marks the coroutine as Done and yields back.
 #[no_mangle]
 pub extern "C" fn vproc_exit() {
     vproc_exit_with_code(0);
 }
 
-/// Terminate the current coroutine with an exit code.
 pub fn vproc_exit_with_code(code: i32) {
     let ex = unsafe { &mut *get_global_executor() };
     let pid = match ex.current {
@@ -310,26 +267,32 @@ pub fn vproc_exit_with_code(code: i32) {
         co.state = State::Done;
         co.exit_code = code;
     }
-    // Don't re-queue — just schedule the next one
-    ex.schedule();
+    ex.exit_codes.insert(pid, code);
+    // Yield back to the driver thread via minicoro.
+    // Use mco_running() to avoid double-&mut on vprocs.
+    unsafe {
+        let co = mco_running_raw();
+        if !co.is_null() {
+            mco_yield_raw(co);
+        }
+    }
 }
 
-/// Get the exit code of a completed coroutine.
-/// Returns None if the coroutine hasn't finished yet or doesn't exist.
 pub fn get_exit_code(pid: VPid) -> Option<i32> {
     let ex = unsafe { &mut *get_global_executor() };
+    if let Some(&code) = ex.exit_codes.get(&pid) {
+        return Some(code);
+    }
     ex.vprocs.get(&pid).and_then(|co| {
         if co.is_done() { Some(co.exit_code) } else { None }
     })
 }
 
-/// Check if a VPid is a child of the given parent.
 pub fn is_child_of(parent: VPid, child: VPid) -> bool {
     let ex = unsafe { &mut *get_global_executor() };
     ex.children.get(&parent).map_or(false, |kids| kids.contains(&child))
 }
 
-/// Remove a child from the parent's children list (after waitpid reaps it).
 pub fn reap_child(parent: VPid, child: VPid) {
     let ex = unsafe { &mut *get_global_executor() };
     if let Some(kids) = ex.children.get_mut(&parent) {
@@ -337,12 +300,51 @@ pub fn reap_child(parent: VPid, child: VPid) {
     }
 }
 
-/// Public API: yield from current coroutine
-pub fn do_yield() {
+pub fn remove_exit_code(pid: VPid) {
     let ex = unsafe { &mut *get_global_executor() };
-    ex.r#yield();
+    ex.exit_codes.remove(&pid);
 }
 
-fn sp_ptr(p: &mut *mut u8) -> *mut *mut u8 {
-    p as *mut *mut u8
+pub fn do_yield() {
+    unsafe {
+        let co = mco_running_raw();
+        if !co.is_null() {
+            // Inside a coroutine — yield via minicoro directly.
+            mco_yield_raw(co);
+        } else {
+            // Driver thread — advance the scheduler.
+            let ex = &mut *get_global_executor();
+            ex.step_from_driver();
+        }
+    }
+}
+
+unsafe fn mco_running_raw() -> *mut crate::coroutine::McoCoro {
+    unsafe extern "C" {
+        fn mco_running() -> *mut crate::coroutine::McoCoro;
+    }
+    mco_running()
+}
+
+unsafe fn mco_yield_raw(co: *mut crate::coroutine::McoCoro) {
+    unsafe extern "C" {
+        fn mco_yield(co: *mut crate::coroutine::McoCoro) -> i32;
+    }
+    mco_yield(co);
+}
+
+/// Drive the scheduler from the driver thread (not from inside a coroutine).
+impl Executor {
+    pub fn step_from_driver(&mut self) {
+        let next_pid = match self.pick_next() {
+            Some(pid) => pid,
+            None => return,
+        };
+        self.deliver_signals(next_pid);
+        self.current = Some(next_pid);
+        self.switch_count += 1;
+        self.vprocs.get_mut(&next_pid).unwrap().resume();
+        // Clear current so do_yield knows we're back on the driver thread.
+        self.current = None;
+    }
 }
