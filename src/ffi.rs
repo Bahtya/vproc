@@ -337,3 +337,66 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
     // Parent: read child pid from our Coroutine.
     ex.vprocs.get(&pid).unwrap().fork_child_pid
 }
+
+// ---------------------------------------------------------------------------
+// High-level process creation (for hermux integration)
+// ---------------------------------------------------------------------------
+
+static EXECUTOR_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Create a virtual process: load binary in coroutine, map fd 0/1/2 to real fds.
+///
+/// Returns virtual PID (> 0) on success, 0 on error.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_create_process(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    stdin_fd: c_int,
+    stdout_fd: c_int,
+    stderr_fd: c_int,
+) -> u32 {
+    let path_str = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    let argv_vec = unsafe { crate::c_array_to_vec(argv) };
+    let envp_vec = unsafe { crate::c_array_to_vec(envp) };
+
+    match crate::vexec::virtual_execve_via_entry(&path_str, argv_vec, envp_vec) {
+        Ok(exec) => {
+            // Replace the default fd table with custom mappings to PTY slave
+            crate::vfd::create_table_with_fds(exec.vpid, stdin_fd, stdout_fd, stderr_fd);
+            exec.vpid
+        }
+        Err(e) => {
+            let msg = format!("vproc_ffi_create_process: {}\n", e);
+            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+            0
+        }
+    }
+}
+
+/// Drive the scheduler until the given vpid exits.
+/// Returns the exit code. Blocks the calling thread.
+///
+/// Mutex is released before do_yield() to prevent deadlock when multiple
+/// sessions' waiter threads call this concurrently.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_run_until_exit(vpid: u32) -> c_int {
+    loop {
+        {
+            let _guard = EXECUTOR_MUTEX.lock().unwrap();
+            match crate::executor::get_exit_code(vpid) {
+                Some(code) => return code,
+                None => {}
+            }
+            let ptr = crate::executor::get_global_executor();
+            if ptr.is_null() || !unsafe { (*ptr).vprocs.contains_key(&vpid) } {
+                return -1;
+            }
+        }
+        // Mutex released — safe to yield (may switch to coroutine)
+        crate::executor::do_yield();
+    }
+}
