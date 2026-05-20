@@ -45,3 +45,12 @@ jobs:
         with:
           files: "*.tar.gz"
           generate_release_notes: true
+
+      - name: Notify hermux
+        continue-on-error: true
+        run: |
+          curl -f -X POST \
+            -H "Authorization: token ${{ secrets.HERMUX_DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/Bahtya/hermux/dispatches \
+            -d "{\"event_type\":\"vproc-release\",\"client_payload\":{\"version\":\"${GITHUB_REF_NAME}\"}}"
