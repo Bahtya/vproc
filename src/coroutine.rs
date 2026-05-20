@@ -39,23 +39,6 @@ struct McoDesc {
     stack_size: usize,
 }
 
-// Trampoline for calling main() directly in a coroutine.
-// x19 = main_addr, x20 = argc, x21 = argv, x22 = envp
-std::arch::global_asm!(
-    ".text",
-    ".align 2",
-    ".global __vproc_main_call",
-    ".type __vproc_main_call, @function",
-    "__vproc_main_call:",
-    "mov    x0, x20",          // argc
-    "mov    x1, x21",          // argv
-    "mov    x2, x22",          // envp
-    "blr    x19",              // call main(argc, argv, envp)
-    "bl     vproc_exit_with_code", // x0 = main's return value
-    "brk    #1",               // unreachable
-    ".size __vproc_main_call, . - __vproc_main_call",
-);
-
 extern "C" {
     fn mco_desc_init(func: extern "C" fn(*mut McoCoro), stack_size: usize) -> McoDesc;
     fn mco_create(out_co: *mut *mut McoCoro, desc: *mut McoDesc) -> i32;

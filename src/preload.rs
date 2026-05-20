@@ -304,45 +304,17 @@ pub extern "C" fn getppid() -> c_int {
 #[no_mangle]
 pub extern "C" fn fork() -> c_int {
     if !enabled() {
-        // Use raw clone syscall — libc fork is inline-hooked so real("fork")
-        // would recurse.  clone with SIGCHLD is equivalent to fork.
-        let ret: isize;
         unsafe {
-            std::arch::asm!(
-                "mov x8, #220",   // __NR_clone
-                "mov x0, #17",    // SIGCHLD
-                "mov x1, #0",
-                "svc #0",
-                lateout("x0") ret,
-            );
-        }
-        return if ret >= 0 { ret as c_int } else {
-            unsafe { *libc::__errno() = (-ret) as c_int; }
-            -1
-        };
-    }
-
-    // Use raw clone syscall to avoid libc fork() deadlock.
-    // The driver thread already swaps fd 0/1/2 around coroutine resume,
-    // so fork children inherit the correct fds from the vfd table.
-    let pid: c_int;
-    unsafe {
-        let ret: isize;
-        std::arch::asm!(
-            "mov x8, #220",   // __NR_clone on aarch64
-            "mov x0, #17",    // SIGCHLD
-            "mov x1, #0",     // stack = 0 (use parent's stack)
-            "svc #0",
-            lateout("x0") ret,
-        );
-        if ret < 0 {
-            *libc::__errno() = (-ret) as c_int;
-            pid = -1;
-        } else {
-            pid = ret as c_int;
+            let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+            return f();
         }
     }
-
+    // Use real() (dlsym RTLD_NEXT) to get the true libc fork,
+    // not libc::fork() which would resolve to our own symbol.
+    let pid = unsafe {
+        let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+        f()
+    };
     if pid == 0 {
         REAL_FORK_CHILD.store(true, Ordering::SeqCst);
     }
@@ -383,17 +355,10 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
         !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
     };
     if !is_virtual {
-        // Real child process — poll with WNOHANG + yield to avoid blocking
-        // the driver thread. The child is a real OS process, not a vproc coroutine.
-        if options & libc::WNOHANG != 0 {
-            return raw_wait4(pid, status, options);
-        }
-        loop {
-            let ret = raw_wait4(pid, status, libc::WNOHANG);
-            if ret > 0 { return ret; }
-            if ret < 0 { return -1; }
-            crate::executor::do_yield();
-        }
+        // Real child process — use raw wait4 syscall to avoid recursion:
+        // libc waitpid() internally calls wait4(), which we also intercept,
+        // causing waitpid → libc waitpid → libc wait4 → our wait4 → our waitpid.
+        return raw_wait4(pid, status, options);
     }
     // Virtual process — spin/yield until done
     loop {
@@ -489,24 +454,17 @@ static EXECVE_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 #[no_mangle]
 pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
-    // Use raw pipe2 syscall to avoid recursion when libc pipe is inline-hooked.
-    let ret = unsafe { libc::syscall(59, fds, 0) as c_int }; // __NR_pipe2 = 59 on aarch64
-    if ret < 0 {
-        unsafe { *libc::__errno() = (-ret) as c_int; }
-        -1
-    } else {
-        0
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
+            return f(fds);
+        }
     }
-}
-
-#[no_mangle]
-pub extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
-    let ret = unsafe { libc::syscall(59, fds, flags) as c_int }; // __NR_pipe2 = 59
-    if ret < 0 {
-        unsafe { *libc::__errno() = (-ret) as c_int; }
-        -1
-    } else {
-        0
+    // Use real pipe() so that real fork() children inherit working pipe fds.
+    // Virtual pipes can't cross real fork() boundaries.
+    unsafe {
+        let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
+        f(fds)
     }
 }
 
@@ -551,20 +509,10 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
                 _ => fd,
             })
             .unwrap_or(fd);
-        let real_poll: extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> c_int =
-            unsafe { std::mem::transmute(real("poll\0")) };
-        let real_read: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-            unsafe { std::mem::transmute(real("read\0")) };
-        loop {
-            let mut pfd = libc::pollfd { fd: real_fd, events: libc::POLLIN, revents: 0 };
-            let n = real_poll(&mut pfd, 1, 0);
-            if n < 0 || (pfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
-                return real_read(real_fd, buf, count);
-            }
-            if (pfd.revents & libc::POLLIN) != 0 {
-                return real_read(real_fd, buf, count);
-            }
-            crate::executor::do_yield();
+        unsafe {
+            let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
+                std::mem::transmute(real("read\0"));
+            return f(real_fd, buf, count);
         }
     }
 
@@ -898,80 +846,6 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
     unsafe {
         let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("raise\0"));
         f(sig)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// setsid() / getpgrp() / tcsetpgrp() / tcgetpgrp()
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn setsid() -> c_int {
-    if enabled() {
-        if let Some(vpid) = current_vpid() {
-            return vpid as c_int;
-        }
-    }
-    unsafe {
-        let f: extern "C" fn() -> c_int = std::mem::transmute(real("setsid\0"));
-        f()
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn getpgrp() -> c_int {
-    if enabled() {
-        if let Some(vpid) = current_vpid() {
-            return vpid as c_int;
-        }
-    }
-    unsafe {
-        let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpgrp\0"));
-        f()
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
-    if enabled() {
-        if let Some(vpid) = current_vpid() {
-            if crate::vfd::get_table(vpid)
-                .and_then(|t| t.get(fd as u32))
-                .map(|vfd| match vfd {
-                    crate::vfd::Vfd::Real(_) => false,
-                    _ => true,
-                })
-                .unwrap_or(false)
-            {
-                return 0;
-            }
-        }
-    }
-    unsafe {
-        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("tcsetpgrp\0"));
-        f(fd, pgid)
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
-    if enabled() {
-        if let Some(vpid) = current_vpid() {
-            if crate::vfd::get_table(vpid)
-                .and_then(|t| t.get(fd as u32))
-                .map(|vfd| match vfd {
-                    crate::vfd::Vfd::Real(_) => false,
-                    _ => true,
-                })
-                .unwrap_or(false)
-            {
-                return vpid as c_int;
-            }
-        }
-    }
-    unsafe {
-        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("tcgetpgrp\0"));
-        f(fd)
     }
 }
 
