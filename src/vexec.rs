@@ -772,7 +772,14 @@ fn spawn_main_coroutine(
     let vpid = crate::spawn(Box::new(move || {
         let main_fn: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int =
             unsafe { std::mem::transmute(main_addr) };
-        let result = main_fn(argc as c_int, argv.as_ptr(), envp.as_ptr());
+        // Leak Vec buffers — bionic stores argv/environ pointers internally
+        // and they must remain valid for the process lifetime. The C string
+        // data is tracked via c_strings and cleaned up on coroutine drop.
+        let argv_ptr = argv.as_ptr();
+        let envp_ptr = envp.as_ptr();
+        std::mem::forget(argv);
+        std::mem::forget(envp);
+        let result = main_fn(argc as c_int, argv_ptr, envp_ptr);
         crate::executor::vproc_exit_with_code(result);
     }));
     unsafe {

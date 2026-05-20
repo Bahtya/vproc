@@ -311,6 +311,10 @@ pub extern "C" fn fork() -> c_int {
     }
     // Use real() (dlsym RTLD_NEXT) to get the true libc fork,
     // not libc::fork() which would resolve to our own symbol.
+    // NOTE: do NOT use raw clone syscall here — bionic's fork() runs
+    // pthread_atfork handlers that reset TLS, robust mutex lists, and
+    // per-process bookkeeping. Raw clone skips these, leaving the child
+    // in an inconsistent state.
     let pid = unsafe {
         let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
         f()

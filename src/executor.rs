@@ -23,8 +23,6 @@ pub fn get_global_executor() -> *mut Executor {
     EXECUTOR.with(|e| e.get())
 }
 
-const _MAIN_VPID: VPid = 0;
-
 pub struct Executor {
     pub vprocs: HashMap<VPid, Coroutine>,
     ready_queue: VecDeque<VPid>,
