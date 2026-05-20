@@ -380,9 +380,12 @@ pub fn remove_table(vpid: u32) {
     }
 }
 
-/// Remove a virtual process's fd table and return all real kernel fds
+/// Remove a virtual process's fd table and return real kernel fds
 /// from File entries that should be closed by the caller.
 /// Deduplicates by Arc identity so dup'd fds are not double-closed.
+/// Only returns fds whose Arc refcount is 1 (exclusively owned) —
+/// fds shared with other tables (e.g. inherited by fork children) are
+/// not closed here; the last owner is responsible.
 /// Vfd::Real entries are NOT collected — they are borrowed fds (e.g. the
 /// caller's pipe fd passed via vproc_ffi_create_process) and remain owned
 /// by the caller.
@@ -391,7 +394,8 @@ pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
     if ptr.is_null() {
         return Vec::new();
     }
-    let table = match unsafe { (*ptr).remove(&vpid) } {
+    // Check ref counts BEFORE removing the table, so shared Arcs are still > 1.
+    let table = match unsafe { (*ptr).get(&vpid) } {
         Some(t) => t,
         None => return Vec::new(),
     };
@@ -399,13 +403,17 @@ pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
     let mut seen: Vec<*const FileRef> = Vec::new();
     for vfd in table.fds.values() {
         if let Vfd::File(arc) = vfd {
-            let ptr = Arc::as_ptr(arc);
-            if seen.iter().all(|&p| p != ptr) {
-                fds.push(arc.real_fd);
-                seen.push(ptr);
+            let arc_ptr = Arc::as_ptr(arc);
+            if seen.iter().all(|&p| p != arc_ptr) {
+                if Arc::strong_count(arc) == 1 {
+                    fds.push(arc.real_fd);
+                }
+                seen.push(arc_ptr);
             }
         }
     }
+    // Now drop the table (decrements Arc refcounts for shared fds).
+    unsafe { (*ptr).remove(&vpid); }
     fds
 }
 

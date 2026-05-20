@@ -102,22 +102,15 @@ pub fn cached_binary_count() -> usize {
 }
 
 /// Release references to binaries used by finished coroutines.
-/// Decrements active_users for each path; entries with zero users are dlclose'd.
+/// Decrements active_users for each path. Entries are kept alive for reuse
+/// across sessions — only dlclose when explicitly requested via unload_binary.
+/// NOTE: do NOT dlclose here — it triggers __libc_init which resets minicoro's
+/// _mco_main_ctx, breaking subsequent coroutine context switching.
 pub fn release_binaries(paths: &[String]) {
-    let mut cache = BINARY_CACHE.lock().unwrap();
-    let mut to_remove = Vec::new();
+    let cache = BINARY_CACHE.lock().unwrap();
     for path in paths {
         if let Some(entry) = cache.get(path) {
-            if entry.active_users.fetch_sub(1, Ordering::Relaxed) == 1 {
-                to_remove.push(path.clone());
-            }
-        }
-    }
-    for path in to_remove {
-        if let Some(entry) = cache.remove(&path) {
-            if !entry.handle.0.is_null() {
-                unsafe { libc::dlclose(entry.handle.0); }
-            }
+            entry.active_users.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

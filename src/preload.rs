@@ -359,10 +359,18 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
         !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
     };
     if !is_virtual {
-        // Real child process — use raw wait4 syscall to avoid recursion:
-        // libc waitpid() internally calls wait4(), which we also intercept,
-        // causing waitpid → libc waitpid → libc wait4 → our wait4 → our waitpid.
-        return raw_wait4(pid, status, options);
+        // Real child process — poll with WNOHANG + yield to avoid blocking
+        // the driver thread. Direct raw_wait4 with options=0 would deadlock
+        // the scheduler if the real child hasn't exited yet.
+        if options & libc::WNOHANG != 0 {
+            return raw_wait4(pid, status, options);
+        }
+        loop {
+            let ret = raw_wait4(pid, status, libc::WNOHANG);
+            if ret > 0 { return ret; }
+            if ret < 0 { return -1; }
+            crate::executor::do_yield();
+        }
     }
     // Virtual process — spin/yield until done
     loop {
@@ -469,6 +477,21 @@ pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
     unsafe {
         let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
         f(fds)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
+    if !enabled() {
+        unsafe {
+            let f: extern "C" fn(*mut c_int, c_int) -> c_int = std::mem::transmute(real("pipe2\0"));
+            return f(fds, flags);
+        }
+    }
+    // Same as pipe() — use real pipe2 so real fork children inherit working fds.
+    unsafe {
+        let f: extern "C" fn(*mut c_int, c_int) -> c_int = std::mem::transmute(real("pipe2\0"));
+        f(fds, flags)
     }
 }
 
@@ -641,13 +664,12 @@ pub extern "C" fn close(fd: c_int) -> c_int {
         }
     };
     match table.get(fd as u32) {
-        Some(crate::vfd::Vfd::Real(real_fd)) => {
-            let result = unsafe {
-                let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-                f(*real_fd)
-            };
+        Some(crate::vfd::Vfd::Real(_real_fd)) => {
+            // Vfd::Real is a borrowed fd (e.g. caller's pipe fd passed via
+            // vproc_ffi_create_process). Don't close the real fd — the caller
+            // owns it. Just remove the vfd entry.
             let _ = table.close(fd as u32);
-            result
+            0
         }
         Some(crate::vfd::Vfd::File(_)) => {
             if let Some(real_fd) = table.close_file_fd(fd as u32) {
@@ -821,6 +843,76 @@ pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
     unsafe {
         let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("setpgid\0"));
         f(pid, pgid)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn setsid() -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            return vpid as c_int;
+        }
+    }
+    unsafe {
+        let f: extern "C" fn() -> c_int = std::mem::transmute(real("setsid\0"));
+        f()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn getpgrp() -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            return vpid as c_int;
+        }
+    }
+    unsafe {
+        let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpgrp\0"));
+        f()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            if crate::vfd::get_table(vpid)
+                .and_then(|t| t.get(fd as u32))
+                .map(|vfd| match vfd {
+                    crate::vfd::Vfd::Real(_) => false,
+                    _ => true,
+                })
+                .unwrap_or(false)
+            {
+                return 0;
+            }
+        }
+    }
+    unsafe {
+        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("tcsetpgrp\0"));
+        f(fd, pgid)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
+    if enabled() {
+        if let Some(vpid) = current_vpid() {
+            if crate::vfd::get_table(vpid)
+                .and_then(|t| t.get(fd as u32))
+                .map(|vfd| match vfd {
+                    crate::vfd::Vfd::Real(_) => false,
+                    _ => true,
+                })
+                .unwrap_or(false)
+            {
+                return vpid as c_int;
+            }
+        }
+    }
+    unsafe {
+        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("tcgetpgrp\0"));
+        f(fd)
     }
 }
 
