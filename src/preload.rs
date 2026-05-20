@@ -211,6 +211,7 @@ pub extern "C" fn _exit(code: c_int) -> ! {
     if current_vpid().is_some() {
         crate::executor::vproc_exit_with_code(code);
     }
+    // Raw exit_group syscall — bypass LD_PRELOAD, never returns.
     unsafe {
         std::arch::asm!(
             "mov x8, #94",
@@ -233,6 +234,7 @@ pub extern "C" fn exit(code: c_int) -> ! {
     if vpid.is_some() {
         crate::executor::vproc_exit_with_code(code);
     }
+    // Raw exit_group syscall — bypass LD_PRELOAD, never returns.
     unsafe {
         std::arch::asm!(
             "mov x8, #94",
@@ -320,20 +322,9 @@ pub extern "C" fn fork() -> c_int {
         };
     }
 
-    // Before real fork, sync kernel fd 0/1/2 with the vfd table.
-    // Fork children inherit the kernel fd table, not vproc's vfd table.
-    // Without this, fork children get Java's original fds (stdout, etc.)
-    // instead of the PTY slave, so pipe commands like "echo x | cat" break.
-    // Collect fd sync info before fork (read from vfd table).
-    // We'll apply it in the CHILD after fork, where it's safe to change fds.
-    let fd_sync = if let Some(vpid) = current_vpid() {
-        crate::vfd::sync_std_fds(vpid)
-    } else {
-        Vec::new()
-    };
-
-    // Use raw clone syscall to avoid libc fork() deadlock
-    // (libc fork() acquires atfork locks that may be held by other threads)
+    // Use raw clone syscall to avoid libc fork() deadlock.
+    // The driver thread already swaps fd 0/1/2 around coroutine resume,
+    // so fork children inherit the correct fds from the vfd table.
     let pid: c_int;
     unsafe {
         let ret: isize;
@@ -354,27 +345,6 @@ pub extern "C" fn fork() -> c_int {
 
     if pid == 0 {
         REAL_FORK_CHILD.store(true, Ordering::SeqCst);
-        // In child: sync kernel fds 0/1/2 with vfd table.
-        // The child inherits the parent's kernel fd table.
-        // We need to make sure fds 0/1/2 point to the PTY slave
-        // (not Java's original stdout/stderr).
-        if !fd_sync.is_empty() {
-            let real_dup2_fn: extern "C" fn(c_int, c_int) -> c_int =
-                unsafe { std::mem::transmute(real("dup2\0")) };
-            for (old_fd, new_fd) in &fd_sync {
-                real_dup2_fn(*old_fd, *new_fd);
-            }
-        }
-    } else if pid > 0 {
-        // Parent: undo the vfd table changes from sync_std_fds.
-        // sync_std_fds updated the table entries (e.g., fd 0 → Real(0)),
-        // but in the parent, the kernel fds are unchanged (we only synced in child).
-        // Restore the original mappings so the coroutine continues to work.
-        if !fd_sync.is_empty() {
-            if let Some(vpid) = current_vpid() {
-                crate::vfd::restore_std_fds(vpid, &fd_sync);
-            }
-        }
     }
     pid
 }

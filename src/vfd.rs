@@ -6,6 +6,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::os::raw::c_int;
 use std::sync::Arc;
 
 const PIPE_CAPACITY: usize = 65536; // 64 KiB pipe buffer
@@ -136,6 +137,27 @@ impl VfdTable {
         table.fds.insert(1, Vfd::Real(1));
         table.fds.insert(2, Vfd::Real(2));
         table
+    }
+
+    /// Get the real kernel fds for virtual fds 0, 1, 2.
+    /// Returns None if any of them is missing or not a real fd.
+    pub fn get_real_fds_012(&self) -> Option<[c_int; 3]> {
+        let fd0 = match self.fds.get(&0)? {
+            Vfd::Real(r) => *r,
+            Vfd::File(f) => f.real_fd,
+            _ => return None,
+        };
+        let fd1 = match self.fds.get(&1)? {
+            Vfd::Real(r) => *r,
+            Vfd::File(f) => f.real_fd,
+            _ => return None,
+        };
+        let fd2 = match self.fds.get(&2)? {
+            Vfd::Real(r) => *r,
+            Vfd::File(f) => f.real_fd,
+            _ => return None,
+        };
+        Some([fd0, fd1, fd2])
     }
 
     pub fn new_with_fds(stdin: i32, stdout: i32, stderr: i32) -> Self {
@@ -408,36 +430,7 @@ pub fn create_table_with_fds(vpid: u32, stdin: i32, stdout: i32, stderr: i32) ->
     tables.get_mut(&vpid).unwrap()
 }
 
-/// Sync vfd table entries for fd 0/1/2 to the kernel fd table via dup2,
-/// so real fork() children inherit correct fd mappings.
-/// Returns a list of (old_real_fd, new_fd) pairs that were synced.
-pub fn sync_std_fds(vpid: u32) -> Vec<(i32, i32)> {
-    let table = match get_table(vpid) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-    let mut synced = Vec::new();
-    for fd in 0..3u32 {
-        let real_fd = match table.get(fd) {
-            Some(Vfd::Real(rfd)) => *rfd,
-            _ => continue,
-        };
-        if real_fd != fd as i32 {
-            synced.push((real_fd, fd as i32));
-            table.fds.insert(fd, Vfd::Real(fd as i32));
-        }
-    }
-    synced
-}
-
-/// Restore vfd table entries for fd 0/1/2 to their original real fd values.
-/// Called in the parent after fork to undo the sync_std_fds changes.
-pub fn restore_std_fds(vpid: u32, original: &[(i32, i32)]) {
-    let table = match get_table(vpid) {
-        Some(t) => t,
-        None => return,
-    };
-    for (old_fd, new_fd) in original {
-        table.fds.insert(*new_fd as u32, Vfd::Real(*old_fd));
-    }
+/// Get real kernel fds [stdin, stdout, stderr] for a vpid.
+pub fn get_real_fds(vpid: u32) -> Option<[i32; 3]> {
+    get_table(vpid).and_then(|t| t.get_real_fds_012())
 }

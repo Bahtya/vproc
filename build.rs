@@ -1,14 +1,9 @@
 fn main() {
-    println!("cargo::rerun-if-changed=asm/switch.S");
-    println!("cargo::rerun-if-changed=asm/elf_entry.S");
+    println!("cargo::rerun-if-changed=coro/minicoro.c");
     cc::Build::new()
-        .file("asm/switch.S")
+        .file("coro/minicoro.c")
+        .define("MINICORO_IMPL", None)
         .flag("-std=c11")
         .flag("-O2")
-        .compile("vproc_switch");
-    cc::Build::new()
-        .file("asm/elf_entry.S")
-        .flag("-std=c11")
-        .flag("-O2")
-        .compile("vproc_elf_entry");
+        .compile("minicoro");
 }
