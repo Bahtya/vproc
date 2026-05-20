@@ -1,6 +1,6 @@
 # vproc
 
-aarch64 assembly + Rust coroutine executor that runs multiple "virtual processes" inside a single Android process.
+aarch64 assembly + Rust coroutine executor powered by [minicoro](https://github.com/edubart/minicoro) that runs multiple "virtual processes" inside a single Android process.
 
 Android 只看到 1 个进程，内部通过用户态调度器在协程之间切换上下文。
 
@@ -17,7 +17,7 @@ Go 运行时在 1 个 OS 进程内调度数万个 goroutine，上下文切换仅
 │  主进程 (Android 看到 1 个进程)                     │
 │                                                   │
 │  ┌─────────────────────────────────────────────┐  │
-│  │  vproc Runtime (Rust + aarch64 asm)          │  │
+│  │  vproc Runtime (Rust + minicoro)             │  │
 │  │                                              │  │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐    │  │
 │  │  │ VP 1     │ │ VP 2     │ │ VP 3     │    │  │
@@ -26,7 +26,8 @@ Go 运行时在 1 个 OS 进程内调度数万个 goroutine，上下文切换仅
 │  │  │ own fds  │ │ own fds  │ │ own fds  │    │  │
 │  │  └────┬─────┘ └────┬─────┘ └────┬─────┘    │  │
 │  │       └──────┬──────┘──────────┘           │  │
-│  │     Scheduler (asm context_switch)          │  │
+│  │     Scheduler (minicoro mco_resume/yield)   │  │
+│  │     + fd swap around coroutine resume       │  │
 │  │              │                              │  │
 │  │  ┌───────────┴───────────┐                  │  │
 │  │  │ ELF Loader / dlopen   │                  │  │
@@ -47,20 +48,24 @@ Go 运行时在 1 个 OS 进程内调度数万个 goroutine，上下文切换仅
 
 ### Phase 1: 协程调度器 ✅
 
-aarch64 汇编上下文切换 + Rust 调度器。
+基于 [minicoro](https://github.com/edubart/minicoro) 的生产级协程调度器。
 
-**上下文切换** (`asm/switch.S`): 保存/恢复 callee-saved 寄存器 (x19-x28, x29/fp, x30/lr, d8-d15)，切换 sp。160 字节栈帧。
+**minicoro** (`coro/minicoro.c`): 轻量 C 协程库（~2000 行），aarch64 汇编上下文切换。vproc fork 并扩展了 minicoro，新增 API：
+- `mco_create_with_elf_entry()` — 自定义 ELF 入口点，aarch64 汇编 trampoline `__mco_elf_entry`
+- `mco_fork_from()` — 复制父协程栈 + ctxbuf，创建子协程
+- `mco_set_user_data()` — minicoro 原版只有 getter，vproc 需要 setter
+- `mco_get_ctx()`, `mco_get_back_ctx()`, `mco_set_stack()` — 辅助 API
 
-**协程创建** (`src/coroutine.rs`): 分配 2 MiB 栈，在栈顶构造 vproc_switch 帧。x19 存函数指针（通过 double-box 模式将 `Box<dyn FnOnce()>` 胖指针转为瘦指针），x30 存 trampoline 地址。首次切换到该协程时，`ret` 跳到 trampoline，trampoline 调用函数，完成后调 `vproc_exit()`。
+**协程创建** (`src/coroutine.rs`): `CoroUserdata` 模式存储 per-coroutine 元数据。minicoro 的 user_data 指向 CoroUserdata（exit_code + closure）。
 
-**调度器** (`src/executor.rs`): `UnsafeCell<Executor>` 避免引用冲突（RefCell 会在 yield 嵌套调用时 panic）。HashMap 存储 coroutine，VecDeque 就绪队列，轮转调度。`schedule()` 统一处理 yield 和 exit。
+**调度器** (`src/executor.rs`): `UnsafeCell<Executor>` 避免引用冲突。HashMap 存储 coroutine，VecDeque 就绪队列，轮转调度。`EXECUTOR_PTR` AtomicPtr 替代 TLS（存活于 `__libc_init` 重初始化）。
 
 **关键设计决策**:
-- Double-box: `Box::into_raw(Box::new(f))` — 胖指针 16B 存不进 u64，需要套一层
-- UnsafeCell 而非 RefCell — yield() 在 block_on_all() 借用内调用
-- global_asm! trampoline — 用 `#[naked]` 属性在 Rust 1.95 需要 `#[unsafe(naked)]` 且只能用 `naked_asm!`，改用 global_asm! 更稳定
+- CoroUserdata per-coroutine — 避免全局 closure slot 被第一个协程消费
+- mco_running_raw() — 绕过 Rust wrapper，避免 double-&mut
+- AtomicPtr 替代 thread_local — dlopen 的 `__libc_init` 会重置 TLS
 
-**性能**: 1000 协程 4001 次切换在 20ms 内完成（release），~5μs/switch（含 HashMap/VecDeque 开销）。
+**性能**: 1000 协程 3000 次切换在 ~107ms 内完成（debug），~36μs/switch。
 
 ### Phase 2: 虚拟 fork/waitpid ✅
 
@@ -82,11 +87,10 @@ aarch64 汇编上下文切换 + Rust 调度器。
 3. mmap LOAD 段（R-X for text, RW for data），复制文件内容，BSS 零填充
 4. 应用 R_AARCH64_RELATIVE 重定位（`base + addend`）
 
-**ELF 入口跳板** (`asm/elf_entry.S`):
-```asm
-__vproc_elf_entry:
-    mov  sp, x20    // 切换到 ELF 栈布局
-    br   x19        // 跳转到入口点
+**ELF 入口跳板** (minicoro `__mco_elf_entry`):
+```
+mov  sp, x20    // 切换到 ELF 栈布局
+br   x19        // 跳转到入口点
 ```
 
 **ELF 栈布局**:
@@ -442,7 +446,7 @@ PR #14, #15, #16 — 推送 `v*` tag 自动构建发布。
 ## 当前状态
 
 ### 已验证
-- ✅ 协程调度器（1000 协程，~5μs/switch）
+- ✅ 协程调度器（minicoro, 1000 协程，~36μs/switch debug）
 - ✅ 虚拟 fork（栈复制 + fd 表复制，0 真实进程）
 - ✅ waitpid（exit code 传播，父子关系追踪）
 - ✅ PIE ELF 加载（静态 + 动态二进制）
@@ -465,6 +469,8 @@ PR #14, #15, #16 — 推送 `v*` tag 自动构建发布。
 - ✅ **二进制缓存生命周期**: 引用计数 + auto-dlclose
 - ✅ **CI Release**: 推送 `v*` tag 自动构建并发布 `libvproc.so`
 - ✅ **40 项集成测试**: pipe/file/cwd/signal/stress 全部通过
+- ✅ **C FFI E2E 测试**: 10/10 通过（echo, exit, pipes, grep, stress）
+- ✅ **minicoro 生产级调度器**: 替代自研 asm 上下文切换，修复多个 yield/resume bug
 
 ### 待解决
 
@@ -476,29 +482,25 @@ PR #14, #15, #16 — 推送 `v*` tag 自动构建发布。
 ```
 vproc/
 ├── Cargo.toml
-├── build.rs                  # 编译 asm/*.S
+├── build.rs                  # 编译 coro/minicoro.c
 ├── .github/workflows/
 │   └── release.yml           # CI: tag 触发构建 + GitHub Release
-├── asm/
-│   ├── switch.S              # aarch64 上下文切换 (160B 帧)
-│   └── elf_entry.S           # ELF 入口跳板
+├── coro/
+│   └── minicoro.c            # minicoro v0.2.0 fork + 扩展 (ELF entry, fork_from, set_user_data)
 ├── preload/
 │   ├── preload.c             # 纯 C LD_PRELOAD 层 (~320 行)
 │   ├── Makefile              # 构建 libvproc_preload.so + 测试
 │   └── test_preload.c        # 基础拦截测试
 ├── src/
 │   ├── lib.rs                # 公开 API + c_array_to_vec 工具函数
-│   ├── coroutine.rs          # Coroutine struct + trampoline + new_elf() + fork_from()
-│   ├── executor.rs           # UnsafeCell 调度器 + reap_done_coroutines()
+│   ├── coroutine.rs          # minicoro FFI 包装 + CoroUserdata + new_elf() + fork_from()
+│   ├── executor.rs           # minicoro 调度器 + reap_done_coroutines() + fd swap
 │   ├── elf.rs                # ELF64 解析器 (纯安全 Rust)
-│   ├── ffi.rs                # C FFI 接口 + spawn queue + driver thread
+│   ├── ffi.rs                # C FFI 接口 + spawn queue + driver thread + raw_dup3
 │   ├── loader.rs             # PIE 加载器 (mmap + 重定位) + build_auxv()
 │   ├── vexec.rs              # virtual_execve + binary cache lifecycle
-│   ├── vfd.rs                # 虚拟 fd 表 + 环形缓冲区管道 + clone_for_fork()
-│   ├── preload.rs            # Rust LD_PRELOAD 拦截层 (18 函数)
-│   └── arch/
-│       ├── mod.rs
-│       └── aarch64.rs        # context_switch FFI
+│   ├── vfd.rs                # 虚拟 fd 表 + 环形缓冲区管道 + clone_for_fork() + get_real_fds
+│   └── preload.rs            # Rust LD_PRELOAD 拦截层 (18 函数)
 ├── examples/
 │   ├── basic.rs              # 3 协程交替
 │   ├── stress.rs             # 1000 协程压力测试
@@ -518,6 +520,8 @@ vproc/
     ├── cwd_tests.rs          # 工作目录测试 (4 项)
     ├── signal_tests.rs       # 信号测试 (3 项)
     ├── stress_tests.rs       # 压力测试 (6 项)
+    ├── hermux_sim/
+    │   └── test_c_session.c  # C FFI E2E 测试 (模拟 Hermux JNI 路径, 10 项)
     ├── test_static_pie.S     # 最小 aarch64 静态 PIE (write+exit)
     └── test_fork.c           # fork/waitpid 拦截测试
 ```
