@@ -352,9 +352,9 @@ impl Executor {
         };
         self.deliver_signals(next_pid);
         let fds_swapped = if let Some(real_fds) = crate::vfd::get_real_fds(next_pid) {
-            unsafe { crate::ffi::raw_dup3(real_fds[0], 0); }
-            unsafe { crate::ffi::raw_dup3(real_fds[1], 1); }
-            unsafe { crate::ffi::raw_dup3(real_fds[2], 2); }
+            if unsafe { crate::ffi::raw_dup3(real_fds[0], 0) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(real_fds[1], 1) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(real_fds[2], 2) } < 0 { std::process::abort(); }
             true
         } else {
             false
@@ -364,9 +364,9 @@ impl Executor {
         self.vprocs.get_mut(&next_pid).unwrap().resume();
         self.current = None;
         if fds_swapped {
-            unsafe { crate::ffi::raw_dup3(saved_fds[0], 0); }
-            unsafe { crate::ffi::raw_dup3(saved_fds[1], 1); }
-            unsafe { crate::ffi::raw_dup3(saved_fds[2], 2); }
+            if unsafe { crate::ffi::raw_dup3(saved_fds[0], 0) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(saved_fds[1], 1) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(saved_fds[2], 2) } < 0 { std::process::abort(); }
         }
     }
 }

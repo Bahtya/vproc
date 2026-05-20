@@ -641,10 +641,14 @@ pub extern "C" fn close(fd: c_int) -> c_int {
         }
     };
     match table.get(fd as u32) {
-        Some(crate::vfd::Vfd::Real(real_fd)) => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            f(*real_fd)
-        },
+        Some(crate::vfd::Vfd::Real(real_fd)) => {
+            let result = unsafe {
+                let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
+                f(*real_fd)
+            };
+            let _ = table.close(fd as u32);
+            result
+        }
         Some(crate::vfd::Vfd::File(_)) => {
             if let Some(real_fd) = table.close_file_fd(fd as u32) {
                 unsafe { real_close(real_fd); }

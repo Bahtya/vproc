@@ -381,8 +381,8 @@ pub fn remove_table(vpid: u32) {
 }
 
 /// Remove a virtual process's fd table and return all real kernel fds
-/// from File entries that should be closed by the caller.
-/// Deduplicates by Arc identity so dup'd fds are not double-closed.
+/// that should be closed by the caller.
+/// Deduplicates File entries by Arc identity and Real entries by value.
 pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
     let ptr = get_tables_ptr();
     if ptr.is_null() {
@@ -393,14 +393,24 @@ pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
         None => return Vec::new(),
     };
     let mut fds = Vec::new();
-    let mut seen: Vec<*const FileRef> = Vec::new();
+    let mut seen_arc: Vec<*const FileRef> = Vec::new();
+    let mut seen_real: Vec<i32> = Vec::new();
     for vfd in table.fds.values() {
-        if let Vfd::File(arc) = vfd {
-            let ptr = Arc::as_ptr(arc);
-            if seen.iter().all(|&p| p != ptr) {
-                fds.push(arc.real_fd);
-                seen.push(ptr);
+        match vfd {
+            Vfd::File(arc) => {
+                let ptr = Arc::as_ptr(arc);
+                if seen_arc.iter().all(|&p| p != ptr) {
+                    fds.push(arc.real_fd);
+                    seen_arc.push(ptr);
+                }
             }
+            Vfd::Real(r) => {
+                if !seen_real.contains(r) {
+                    fds.push(*r);
+                    seen_real.push(*r);
+                }
+            }
+            _ => {}
         }
     }
     fds

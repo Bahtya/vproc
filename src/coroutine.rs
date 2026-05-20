@@ -27,7 +27,6 @@ const MCO_SUSPENDED: i32 = 3;
 pub enum State {
     Ready,
     Running,
-    Blocked,
     Done,
 }
 
