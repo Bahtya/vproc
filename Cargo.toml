@@ -11,3 +11,4 @@ cc = "1"
 
 [dependencies]
 libc = "0.2.186"
+goblin = "0.10"

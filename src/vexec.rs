@@ -755,9 +755,7 @@ fn decode_adrp(pc: usize, insn: u32) -> usize {
 }
 
 /// Spawn a coroutine that directly calls main(argc, argv, envp).
-/// Uses an assembly trampoline (__vproc_main_call) similar to the ELF entry
-/// path, avoiding Box<dyn FnOnce()> closures which have issues in the driver
-/// thread context.
+/// Uses a Box<dyn FnOnce()> closure to invoke main() within minicoro.
 fn spawn_main_coroutine(
     main_addr: usize,
     argc: usize,
@@ -765,69 +763,18 @@ fn spawn_main_coroutine(
     envp: Vec<*const u8>,
     c_strings: Vec<*mut u8>,
 ) -> VPid {
-    use std::alloc::{alloc, Layout};
-    const STACK_SIZE: usize = 2 * 1024 * 1024;
-
-    let layout = Layout::from_size_align(STACK_SIZE, 16).unwrap();
-    let stack_base = unsafe { alloc(layout) };
-    assert!(!stack_base.is_null(), "stack alloc failed for main coroutine");
-    let stack_top = unsafe { stack_base.add(STACK_SIZE) };
-
-    // vproc_switch frame (160 bytes) at the top of the stack.
-    // Register assignments for __vproc_main_call:
-    //   x19 = main_addr, x20 = argc, x21 = argv ptr, x22 = envp ptr
-    //   x30 = __vproc_main_call
-    let frame_size: usize = 160;
-    let sp_init = unsafe { stack_top.sub(frame_size) };
-
-    unsafe {
-        // x19 = main_addr, x20 = argc
-        std::ptr::write_unaligned(sp_init as *mut u64, main_addr as u64);
-        std::ptr::write_unaligned(sp_init.add(8) as *mut u64, argc as u64);
-
-        // x21 = argv.as_ptr(), x22 = envp.as_ptr()
-        // These Vecs are moved into the coroutine's c_strings cleanup list,
-        // but the raw pointer arrays need to stay alive. Leak the Vec buffers
-        // and let c_strings cleanup handle the individual C strings.
-        let argv_ptr = argv.as_ptr() as u64;
-        let envp_ptr = envp.as_ptr() as u64;
-        std::mem::forget(argv);
-        std::mem::forget(envp);
-
-        std::ptr::write_unaligned(sp_init.add(16) as *mut u64, argv_ptr);
-        std::ptr::write_unaligned(sp_init.add(24) as *mut u64, envp_ptr);
-
-        // x23-x28: zero
-        for off in [32usize, 48, 64] {
-            std::ptr::write_unaligned(sp_init.add(off) as *mut u64, 0);
-            std::ptr::write_unaligned(sp_init.add(off + 8) as *mut u64, 0);
-        }
-
-        // x29(fp) = 0, x30(lr) = __vproc_main_call
-        std::ptr::write_unaligned(sp_init.add(80) as *mut u64, 0);
-        std::ptr::write_unaligned(
-            sp_init.add(88) as *mut u64,
-            crate::coroutine::__vproc_main_call as *const () as usize as u64,
-        );
-
-        // d8-d15: zero
-        for i in 0..8 {
-            std::ptr::write_unaligned(sp_init.add(96 + i * 8) as *mut u64, 0);
-        }
-    }
+    let main_fn: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int =
+        unsafe { std::mem::transmute(main_addr) };
+    let argv_ptr = argv.as_ptr();
+    let envp_ptr = envp.as_ptr();
+    std::mem::forget(argv);
+    std::mem::forget(envp);
 
     let pid = {
         let ex = unsafe { &mut *crate::executor::get_global_executor() };
-        let next_pid = ex.next_pid();
-        let co = crate::coroutine::Coroutine::from_raw_parts(
-            next_pid,
-            sp_init,
-            stack_base,
-            STACK_SIZE,
-        );
-        ex.insert_coroutine(next_pid, co);
-        ex.push_ready(next_pid);
-        next_pid
+        ex.spawn(Box::new(move || {
+            main_fn(argc as c_int, argv_ptr, envp_ptr);
+        }))
     };
 
     unsafe {

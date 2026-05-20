@@ -1,4 +1,3 @@
-pub mod arch;
 pub mod coroutine;
 pub mod elf;
 pub mod executor;
