@@ -72,7 +72,12 @@ struct CoroUserdata {
 /// minicoro trampoline: called when a standard coroutine starts.
 /// Reads the closure from user_data and executes it.
 extern "C" fn mco_trampoline(co: *mut McoCoro) {
-    let ud = unsafe { &mut *(mco_get_user_data(co) as *mut CoroUserdata) };
+    let ud_ptr = unsafe { mco_get_user_data(co) };
+    if ud_ptr.is_null() {
+        crate::executor::vproc_exit_with_code(128);
+        return;
+    }
+    let ud = unsafe { &mut *(ud_ptr as *mut CoroUserdata) };
     let f = ud.closure.take().expect("mco_trampoline: no closure in userdata");
     let f: Box<dyn FnOnce()> = *f;
 
@@ -111,7 +116,10 @@ impl Coroutine {
         let mut desc = unsafe { mco_desc_init(mco_trampoline, DEFAULT_STACK_SIZE) };
         desc.user_data = ud as *mut c_void;
         let rc = unsafe { mco_create(&mut co_ptr, &mut desc as *mut _) };
-        assert!(rc == 0, "mco_create failed: {}", rc);
+        if rc != 0 {
+            eprintln!("vproc: mco_create failed: {}", rc);
+            std::process::abort();
+        }
 
         Coroutine {
             id,
@@ -182,7 +190,10 @@ impl Coroutine {
                 stack_size,
             )
         };
-        assert!(rc == 0, "mco_create_with_elf_entry failed: {}", rc);
+        if rc != 0 {
+        eprintln!("vproc: mco_create_with_elf_entry failed: {}", rc);
+        std::process::abort();
+    }
 
         let ud = Box::into_raw(Box::new(CoroUserdata { exit_code: 0, closure: None }));
         unsafe { mco_set_user_data(co_ptr, ud as *mut c_void) };

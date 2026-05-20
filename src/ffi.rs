@@ -480,7 +480,7 @@ fn start_driver_once() {
 /// Raw dup3 syscall — bypasses LD_PRELOAD interceptors.
 /// aarch64 has no __NR_dup2; dup3(old, new, 0) is equivalent.
 #[cfg(target_arch = "aarch64")]
-unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) {
+pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) {
     if old_fd < 0 || old_fd == new_fd {
         return;
     }
@@ -512,6 +512,13 @@ fn run_driver_loop() {
             libc::dup(2),
         ]
     };
+    for &fd in &saved_fds {
+        if fd < 0 {
+            let msg = format!("vproc: failed to save driver fd (got {})\n", fd);
+            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+            std::process::abort();
+        }
+    }
 
     loop {
         // 1. Drain spawn queue — driver owns the Executor exclusively
@@ -533,26 +540,12 @@ fn run_driver_loop() {
             cvar.notify_all();
         }
 
-        // 2. Drive the scheduler — swap fds around each coroutine resume
+        // 2. Drive the scheduler — fd swap is encapsulated in Executor
         let ptr = crate::executor::get_global_executor();
         if !ptr.is_null() {
             unsafe {
                 let ex = &mut *ptr;
-                if let Some(next_pid) = ex.pick_next() {
-                    // Install the coroutine's real fds so fork children inherit them
-                    if let Some(real_fds) = crate::vfd::get_real_fds(next_pid) {
-                        raw_dup3(real_fds[0], 0);
-                        raw_dup3(real_fds[1], 1);
-                        raw_dup3(real_fds[2], 2);
-                    }
-                    ex.current = Some(next_pid);
-                    ex.vprocs.get_mut(&next_pid).unwrap().resume();
-                    ex.current = None;
-                    // Restore driver's original fds
-                    raw_dup3(saved_fds[0], 0);
-                    raw_dup3(saved_fds[1], 1);
-                    raw_dup3(saved_fds[2], 2);
-                }
+                ex.step_from_driver_with_fd_swap(saved_fds);
             }
         }
 

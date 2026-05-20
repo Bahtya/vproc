@@ -1,8 +1,8 @@
 # vproc
 
-aarch64 assembly + Rust coroutine executor powered by [minicoro](https://github.com/edubart/minicoro) that runs multiple "virtual processes" inside a single Android process.
+用户态虚拟进程运行时，基于 [minicoro](https://github.com/edubart/minicoro) 协程库，在单个 Android 进程内运行多个"虚拟进程"。
 
-Android 只看到 1 个进程，内部通过用户态调度器在协程之间切换上下文。
+Android 只看到 1 个进程，内部通过 minicoro 协程调度器在虚拟进程之间切换上下文，每个虚拟进程拥有独立的栈、fd 表、工作目录和信号队列。
 
 ## 背景
 
@@ -219,15 +219,15 @@ echo  → exit code 0 ✅
 
 **问题**: `apt`/`dpkg` 大量使用 `fork()` 创建子进程处理下载、解压、配置。没有虚拟 fork，所有依赖 fork 的程序都无法运行。
 
-**方案**: helper 协程 + 栈复制。
+**方案**: helper 协程 + `mco_fork_from` 栈复制。
 
 ```
 1. vproc_ffi_fork() 被 preload fork() 调用
 2. 检查 is_fork_child 标志 → 子进程直接返回 0
 3. 父进程: spawn helper 协程
-4. do_yield() → vproc_switch 保存 callee-saved 寄存器到父进程栈
+4. do_yield() → mco_yield 保存协程上下文到父进程栈
 5. helper 调用 spawn_fork_child():
-   - fork_from() 复制父进程整个栈（含保存的寄存器帧）
+   - mco_fork_from() 复制父进程整个栈 + minicoro ctxbuf
    - 设置 is_fork_child=true, 复制 fd 表
    - 记录父子关系到 Executor.children
 6. helper 退出 → 调度器切回父进程
@@ -238,9 +238,7 @@ echo  → exit code 0 ✅
 **关键实现**:
 
 `Coroutine::fork_from()` (`src/coroutine.rs`):
-- 分配新栈（与父进程相同大小）
-- `ptr::copy_nonoverlapping` 复制整个栈内容
-- 子进程 sp 在相同偏移位置（`child_base + (parent_sp - parent_base)`）
+- 调用 `mco_fork_from()` 复制父协程完整栈（minicoro 管理）
 - 设置 `ppid`, `is_fork_child`, `fork_child_pid=0`
 
 `Executor::spawn_fork_child()` (`src/executor.rs`):
@@ -251,10 +249,6 @@ echo  → exit code 0 ✅
 `VfdTable::clone_for_fork()` (`src/vfd.rs`):
 - Real fd: 直接复制（共享内核 file description，匹配 Linux fork 语义）
 - Pipe fd: 共享同一个 PipeBuffer 指针（匹配 Linux pipe 语义）
-
-**安全限制** — caller-saved 寄存器丢失:
-
-`vproc_switch` 只保存 callee-saved 寄存器（x19-x30, d8-d15）。x0-x18 中的变量在子进程中值未定义。这对 fork-then-execve 模式安全（子进程只读 fork 返回值 x0=0 后立即调 execve），但长时间运行的子进程需要注意。
 
 **验证**:
 ```
@@ -280,10 +274,10 @@ switches: 15
 
 修复 ELF 协程不执行的核心 bug，实现 `sh -c "echo hello"` 端到端通过。
 
-**问题**: dlopen 的 ELF 二进制的 `_start` → `__libc_init` → `exit()` 路径中，exit() 终止了整个进程而非切回主协程。
+**问题**: dlopen 的 ELF 二进制的 `_start` → `__libc_init` → `exit()` 路径中，exit() 终止了整个进程而非切回调度器。
 
-**根因分析** (3 路并行调试):
-1. `__libc_init` 重新初始化 TLS → executor 的 thread-local 状态丢失
+**根因分析**:
+1. `__libc_init` 重新初始化 TLS → minicoro 的 `_mco_main_ctx` 线程局部变量丢失
 2. `preload.rs` 的 `enabled()` 使用 `std::env::var("VPROC")`（Rust TLS 依赖），TLS 重初始化后失效
 3. `enabled()` 在 `set_var("VPROC","1")` 之前被首次调用（通过 `println!` → `write()` 链），缓存了 `false`
 
@@ -291,7 +285,7 @@ switches: 15
 - `enabled()` 改用 `libc::getenv()`（C 级别，不受 TLS 重初始化影响）
 - 不缓存 `false` 结果，每次检查直到发现 `VPROC=1`
 - 全局 `AtomicPtr<Executor>` 替代 TLS（存活于 `__libc_init` 重初始化）
-- libc `exit()` inline hook（aarch64 trampoline 跳转到 Rust 拦截器）
+- `exit()`/`_exit()` → `vproc_exit_with_code()` + raw `exit_group` syscall（不使用自旋循环）
 
 **验证**:
 ```
@@ -470,7 +464,8 @@ PR #14, #15, #16 — 推送 `v*` tag 自动构建发布。
 - ✅ **CI Release**: 推送 `v*` tag 自动构建并发布 `libvproc.so`
 - ✅ **40 项集成测试**: pipe/file/cwd/signal/stress 全部通过
 - ✅ **C FFI E2E 测试**: 10/10 通过（echo, exit, pipes, grep, stress）
-- ✅ **minicoro 生产级调度器**: 替代自研 asm 上下文切换，修复多个 yield/resume bug
+- ✅ **Termux 会话模拟**: 18/18 通过（管道/Shell特性/Sequential sessions/压力测试）
+- ✅ **minicoro 生产级调度器**: 替代自研 asm 上下文切换，修复 7 个 yield/resume bug
 
 ### 待解决
 
@@ -494,7 +489,7 @@ vproc/
 ├── src/
 │   ├── lib.rs                # 公开 API + c_array_to_vec 工具函数
 │   ├── coroutine.rs          # minicoro FFI 包装 + CoroUserdata + new_elf() + fork_from()
-│   ├── executor.rs           # minicoro 调度器 + reap_done_coroutines() + fd swap
+│   ├── executor.rs           # minicoro 调度器 + fd swap + reap_done_coroutines()
 │   ├── elf.rs                # ELF64 解析器 (纯安全 Rust)
 │   ├── ffi.rs                # C FFI 接口 + spawn queue + driver thread + raw_dup3
 │   ├── loader.rs             # PIE 加载器 (mmap + 重定位) + build_auxv()
@@ -521,7 +516,8 @@ vproc/
     ├── signal_tests.rs       # 信号测试 (3 项)
     ├── stress_tests.rs       # 压力测试 (6 项)
     ├── hermux_sim/
-    │   └── test_c_session.c  # C FFI E2E 测试 (模拟 Hermux JNI 路径, 10 项)
+    │   ├── test_c_session.c  # C FFI E2E 测试 (Hermux JNI 路径, 10 项)
+    │   └── test_termux_session.c # Termux 会话模拟 (管道/Shell特性/压力, 18 项)
     ├── test_static_pie.S     # 最小 aarch64 静态 PIE (write+exit)
     └── test_fork.c           # fork/waitpid 拦截测试
 ```

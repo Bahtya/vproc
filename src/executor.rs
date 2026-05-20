@@ -120,7 +120,7 @@ impl Executor {
         self.current
     }
 
-    pub fn pick_next(&mut self) -> Option<VPid> {
+    fn pick_next(&mut self) -> Option<VPid> {
         while let Some(pid) = self.ready_queue.pop_front() {
             if let Some(co) = self.vprocs.get(&pid) {
                 if !co.is_done() {
@@ -342,5 +342,33 @@ impl Executor {
         self.switch_count += 1;
         self.vprocs.get_mut(&next_pid).unwrap().resume();
         self.current = None;
+    }
+
+    /// Drive the scheduler with fd 0/1/2 swapped around the coroutine resume.
+    /// Before resuming, installs the coroutine's real fds so fork children
+    /// inherit the correct ones. After resume, restores the driver's originals.
+    pub fn step_from_driver_with_fd_swap(&mut self, saved_fds: [std::os::raw::c_int; 3]) {
+        let next_pid = match self.pick_next() {
+            Some(pid) => pid,
+            None => return,
+        };
+        self.deliver_signals(next_pid);
+        let fds_swapped = if let Some(real_fds) = crate::vfd::get_real_fds(next_pid) {
+            unsafe { crate::ffi::raw_dup3(real_fds[0], 0); }
+            unsafe { crate::ffi::raw_dup3(real_fds[1], 1); }
+            unsafe { crate::ffi::raw_dup3(real_fds[2], 2); }
+            true
+        } else {
+            false
+        };
+        self.current = Some(next_pid);
+        self.switch_count += 1;
+        self.vprocs.get_mut(&next_pid).unwrap().resume();
+        self.current = None;
+        if fds_swapped {
+            unsafe { crate::ffi::raw_dup3(saved_fds[0], 0); }
+            unsafe { crate::ffi::raw_dup3(saved_fds[1], 1); }
+            unsafe { crate::ffi::raw_dup3(saved_fds[2], 2); }
+        }
     }
 }
