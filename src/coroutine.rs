@@ -13,11 +13,20 @@ pub type VPid = u32;
 
 const DEFAULT_STACK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 
+// minicoro coroutine states (mirrors mco_state enum in minicoro.h).
+#[allow(dead_code)]
+const MCO_DEAD: i32 = 0;
+#[allow(dead_code)]
+const MCO_NORMAL: i32 = 1;
+#[allow(dead_code)]
+const MCO_RUNNING: i32 = 2;
+#[allow(dead_code)]
+const MCO_SUSPENDED: i32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum State {
     Ready,
     Running,
-    Blocked,
     Done,
 }
 
@@ -38,23 +47,6 @@ struct McoDesc {
     coro_size: usize,
     stack_size: usize,
 }
-
-// Trampoline for calling main() directly in a coroutine.
-// x19 = main_addr, x20 = argc, x21 = argv, x22 = envp
-std::arch::global_asm!(
-    ".text",
-    ".align 2",
-    ".global __vproc_main_call",
-    ".type __vproc_main_call, @function",
-    "__vproc_main_call:",
-    "mov    x0, x20",          // argc
-    "mov    x1, x21",          // argv
-    "mov    x2, x22",          // envp
-    "blr    x19",              // call main(argc, argv, envp)
-    "bl     vproc_exit_with_code", // x0 = main's return value
-    "brk    #1",               // unreachable
-    ".size __vproc_main_call, . - __vproc_main_call",
-);
 
 extern "C" {
     fn mco_desc_init(func: extern "C" fn(*mut McoCoro), stack_size: usize) -> McoDesc;
@@ -208,9 +200,9 @@ impl Coroutine {
             )
         };
         if rc != 0 {
-        eprintln!("vproc: mco_create_with_elf_entry failed: {}", rc);
-        std::process::abort();
-    }
+            eprintln!("vproc: mco_create_with_elf_entry failed: {}", rc);
+            std::process::abort();
+        }
 
         let ud = Box::into_raw(Box::new(CoroUserdata { exit_code: 0, closure: None }));
         unsafe { mco_set_user_data(co_ptr, ud as *mut c_void) };
@@ -236,9 +228,8 @@ impl Coroutine {
         self.state = State::Running;
         unsafe {
             mco_resume(self.co);
-            // minicoro states: MCO_DEAD=0, MCO_NORMAL=1, MCO_RUNNING=2, MCO_SUSPENDED=3
             if self.state != State::Done {
-                if mco_status(self.co) == 0 { // MCO_DEAD
+                if mco_status(self.co) == MCO_DEAD {
                     self.state = State::Done;
                 } else {
                     self.state = State::Ready;
@@ -258,6 +249,7 @@ impl Coroutine {
         unsafe {
             let ud = mco_get_user_data(self.co) as *mut CoroUserdata;
             (*ud).exit_code = code;
+            drop((*ud).closure.take());
         }
     }
 

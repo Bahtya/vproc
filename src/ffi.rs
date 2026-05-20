@@ -480,9 +480,9 @@ fn start_driver_once() {
 /// Raw dup3 syscall — bypasses LD_PRELOAD interceptors.
 /// aarch64 has no __NR_dup2; dup3(old, new, 0) is equivalent.
 #[cfg(target_arch = "aarch64")]
-pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) {
+pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) -> i32 {
     if old_fd < 0 || old_fd == new_fd {
-        return;
+        return 0;
     }
     let ret: isize;
     std::arch::asm!(
@@ -497,6 +497,7 @@ pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) {
         let msg = format!("vproc: raw_dup3({}, {}) failed\n", old_fd, new_fd);
         libc::syscall(64, 2, msg.as_ptr(), msg.len());
     }
+    ret as i32
 }
 
 /// Save driver thread's real fd 0/1/2, install the coroutine's real fds
@@ -563,11 +564,10 @@ fn run_driver_loop() {
             });
             done
         };
-        for (vpid, code, result) in completed {
+        for (_vpid, code, result) in completed {
             let (lock, cvar) = &*result;
             *lock.lock().unwrap() = Some(code);
             cvar.notify_all();
-            crate::executor::remove_exit_code(vpid);
         }
 
         // 3b. Reap done coroutines

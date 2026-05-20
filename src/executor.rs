@@ -23,8 +23,6 @@ pub fn get_global_executor() -> *mut Executor {
     EXECUTOR.with(|e| e.get())
 }
 
-const _MAIN_VPID: VPid = 0;
-
 pub struct Executor {
     pub vprocs: HashMap<VPid, Coroutine>,
     ready_queue: VecDeque<VPid>,
@@ -33,8 +31,6 @@ pub struct Executor {
     switch_count: u64,
     pub children: HashMap<VPid, Vec<VPid>>,
     pub saved_fork_lr: Option<u64>,
-    /// Exit codes of reaped coroutines. Survives reap so that late-registered
-    /// waiters (vproc_ffi_run_until_exit) can still retrieve the result.
     exit_codes: HashMap<VPid, i32>,
 }
 
@@ -50,20 +46,6 @@ impl Executor {
             saved_fork_lr: None,
             exit_codes: HashMap::new(),
         }
-    }
-
-    pub fn next_pid(&mut self) -> VPid {
-        let pid = self.next_pid;
-        self.next_pid += 1;
-        pid
-    }
-
-    pub fn insert_coroutine(&mut self, pid: VPid, co: Coroutine) {
-        self.vprocs.insert(pid, co);
-    }
-
-    pub fn push_ready(&mut self, pid: VPid) {
-        self.ready_queue.push_back(pid);
     }
 
     pub fn spawn(&mut self, f: Box<dyn FnOnce()>) -> VPid {
@@ -244,14 +226,6 @@ impl Executor {
 
     pub fn block_on_all(&mut self) {
         set_global_executor(self as *mut Executor);
-        // Save caller's fd 0/1/2 so we can swap around each coroutine resume.
-        let saved_fds: [std::os::raw::c_int; 3] = unsafe {
-            [
-                libc::dup(0),
-                libc::dup(1),
-                libc::dup(2),
-            ]
-        };
         while self.vprocs.values().any(|c| !c.is_done()) {
             let next_pid = match self.pick_next() {
                 Some(pid) => pid,
@@ -260,31 +234,11 @@ impl Executor {
             self.deliver_signals(next_pid);
             self.current = Some(next_pid);
             self.switch_count += 1;
-            // Swap fds so real fork children inherit correct ones
-            let fds_swapped = if let Some(real_fds) = crate::vfd::get_real_fds(next_pid) {
-                unsafe { crate::ffi::raw_dup3(real_fds[0], 0); }
-                unsafe { crate::ffi::raw_dup3(real_fds[1], 1); }
-                unsafe { crate::ffi::raw_dup3(real_fds[2], 2); }
-                true
-            } else {
-                false
-            };
             self.vprocs.get_mut(&next_pid).unwrap().resume();
-            if fds_swapped {
-                unsafe { crate::ffi::raw_dup3(saved_fds[0], 0); }
-                unsafe { crate::ffi::raw_dup3(saved_fds[1], 1); }
-                unsafe { crate::ffi::raw_dup3(saved_fds[2], 2); }
-            }
             if let Some(co) = self.vprocs.get(&next_pid) {
                 if !co.is_done() {
                     self.ready_queue.push_back(next_pid);
                 }
-            }
-        }
-        // Restore caller's original fds
-        for &fd in &saved_fds {
-            if fd >= 0 {
-                unsafe { libc::close(fd); }
             }
         }
         self.reap_done_coroutines();
@@ -293,14 +247,6 @@ impl Executor {
     pub fn switch_count(&self) -> u64 {
         self.switch_count
     }
-
-    pub fn ready_queue_len(&self) -> usize {
-        self.ready_queue.len()
-    }
-
-    pub fn vproc_count(&self) -> usize {
-        self.vprocs.len()
-    }
 }
 
 #[no_mangle]
@@ -308,7 +254,6 @@ pub extern "C" fn vproc_exit() {
     vproc_exit_with_code(0);
 }
 
-/// Terminate the current coroutine with an exit code.
 pub fn vproc_exit_with_code(code: i32) {
     let ex = unsafe { &mut *get_global_executor() };
     let pid = match ex.current {
@@ -328,9 +273,6 @@ pub fn vproc_exit_with_code(code: i32) {
     }
 }
 
-/// Get the exit code of a completed coroutine.
-/// Returns None if the coroutine hasn't finished yet or doesn't exist.
-/// Checks the persistent exit_codes map first (survives reap), then vprocs.
 pub fn get_exit_code(pid: VPid) -> Option<i32> {
     let ex = unsafe { &mut *get_global_executor() };
     if let Some(&code) = ex.exit_codes.get(&pid) {
@@ -353,13 +295,11 @@ pub fn reap_child(parent: VPid, child: VPid) {
     }
 }
 
-/// Remove a persisted exit code after its waiter has been satisfied.
 pub fn remove_exit_code(pid: VPid) {
     let ex = unsafe { &mut *get_global_executor() };
     ex.exit_codes.remove(&pid);
 }
 
-/// Public API: yield from current coroutine
 pub fn do_yield() {
     unsafe {
         let co = mco_running_raw();
@@ -412,9 +352,9 @@ impl Executor {
         };
         self.deliver_signals(next_pid);
         let fds_swapped = if let Some(real_fds) = crate::vfd::get_real_fds(next_pid) {
-            unsafe { crate::ffi::raw_dup3(real_fds[0], 0); }
-            unsafe { crate::ffi::raw_dup3(real_fds[1], 1); }
-            unsafe { crate::ffi::raw_dup3(real_fds[2], 2); }
+            if unsafe { crate::ffi::raw_dup3(real_fds[0], 0) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(real_fds[1], 1) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(real_fds[2], 2) } < 0 { std::process::abort(); }
             true
         } else {
             false
@@ -424,9 +364,9 @@ impl Executor {
         self.vprocs.get_mut(&next_pid).unwrap().resume();
         self.current = None;
         if fds_swapped {
-            unsafe { crate::ffi::raw_dup3(saved_fds[0], 0); }
-            unsafe { crate::ffi::raw_dup3(saved_fds[1], 1); }
-            unsafe { crate::ffi::raw_dup3(saved_fds[2], 2); }
+            if unsafe { crate::ffi::raw_dup3(saved_fds[0], 0) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(saved_fds[1], 1) } < 0 { std::process::abort(); }
+            if unsafe { crate::ffi::raw_dup3(saved_fds[2], 2) } < 0 { std::process::abort(); }
         }
     }
 }
