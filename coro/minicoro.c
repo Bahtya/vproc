@@ -509,6 +509,7 @@ extern "C" {
   #elif defined(MCO_USE_VMEM_ALLOCATOR) /* POSIX virtual memory allocator */
     #include <sys/mman.h>
     #include <sys/auxv.h>
+    #include <unistd.h>
 
     #ifndef HWCAP_MTE
     #define HWCAP_MTE (1UL << 18)
@@ -517,17 +518,25 @@ extern "C" {
     #define PROT_MTE 0x20
     #endif
 
+    /* Cache MTE availability — never changes at runtime. */
     static int _mco_mte_available(void) {
-      unsigned long hwcap = getauxval(AT_HWCAP);
-      return (hwcap & HWCAP_MTE) != 0;
+      static int cached = -1;
+      if (cached == -1) {
+        unsigned long hwcap = getauxval(AT_HWCAP);
+        cached = (hwcap & HWCAP_MTE) != 0 ? 1 : 0;
+      }
+      return cached;
     }
 
     /* Allocate stack with guard page at the bottom.
-       Layout: [guard page (PROT_NONE)] [stack (RW or RW+MTE)] */
+       Layout: [guard page(s) (PROT_NONE)] [stack (RW or RW+MTE)]
+       Guard size matches the system page size (4K or 16K on Android 15+). */
     static void* mco_alloc(size_t size, void* allocator_data) {
       _MCO_UNUSED(allocator_data);
-      size_t page_size = 4096;
-      size_t total = page_size + size;
+      long page_size = sysconf(_SC_PAGESIZE);
+      if (page_size <= 0) page_size = 4096;
+      size_t guard_size = (size_t)page_size;
+      size_t total = guard_size + size;
       int prot = PROT_READ | PROT_WRITE;
       if (_mco_mte_available()) {
         prot |= PROT_MTE;
@@ -536,7 +545,7 @@ extern "C" {
       void* ptr = mmap(NULL, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       if (ptr == MAP_FAILED) return NULL;
       /* Map stack portion (skip guard page) as RW [+MTE] */
-      void* stack = (char*)ptr + page_size;
+      void* stack = (char*)ptr + guard_size;
       if (mmap(stack, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
         munmap(ptr, total);
         return NULL;
@@ -547,9 +556,11 @@ extern "C" {
     static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
       _MCO_UNUSED(allocator_data);
       if (ptr == NULL) return;
-      size_t page_size = 4096;
-      void* base = (char*)ptr - page_size;
-      munmap(base, page_size + size);
+      long page_size = sysconf(_SC_PAGESIZE);
+      if (page_size <= 0) page_size = 4096;
+      size_t guard_size = (size_t)page_size;
+      void* base = (char*)ptr - guard_size;
+      munmap(base, guard_size + size);
     }
   #else /* C allocator */
     #ifndef MCO_ALLOC
