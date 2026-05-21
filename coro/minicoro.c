@@ -508,16 +508,48 @@ extern "C" {
     }
   #elif defined(MCO_USE_VMEM_ALLOCATOR) /* POSIX virtual memory allocator */
     #include <sys/mman.h>
+    #include <sys/auxv.h>
+
+    #ifndef HWCAP_MTE
+    #define HWCAP_MTE (1UL << 18)
+    #endif
+    #ifndef PROT_MTE
+    #define PROT_MTE 0x20
+    #endif
+
+    static int _mco_mte_available(void) {
+      unsigned long hwcap = getauxval(AT_HWCAP);
+      return (hwcap & HWCAP_MTE) != 0;
+    }
+
+    /* Allocate stack with guard page at the bottom.
+       Layout: [guard page (PROT_NONE)] [stack (RW or RW+MTE)] */
     static void* mco_alloc(size_t size, void* allocator_data) {
       _MCO_UNUSED(allocator_data);
-      void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      return ptr != MAP_FAILED ? ptr : NULL;
+      size_t page_size = 4096;
+      size_t total = page_size + size;
+      int prot = PROT_READ | PROT_WRITE;
+      if (_mco_mte_available()) {
+        prot |= PROT_MTE;
+      }
+      /* Reserve total region as PROT_NONE (guard page + stack) */
+      void* ptr = mmap(NULL, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (ptr == MAP_FAILED) return NULL;
+      /* Map stack portion (skip guard page) as RW [+MTE] */
+      void* stack = (char*)ptr + page_size;
+      if (mmap(stack, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+        munmap(ptr, total);
+        return NULL;
+      }
+      return stack;
     }
+
     static void mco_dealloc(void* ptr, size_t size, void* allocator_data) {
       _MCO_UNUSED(allocator_data);
-      int res = munmap(ptr, size);
-      _MCO_UNUSED(res);
-      MCO_ASSERT(res == 0);
+      if (ptr == NULL) return;
+      size_t page_size = 4096;
+      void* base = (char*)ptr - page_size;
+      munmap(base, page_size + size);
     }
   #else /* C allocator */
     #ifndef MCO_ALLOC

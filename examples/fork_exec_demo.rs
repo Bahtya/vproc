@@ -81,7 +81,7 @@ fn wait_child(name: &str, pid: u32, expected: i32) {
 fn vproc_fork() -> u32 {
     // Check if we are a fork child resuming after do_yield
     let fork_result = unsafe {
-        let ex = &mut *vproc::executor::get_global_executor();
+        let ex = &mut *vproc::executor::get_current_executor();
         let pid = ex.current.unwrap();
         let co = ex.vprocs.get(&pid).unwrap();
         if co.is_fork_child {
@@ -96,18 +96,18 @@ fn vproc_fork() -> u32 {
         return fork_result;
     }
 
-    let parent_pid = unsafe { (*vproc::executor::get_global_executor()).current.unwrap() };
+    let parent_pid = unsafe { (*vproc::executor::get_current_executor()).current.unwrap() };
 
     vproc::spawn_front(Box::new(move || {
         unsafe {
-            (*vproc::executor::get_global_executor()).spawn_fork_child(parent_pid);
+            (*vproc::executor::get_current_executor()).spawn_fork_child(parent_pid);
         }
     }));
 
     vproc::executor::do_yield();
 
     unsafe {
-        let ex = &mut *vproc::executor::get_global_executor();
+        let ex = &mut *vproc::executor::get_current_executor();
         let pid = ex.current.unwrap();
         ex.vprocs.get(&pid).unwrap().fork_child_pid
     }

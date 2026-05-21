@@ -117,7 +117,7 @@ pub fn release_binaries(paths: &[String]) {
 
 /// Associate a spawned coroutine with its cached binary and increment the refcount.
 fn track_binary_user(vpid: VPid, path: &str) {
-    let ex = unsafe { &mut *crate::executor::get_global_executor() };
+    let ex = unsafe { &mut *crate::executor::get_current_executor() };
     if let Some(co) = ex.vprocs.get_mut(&vpid) {
         co.binary_path = Some(path.to_string());
     }
@@ -178,8 +178,8 @@ pub fn virtual_execve_static(
     }
 
     // Spawn ELF coroutine
-    let vpid = crate::executor::EXECUTOR.with(|e| unsafe {
-        (&mut *e.get()).spawn_elf(
+    let vpid = unsafe {
+        (*crate::executor::get_current_executor()).spawn_elf(
             image.entry,
             stack_base,
             ELF_STACK_SIZE,
@@ -188,10 +188,10 @@ pub fn virtual_execve_static(
             envp_c,
             auxv,
         )
-    });
+    };
     register_elf_c_strings(vpid, argv_raw);
     unsafe {
-        (*crate::executor::get_global_executor())
+        (*crate::executor::get_current_executor())
             .register_mapped_region(vpid, image.base, image.total_size);
     }
 
@@ -238,7 +238,7 @@ pub fn virtual_execve_dynamic(
         // TODO: propagate exit code to virtual_waitpid
     }));
     unsafe {
-        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+        (*crate::executor::get_current_executor()).register_c_strings(vpid, c_strings);
     }
 
     Ok(VirtualExec { vpid })
@@ -268,7 +268,7 @@ pub fn virtual_execve_via_entry(
     let argc = argv_c.len();
 
     // Check if we already have main() cached for this binary
-    let current_pid = unsafe { (*crate::executor::get_global_executor()).current };
+    let current_pid = unsafe { (*crate::executor::get_current_executor()).current };
     let cached = {
         let lock = BINARY_CACHE.lock().unwrap();
         lock.get(&real_path_str).map(|e| (e.main_addr, Arc::clone(&e.saved_writable), e.handle.0))
@@ -386,10 +386,10 @@ pub fn virtual_execve_via_entry(
     }
 
     let vpid = unsafe {
-        let ex = &mut *crate::executor::get_global_executor();
+        let ex = &mut *crate::executor::get_current_executor();
         // Pin executor to global pointer so it survives TLS reinitialization
         // when __libc_init runs inside the dlopen'd binary's _start.
-        crate::executor::set_global_executor(ex as *mut _);
+        crate::executor::set_current_executor(ex as *mut _);
         ex.spawn_elf(
             entry_addr,
             stack_base,
@@ -776,7 +776,7 @@ fn spawn_main_coroutine(
         crate::executor::vproc_exit_with_code(result);
     }));
     unsafe {
-        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+        (*crate::executor::get_current_executor()).register_c_strings(vpid, c_strings);
     }
     vpid
 }
@@ -798,7 +798,7 @@ fn build_c_strings(strings: &[String]) -> (Vec<*const u8>, Vec<*mut u8>) {
 /// Register C strings for cleanup when a coroutine spawned via spawn_elf is dropped.
 fn register_elf_c_strings(vpid: VPid, c_strings: Vec<*mut u8>) {
     unsafe {
-        (*crate::executor::get_global_executor()).register_c_strings(vpid, c_strings);
+        (*crate::executor::get_current_executor()).register_c_strings(vpid, c_strings);
     }
 }
 

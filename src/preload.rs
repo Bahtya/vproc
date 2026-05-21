@@ -5,6 +5,30 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
+// Library constructor — auto-set VPROC=1 on load
+// ---------------------------------------------------------------------------
+// Ensures integrators don't need to call setenv("VPROC","1") manually.
+// Runs before any other library code via .init_array (Android/Linux).
+
+mod init {
+    use super::*;
+
+    extern "C" fn vproc_auto_enable() {
+        unsafe {
+            libc::setenv(
+                b"VPROC\0".as_ptr() as *const c_char,
+                b"1\0".as_ptr() as *const c_char,
+                1,
+            );
+        }
+    }
+
+    #[link_section = ".init_array"]
+    #[used]
+    static VPROC_INIT: extern "C" fn() = vproc_auto_enable;
+}
+
+// ---------------------------------------------------------------------------
 // SIGSEGV handler — install early for crash diagnosis
 // ---------------------------------------------------------------------------
 
@@ -129,7 +153,7 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
 }
 
 fn current_vpid() -> Option<crate::coroutine::VPid> {
-    let ptr = crate::executor::get_global_executor();
+    let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
         return None;
     }
@@ -175,7 +199,7 @@ fn resolve_path(cwd: &str, path: &str) -> String {
 /// Get the current coroutine's cwd, or None if using process cwd.
 fn get_cwd() -> Option<String> {
     let vpid = current_vpid()?;
-    let ptr = crate::executor::get_global_executor();
+    let ptr = crate::executor::get_current_executor();
     if ptr.is_null() { return None; }
     unsafe { (*ptr).vprocs.get(&vpid).and_then(|co| co.cwd.clone()) }
 }
@@ -274,7 +298,7 @@ pub extern "C" fn getppid() -> c_int {
             return f();
         }
     }
-    let ptr = crate::executor::get_global_executor();
+    let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
         unsafe {
             let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
@@ -355,7 +379,7 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
     // Check if this is a virtual process (exists in vproc executor)
     let vpid = pid as u32;
     let is_virtual = {
-        let ptr = crate::executor::get_global_executor();
+        let ptr = crate::executor::get_current_executor();
         !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
     };
     if !is_virtual {
@@ -381,7 +405,7 @@ pub extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_i
             return pid;
         }
         let exists = {
-            let ptr = crate::executor::get_global_executor();
+            let ptr = crate::executor::get_current_executor();
             !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&vpid) }
         };
         if !exists {
@@ -817,7 +841,7 @@ pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
     }
     // For positive pids, check if it's a virtual process
     if pid > 0 {
-        let ptr = crate::executor::get_global_executor();
+        let ptr = crate::executor::get_current_executor();
         if !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) } {
             // Virtual process — queue the signal for delivery at next schedule
             unsafe {
@@ -849,7 +873,7 @@ pub extern "C" fn getpgid(pid: c_int) -> c_int {
     }
     // For virtual pids, return a fake pgid (just the pid itself)
     if pid > 0 {
-        let ptr = crate::executor::get_global_executor();
+        let ptr = crate::executor::get_current_executor();
         let exists = !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) };
         if exists {
             return pid;
@@ -878,7 +902,7 @@ pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
     }
     // For virtual pids, stub: return success
     if pid > 0 {
-        let ptr = crate::executor::get_global_executor();
+        let ptr = crate::executor::get_current_executor();
         let exists = !ptr.is_null() && unsafe { (*ptr).vprocs.contains_key(&(pid as u32)) };
         if exists {
             return 0;
@@ -975,7 +999,7 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
     if enabled() {
         let vpid = current_vpid();
         if vpid.is_some() {
-            let ptr = crate::executor::get_global_executor();
+            let ptr = crate::executor::get_current_executor();
             if !ptr.is_null() {
                 unsafe {
                     if let Some(co) = (*ptr).vprocs.get_mut(&vpid.unwrap()) {
@@ -1023,7 +1047,7 @@ pub extern "C" fn chdir(path: *const c_char) -> c_int {
 
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
 
-    let ptr = crate::executor::get_global_executor();
+    let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
         unsafe {
             let f: extern "C" fn(*const c_char) -> c_int =
@@ -1084,7 +1108,7 @@ pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
         }
     };
 
-    let ptr = crate::executor::get_global_executor();
+    let ptr = crate::executor::get_current_executor();
     if !ptr.is_null() {
         unsafe {
             if let Some(co) = (*ptr).vprocs.get(&vpid) {

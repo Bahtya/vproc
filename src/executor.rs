@@ -1,26 +1,19 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::coroutine::{Coroutine, State, VPid};
 
 thread_local! {
-    pub static EXECUTOR: UnsafeCell<Executor> = UnsafeCell::new(Executor::new());
+    static CURRENT_EXECUTOR: UnsafeCell<*mut Executor> = UnsafeCell::new(std::ptr::null_mut());
 }
 
-static EXECUTOR_PTR: AtomicPtr<Executor> = AtomicPtr::new(std::ptr::null_mut());
-
-pub fn set_global_executor(ptr: *mut Executor) {
-    EXECUTOR_PTR.store(ptr, Ordering::SeqCst);
+pub fn set_current_executor(ptr: *mut Executor) {
+    CURRENT_EXECUTOR.with(|e| unsafe { *e.get() = ptr });
 }
 
-pub fn get_global_executor() -> *mut Executor {
-    let ptr = EXECUTOR_PTR.load(Ordering::SeqCst);
-    if !ptr.is_null() {
-        return ptr;
-    }
-    EXECUTOR.with(|e| e.get())
+pub fn get_current_executor() -> *mut Executor {
+    CURRENT_EXECUTOR.with(|e| unsafe { *e.get() })
 }
 
 pub struct Executor {
@@ -156,7 +149,7 @@ impl Executor {
 
     /// Run one scheduler step: resume the next ready coroutine.
     /// Returns true if work was done, false if nothing to run.
-    fn step(&mut self) -> bool {
+    pub fn step(&mut self) -> bool {
         let next_pid = match self.pick_next() {
             Some(pid) => pid,
             None => return false,
@@ -224,26 +217,6 @@ impl Executor {
         // explicitly via unload_binary/unload_all_binaries.
     }
 
-    pub fn block_on_all(&mut self) {
-        set_global_executor(self as *mut Executor);
-        while self.vprocs.values().any(|c| !c.is_done()) {
-            let next_pid = match self.pick_next() {
-                Some(pid) => pid,
-                None => break,
-            };
-            self.deliver_signals(next_pid);
-            self.current = Some(next_pid);
-            self.switch_count += 1;
-            self.vprocs.get_mut(&next_pid).unwrap().resume();
-            if let Some(co) = self.vprocs.get(&next_pid) {
-                if !co.is_done() {
-                    self.ready_queue.push_back(next_pid);
-                }
-            }
-        }
-        self.reap_done_coroutines();
-    }
-
     pub fn switch_count(&self) -> u64 {
         self.switch_count
     }
@@ -255,7 +228,7 @@ pub extern "C" fn vproc_exit() {
 }
 
 pub fn vproc_exit_with_code(code: i32) {
-    let ex = unsafe { &mut *get_global_executor() };
+    let ex = unsafe { &mut *get_current_executor() };
     let pid = match ex.current {
         Some(p) => p,
         None => return,
@@ -274,7 +247,7 @@ pub fn vproc_exit_with_code(code: i32) {
 }
 
 pub fn get_exit_code(pid: VPid) -> Option<i32> {
-    let ex = unsafe { &mut *get_global_executor() };
+    let ex = unsafe { &mut *get_current_executor() };
     if let Some(&code) = ex.exit_codes.get(&pid) {
         return Some(code);
     }
@@ -284,19 +257,19 @@ pub fn get_exit_code(pid: VPid) -> Option<i32> {
 }
 
 pub fn is_child_of(parent: VPid, child: VPid) -> bool {
-    let ex = unsafe { &mut *get_global_executor() };
+    let ex = unsafe { &mut *get_current_executor() };
     ex.children.get(&parent).map_or(false, |kids| kids.contains(&child))
 }
 
 pub fn reap_child(parent: VPid, child: VPid) {
-    let ex = unsafe { &mut *get_global_executor() };
+    let ex = unsafe { &mut *get_current_executor() };
     if let Some(kids) = ex.children.get_mut(&parent) {
         kids.retain(|&k| k != child);
     }
 }
 
 pub fn remove_exit_code(pid: VPid) {
-    let ex = unsafe { &mut *get_global_executor() };
+    let ex = unsafe { &mut *get_current_executor() };
     ex.exit_codes.remove(&pid);
 }
 
@@ -306,7 +279,7 @@ pub fn do_yield() {
         if !co.is_null() {
             // Re-queue current coroutine before yielding, otherwise the scheduler
             // never picks it up again (the same logic as Executor::r#yield).
-            let ex = &mut *get_global_executor();
+            let ex = &mut *get_current_executor();
             if let Some(pid) = ex.current {
                 if let Some(co_inner) = ex.vprocs.get(&pid) {
                     if !co_inner.is_done() {
@@ -317,7 +290,7 @@ pub fn do_yield() {
             mco_yield_raw(co);
         } else {
             // Driver thread — advance the scheduler.
-            let ex = &mut *get_global_executor();
+            let ex = &mut *get_current_executor();
             ex.step_from_driver();
         }
     }
