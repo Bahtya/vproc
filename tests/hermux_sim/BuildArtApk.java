@@ -224,22 +224,24 @@ public class BuildArtApk {
             // <application>
             xml.write(startElem(2, -1, 1));
 
-            // <activity name="ArtTestActivity" exported="true">
+            // *** CRITICAL: Android 16 要求 attr() 第一个参数必须用 namespace URI 索引 ***
+            // *** 即 ns=3 (string pool index 3 = "http://schemas.android.com/apk/res/android") ***
+            // *** 不能用 ns=0 (prefix "android")，否则 Android 16 包解析器报"解析软件包时出现问题" ***
             xml.write(startElem(3, -1, 8,
-                attr(0, 6, 14, TYPE_STRING, 14),
-                attr(0, 7, NO_RAW, TYPE_INT_BOOL, 0xFFFFFFFF)));
+                attr(3, 6, 14, TYPE_STRING, 14),       // ns=3 (URI), NOT ns=0 (prefix)
+                attr(3, 7, NO_RAW, TYPE_INT_BOOL, 0xFFFFFFFF)));
 
             // <intent-filter>
             xml.write(startElem(4, -1, 9));
 
             // <action name="android.intent.action.MAIN"/>
             xml.write(startElem(5, -1, 10,
-                attr(0, 6, 12, TYPE_STRING, 12)));
+                attr(3, 6, 12, TYPE_STRING, 12)));      // ns=3 (URI)
             xml.write(endElem(5, -1, 10));
 
             // <category name="android.intent.category.LAUNCHER"/>
             xml.write(startElem(6, -1, 11,
-                attr(0, 6, 13, TYPE_STRING, 13)));
+                attr(3, 6, 13, TYPE_STRING, 13)));      // ns=3 (URI)
             xml.write(endElem(6, -1, 11));
 
             xml.write(endElem(4, -1, 9));   // </intent-filter>

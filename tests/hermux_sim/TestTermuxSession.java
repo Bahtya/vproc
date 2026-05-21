@@ -19,6 +19,54 @@ public class TestTermuxSession {
     static final String SHELL = "/data/data/com.termux/files/usr/bin/sh";
     static final String BASH  = "/data/data/com.termux/files/usr/bin/bash";
 
+    // ART: untrusted_app 无法访问 Termux 数据目录，用 APK 内嵌的 shell
+    static String getShellPath() {
+        String bundled = getNativeLibDir() + "/libsh.so";
+        if (new java.io.File(bundled).canExecute()) return bundled;
+        return SHELL;
+    }
+
+    static String getBashPath() {
+        String bundled = getNativeLibDir() + "/libbash.so";
+        if (new java.io.File(bundled).canExecute()) return bundled;
+        return BASH;
+    }
+
+    static String getNativeLibDir() {
+        try {
+            // Find the directory where our own JNI library was loaded from
+            String classpath = System.getProperty("java.class.path");
+            // Find libvproc_jni_bridge.so via /proc/self/maps
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader("/proc/self/maps"));
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.contains("libvproc_jni_bridge.so")) {
+                    br.close();
+                    // Extract directory from path like: /data/app/~~/.../lib/arm64/libvproc_jni_bridge.so
+                    int lastSlash = line.lastIndexOf('/');
+                    if (lastSlash > 0) {
+                        // Find the start of the path (after the space)
+                        String trimmed = line.trim();
+                        int pathStart = 0;
+                        for (int i = 0; i < trimmed.length(); i++) {
+                            if (trimmed.charAt(i) == '/') {
+                                pathStart = i;
+                                break;
+                            }
+                        }
+                        String path = trimmed.substring(pathStart, lastSlash);
+                        return path;
+                    }
+                }
+            }
+            br.close();
+        } catch (Exception e) {
+            System.err.println("  getNativeLibDir failed: " + e);
+        }
+        return "/data/app/~~/com.vproc.arttest/lib/arm64";
+    }
+
     static boolean libsLoaded = false;
 
     static void ensureLibsLoaded() {
@@ -47,6 +95,13 @@ public class TestTermuxSession {
                                            int stdinFd, int stdoutFd, int stderrFd);
     native String[] detectDeviceInfo();
 
+    // Diagnostic native methods for ART debugging
+    native String diagPathAccess(String path);
+    native String diagDlopen(String path);
+    native String[] diagDlIterate();
+    native String[] diagCreateProcess(String path, String[] argv, String[] envp,
+                                       int stdinFd, int stdoutFd, int stderrFd);
+
     int passed = 0;
     int failed = 0;
     boolean hasCrash = false;
@@ -57,6 +112,17 @@ public class TestTermuxSession {
             String k = (String) key;
             list.add(k + "=" + System.getenv(k));
         }
+        // ART: add shell dir to PATH so sh can find commands
+        String libDir = getNativeLibDir();
+        boolean hasPath = false;
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).startsWith("PATH=")) {
+                list.set(i, "PATH=" + libDir + ":" + list.get(i).substring(5));
+                hasPath = true;
+                break;
+            }
+        }
+        if (!hasPath) list.add("PATH=" + libDir + ":/system/bin");
         return list.toArray(new String[0]);
     }
 
@@ -109,10 +175,11 @@ public class TestTermuxSession {
         if (pty == null) throw new RuntimeException("openpty failed");
         int masterFd = pty[0], slaveFd = pty[1];
 
-        String[] argv = {SHELL, "-c", cmd};
+        String sh = getShellPath();
+        String[] argv = {sh, "-c", cmd};
         String[] envp = buildEnvp();
 
-        int vpid = createProcess(SHELL, argv, envp, slaveFd, slaveFd, slaveFd);
+        int vpid = createProcess(sh, argv, envp, slaveFd, slaveFd, slaveFd);
         if (vpid == 0) {
             closeFd(slaveFd); closeFd(masterFd);
             return new Result(-1, "", false, 0, 0);
@@ -164,10 +231,11 @@ public class TestTermuxSession {
         if (pty == null) throw new RuntimeException("openpty failed");
         int masterFd = pty[0], slaveFd = pty[1];
 
-        String[] argv = {BASH, "--norc", "--noprofile", "-c", cmd};
+        String bash = getBashPath();
+        String[] argv = {bash, "--norc", "--noprofile", "-c", cmd};
         String[] envp = useLargeEnvp ? buildLargeEnvp() : buildEnvp();
 
-        int[] result = createProcessWithRecovery(BASH, argv, envp, slaveFd, slaveFd, slaveFd);
+        int[] result = createProcessWithRecovery(bash, argv, envp, slaveFd, slaveFd, slaveFd);
 
         if (result[1] == 1) {
             // Crash detected
@@ -223,6 +291,55 @@ public class TestTermuxSession {
         executor.shutdownNow();
 
         return new Result(exitCode, output.toString(), false, 0, 0);
+    }
+
+    // --- ART Diagnostics ---
+
+    void runDiagnostics() {
+        System.err.println("=== ART Diagnostics ===");
+        String shellPath = getShellPath();
+        String bashPath = getBashPath();
+        System.err.println("  shell path: " + shellPath);
+        System.err.println("  bash path:  " + bashPath);
+        try {
+            // 1. Path access
+            String pathSh = diagPathAccess(shellPath);
+            System.err.println("  diag path(sh):  " + pathSh);
+            String pathBash = diagPathAccess(bashPath);
+            System.err.println("  diag path(bash): " + pathBash);
+
+            // 2. dlopen
+            String dlopenSh = diagDlopen(shellPath);
+            System.err.println("  diag dlopen(sh):  " + dlopenSh);
+            String dlopenBash = diagDlopen(bashPath);
+            System.err.println("  diag dlopen(bash): " + dlopenBash);
+
+            // 3. dl_iterate_phdr
+            String[] loaded = diagDlIterate();
+            System.err.println("  diag dl_iterate: " + loaded.length + " libs loaded");
+            for (String s : loaded) {
+                System.err.println("    " + s);
+            }
+
+            // 4. Full createProcess with stderr capture
+            int[] pty = openPty();
+            if (pty != null) {
+                String[] argv = {shellPath, "-c", "echo diag"};
+                String[] envp = buildEnvp();
+                String[] cpResult = diagCreateProcess(shellPath, argv, envp,
+                    pty[1], pty[1], pty[1]);
+                System.err.println("  diag createProcess(sh): vpid=" + cpResult[0]
+                    + " err=" + cpResult[1]);
+                closeFd(pty[0]);
+                closeFd(pty[1]);
+            } else {
+                System.err.println("  diag createProcess: openpty failed, skipping");
+            }
+        } catch (Exception e) {
+            System.err.println("  DIAG ERROR: " + e);
+        }
+        System.err.println("=== End Diagnostics ===");
+        System.err.println();
     }
 
     // --- Test cases ---
@@ -332,10 +449,10 @@ public class TestTermuxSession {
 
     void testBashForkSubprocess() throws Exception {
         // "; true" prevents bash last-command exec optimization
-        Result r = runBashCmd("/data/data/com.termux/files/usr/bin/echo fork_test; true", false);
+        Result r = runBashCmd(getShellPath() + " -c 'echo fork_test'; true", false);
         if (r.crashed) return;
         boolean ok = r.exitCode == 0 && r.output.contains("fork_test");
-        test("bash -c /usr/bin/echo; true (fork subprocess)", ok);
+        test("bash -c sh echo; true (fork subprocess)", ok);
         if (!ok) {
             System.err.printf("    exit=%d output=[%s]%n", r.exitCode,
                 r.output.length() > 200 ? r.output.substring(0, 200) + "..." : r.output);
@@ -386,6 +503,9 @@ public class TestTermuxSession {
         // Device detection
         t.testDeviceInfo();
         System.err.println();
+
+        // ART diagnostics — isolate which step of createProcess fails
+        t.runDiagnostics();
 
         // sh baseline tests
         System.err.println("--- sh baseline ---");

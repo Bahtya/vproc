@@ -54,18 +54,28 @@ $(BUILDDIR)/debug.keystore:
 
 # 5. Assemble unsigned APK (Java generates binary manifest + packages)
 $(BUILDDIR)/unsigned.apk: $(BUILDDIR)/BuildArtApk.class $(BUILDDIR)/classes.dex \
-                          $(LIBDIR)/libvproc.so libvproc_jni_bridge.so
+                          $(LIBDIR)/libvproc.so libvproc_jni_bridge.so libsh.so libbash.so \
+                          libandroid-support.so libiconv.so libreadline.so libncursesw.so
 	java -cp $(BUILDDIR) BuildArtApk $@ --generate \
 		$(BUILDDIR)/classes.dex \
 		$(LIBDIR)/libvproc.so \
-		libvproc_jni_bridge.so
+		libvproc_jni_bridge.so \
+		libsh.so \
+		libbash.so \
+		libandroid-support.so \
+		libiconv.so \
+		libreadline.so \
+		libncursesw.so
 
 # 6. Sign APK
+# *** CRITICAL: Android 16 (SDK 36) 三大签名/打包要求 ***
+# *** 1) 必须用 apksigner (V1+V2+V3)，不能用 jarsigner (仅V1，会报"解析软件包时出现问题") ***
+# *** 2) BuildArtApk.java 中 attr() 第一个参数必须用 ns=3 (URI index)，不能用 ns=0 (prefix) ***
+# *** 3) JNI 函数名必须包含完整包名: Java_com_vproc_arttest_TestTermuxSession_xxx ***
 $(BUILDDIR)/art_test.apk: $(BUILDDIR)/unsigned.apk $(BUILDDIR)/debug.keystore
-	cp $< $@
-	$(JARSIGNER) -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
-		-keystore $(BUILDDIR)/debug.keystore -storepass android -keypass android \
-		$@ arttest
+	bash /data/data/com.termux/files/home/android-sdk/build-tools/35.0.0/apksigner sign \
+		--ks $(BUILDDIR)/debug.keystore --ks-pass pass:android --key-pass pass:android \
+		--out $@ $<
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)

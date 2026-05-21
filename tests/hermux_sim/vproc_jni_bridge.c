@@ -23,6 +23,8 @@
 #include <poll.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <link.h>          /* dl_iterate_phdr */
+#include <errno.h>
 
 /* ------------------------------------------------------------------
  * Ensure VPROC=1 on library load
@@ -96,6 +98,8 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
 
 /* ------------------------------------------------------------------
  * JNI: Basic PTY / fd operations
+ * *** CRITICAL: JNI 函数名必须包含完整包名: Java_com_vproc_arttest_TestTermuxSession_xxx ***
+ * *** 否则 ART 抛出 UnsatisfiedLinkError（OpenJDK 通过 RegisterNatives 不受影响）***
  * ------------------------------------------------------------------ */
 
 JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_openPty(JNIEnv *env, jobject obj) {
@@ -312,6 +316,207 @@ cleanup:
     jintArray arr = (*env)->NewIntArray(env, 5);
     (*env)->SetIntArrayRegion(env, arr, 0, 5, result);
     return arr;
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Diagnostics for ART — step-by-step failure isolation
+ * ------------------------------------------------------------------ */
+
+/* Diag 1: Path access — canonicalize + read first 64 bytes */
+JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagPathAccess(
+    JNIEnv *env, jobject obj, jstring path)
+{
+    (void)obj;
+    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+    char buf[1024];
+
+    /* canonicalize */
+    char *real = realpath(c_path, NULL);
+    if (!real) {
+        snprintf(buf, sizeof(buf), "FAIL realpath: errno=%d (%s)", errno, strerror(errno));
+        (*env)->ReleaseStringUTFChars(env, path, c_path);
+        return (*env)->NewStringUTF(env, buf);
+    }
+
+    /* read first 64 bytes */
+    int fd = open(real, O_RDONLY);
+    if (fd < 0) {
+        snprintf(buf, sizeof(buf), "FAIL open(%s): errno=%d (%s)", real, errno, strerror(errno));
+        free(real);
+        (*env)->ReleaseStringUTFChars(env, path, c_path);
+        return (*env)->NewStringUTF(env, buf);
+    }
+    char rbuf[64];
+    ssize_t n = read(fd, rbuf, sizeof(rbuf));
+    close(fd);
+
+    /* check ELF magic */
+    int is_elf = (n >= 4 && rbuf[0]==0x7f && rbuf[1]=='E' && rbuf[2]=='L' && rbuf[3]=='F');
+
+    snprintf(buf, sizeof(buf), "OK: %s (%zd bytes read, %s)", real, n,
+        is_elf ? "ELF" : "NOT ELF");
+    free(real);
+    (*env)->ReleaseStringUTFChars(env, path, c_path);
+    return (*env)->NewStringUTF(env, buf);
+}
+
+/* Diag 2: dlopen test — try loading the binary */
+JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlopen(
+    JNIEnv *env, jobject obj, jstring path)
+{
+    (void)obj;
+    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+    char buf[1024];
+
+    void *handle = dlopen(c_path, RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+        const char *err = dlerror();
+        snprintf(buf, sizeof(buf), "FAIL dlopen: %s", err ? err : "unknown");
+        (*env)->ReleaseStringUTFChars(env, path, c_path);
+        return (*env)->NewStringUTF(env, buf);
+    }
+
+    snprintf(buf, sizeof(buf), "OK: handle=%p", handle);
+    /* don't dlclose — vproc may need it cached */
+    (*env)->ReleaseStringUTFChars(env, path, c_path);
+    return (*env)->NewStringUTF(env, buf);
+}
+
+/* Diag 3 helper: dl_iterate_phdr callback */
+struct diag_dl_data {
+    JNIEnv *env;
+    jobjectArray *result;
+    jclass strClass;
+    int count;
+    int max_count;
+    char **names;
+};
+
+static void diag_dl_collect(struct diag_dl_data *d, const char *name) {
+    if (d->count < d->max_count) {
+        d->names[d->count] = name ? strdup(name) : strdup("(null)");
+        d->count++;
+    }
+}
+
+static int diag_dl_callback(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    struct diag_dl_data *d = (struct diag_dl_data *)data;
+    diag_dl_collect(d, info->dlpi_name);
+    return 0;
+}
+
+/* Diag 3: dl_iterate_phdr — list all loaded shared objects */
+JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlIterate(
+    JNIEnv *env, jobject obj)
+{
+    (void)obj;
+    enum { MAX_LIBS = 128 };
+    char *names[MAX_LIBS];
+    struct diag_dl_data data = {
+        .env = env,
+        .names = names,
+        .count = 0,
+        .max_count = MAX_LIBS,
+    };
+
+    dl_iterate_phdr(diag_dl_callback, &data);
+
+    jclass strClass = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray result = (*env)->NewObjectArray(env, data.count, strClass, NULL);
+    for (int i = 0; i < data.count; i++) {
+        jstring s = (*env)->NewStringUTF(env, names[i]);
+        (*env)->SetObjectArrayElement(env, result, i, s);
+        (*env)->DeleteLocalRef(env, s);
+        free(names[i]);
+    }
+    return result;
+}
+
+/* Diag 4: Full createProcess with stderr capture via pipe */
+JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCreateProcess(
+    JNIEnv *env, jobject obj,
+    jstring path, jobjectArray argv, jobjectArray envp,
+    jint stdin_fd, jint stdout_fd, jint stderr_fd)
+{
+    (void)obj;
+    char errbuf[4096] = "";
+    char vpidbuf[32] = "0";
+
+    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+
+    int argc = (*env)->GetArrayLength(env, argv);
+    const char **c_argv = malloc((argc + 1) * sizeof(char *));
+    for (int i = 0; i < argc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
+        c_argv[i] = (*env)->GetStringUTFChars(env, s, NULL);
+    }
+    c_argv[argc] = NULL;
+
+    int envc = (*env)->GetArrayLength(env, envp);
+    const char **c_envp = malloc((envc + 1) * sizeof(char *));
+    for (int i = 0; i < envc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, envp, i);
+        c_envp[i] = (*env)->GetStringUTFChars(env, s, NULL);
+    }
+    c_envp[envc] = NULL;
+
+    /* Capture stderr via pipe */
+    int err_pipe[2];
+    int saved_stderr = dup(2);
+    if (pipe(err_pipe) == 0) {
+        /* Make read end non-blocking */
+        int flags = fcntl(err_pipe[0], F_GETFL);
+        fcntl(err_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+        dup2(err_pipe[1], 2);
+        close(err_pipe[1]);
+    }
+
+    unsigned int vpid = vproc_ffi_create_process(
+        c_path, c_argv, c_envp, stdin_fd, stdout_fd, stderr_fd);
+
+    /* Restore stderr and read captured errors */
+    dup2(saved_stderr, 2);
+    close(saved_stderr);
+
+    if (err_pipe[0] >= 0) {
+        ssize_t n = read(err_pipe[0], errbuf, sizeof(errbuf) - 1);
+        if (n > 0) {
+            errbuf[n] = '\0';
+            /* Strip trailing newline */
+            if (n > 0 && errbuf[n-1] == '\n') errbuf[n-1] = '\0';
+        } else {
+            errbuf[0] = '\0';
+        }
+        close(err_pipe[0]);
+    }
+
+    snprintf(vpidbuf, sizeof(vpidbuf), "%u", vpid);
+
+    /* Cleanup */
+    for (int i = 0; i < argc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
+        (*env)->ReleaseStringUTFChars(env, s, c_argv[i]);
+    }
+    free(c_argv);
+    for (int i = 0; i < envc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, envp, i);
+        (*env)->ReleaseStringUTFChars(env, s, c_envp[i]);
+    }
+    free(c_envp);
+    (*env)->ReleaseStringUTFChars(env, path, c_path);
+
+    /* Return String[]: {vpid, error_msg} */
+    jclass strClass = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray result = (*env)->NewObjectArray(env, 2, strClass, NULL);
+    jstring svpid = (*env)->NewStringUTF(env, vpidbuf);
+    jstring serr = (*env)->NewStringUTF(env, errbuf[0] ? errbuf : "(no error captured)");
+    (*env)->SetObjectArrayElement(env, result, 0, svpid);
+    (*env)->SetObjectArrayElement(env, result, 1, serr);
+    (*env)->DeleteLocalRef(env, svpid);
+    (*env)->DeleteLocalRef(env, serr);
+    return result;
 }
 
 /* ------------------------------------------------------------------
