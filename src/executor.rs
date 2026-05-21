@@ -304,7 +304,16 @@ pub fn do_yield() {
     unsafe {
         let co = mco_running_raw();
         if !co.is_null() {
-            // Inside a coroutine — yield via minicoro directly.
+            // Re-queue current coroutine before yielding, otherwise the scheduler
+            // never picks it up again (the same logic as Executor::r#yield).
+            let ex = &mut *get_global_executor();
+            if let Some(pid) = ex.current {
+                if let Some(co_inner) = ex.vprocs.get(&pid) {
+                    if !co_inner.is_done() {
+                        ex.ready_queue.push_back(pid);
+                    }
+                }
+            }
             mco_yield_raw(co);
         } else {
             // Driver thread — advance the scheduler.

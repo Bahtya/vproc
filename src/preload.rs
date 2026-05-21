@@ -444,11 +444,61 @@ pub extern "C" fn execve(
             crate::executor::vproc_exit_with_code(0);
             unreachable!()
         }
-        Err(e) => {
-            let msg = format!("vproc: virtual_execve: {}\n", e);
-            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
-            unsafe { *libc::__errno() = libc::ENOEXEC };
-            -1
+        Err(_) => {
+            // virtual_execve failed (e.g. binary format unsupported).
+            // Fall back to real fork + exec + waitpid so that the caller
+            // (e.g. bash last-command exec optimization) still works.
+            let c_path = std::ffi::CString::new(path_str.into_owned())
+                .unwrap_or_default();
+            let pid = unsafe {
+                let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+                f()
+            };
+            if pid < 0 {
+                unsafe { *libc::__errno() = libc::ENOEXEC };
+                return -1;
+            }
+            if pid == 0 {
+                // Child: do real execve
+                REAL_FORK_CHILD.store(true, Ordering::SeqCst);
+                unsafe {
+                    let ret: isize;
+                    std::arch::asm!(
+                        "mov x8, #221",
+                        "svc #0",
+                        lateout("x0") ret,
+                        in("x1") argv,
+                        in("x2") envp,
+                        in("x0") c_path.as_ptr(),
+                    );
+                    // exec failed
+                    let code: c_int = if ret < 0 { 126 } else { 0 };
+                    std::arch::asm!(
+                        "mov x8, #94",
+                        "svc #0",
+                        in("x0") code,
+                        options(noreturn),
+                    );
+                }
+            }
+            // Parent: wait for child with polling (raw_wait4 with 0 would block
+            // the driver thread). Use WNOHANG + yield like the waitpid interceptor.
+            let mut status: c_int = 0;
+            loop {
+                let ret = raw_wait4(pid, &mut status, libc::WNOHANG);
+                if ret > 0 { break; }
+                if ret < 0 { status = 0; break; }
+                crate::executor::do_yield();
+            }
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                1
+            };
+            crate::executor::vproc_exit_with_code(code);
+            unreachable!()
         }
     }
 }

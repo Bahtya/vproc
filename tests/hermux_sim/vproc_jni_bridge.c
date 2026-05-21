@@ -1,31 +1,103 @@
 /**
- * vproc_jni_bridge.c — JNI native method implementations for TestTermuxSession.
+ * vproc_jni_bridge.c -- JNI bridge for TestTermuxSession.
  *
- * Thin wrappers around libvproc FFI functions + openpty for PTY creation.
- * Simulates the exact calling pattern used by Hermux's Java TerminalSession.
+ * Simulates Hermux's termux.c JNI layer:
+ *   - Direct libvproc FFI calls (create_process / run_until_exit)
+ *   - PTY creation (openpty)
+ *   - Raw syscall I/O (bypasses vproc interceptors)
+ *   - Crash recovery (sigaltstack + sigsetjmp/siglongjmp)
+ *   - Device info detection (CPU, MTE, Seccomp)
  */
 
 #define _GNU_SOURCE
 #include <jni.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <pty.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <poll.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
 
-/* Ensure VPROC=1 is set on library load — required for GOT-patched interceptors. */
+/* ------------------------------------------------------------------
+ * Ensure VPROC=1 on library load
+ * ------------------------------------------------------------------ */
+
 __attribute__((constructor))
 static void ensure_vproc_env(void) {
     setenv("VPROC", "1", 1);
 }
 
-/* libvproc FFI functions */
+/* ------------------------------------------------------------------
+ * libvproc FFI
+ * ------------------------------------------------------------------ */
+
 extern unsigned int vproc_ffi_create_process(
     const char *path, const char *const *argv, const char *const *envp,
     int stdin_fd, int stdout_fd, int stderr_fd);
 extern int vproc_ffi_run_until_exit(unsigned int vpid);
 
-/* Create a PTY pair. Returns int[2] = {master_fd, slave_fd}. */
+/* ------------------------------------------------------------------
+ * Raw syscall I/O -- bypasses vproc interceptors
+ * ------------------------------------------------------------------ */
+
+static ssize_t raw_write(int fd, const void *buf, size_t count) {
+    return syscall(__NR_write, fd, buf, count);
+}
+
+static ssize_t raw_read(int fd, void *buf, size_t count) {
+    return syscall(__NR_read, fd, buf, count);
+}
+
+static void raw_log(const char *msg) {
+    raw_write(2, msg, strlen(msg));
+    raw_write(2, "\n", 1);
+}
+
+/* ------------------------------------------------------------------
+ * Crash recovery -- sigaltstack + sigsetjmp/siglongjmp
+ * ------------------------------------------------------------------ */
+
+static sigjmp_buf g_crash_jmp;
+static volatile sig_atomic_t g_crash_signal = 0;
+static volatile void *g_crash_fault_addr = NULL;
+static volatile int g_crash_stage = 0;
+static void *g_crash_stack = NULL;
+
+static void crash_handler(int sig, siginfo_t *info, void *uctx) {
+    g_crash_signal = sig;
+    g_crash_fault_addr = info->si_addr;
+
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "[CRASH] signal=%d fault_addr=%p stage=%d",
+        sig, info->si_addr, g_crash_stage);
+    raw_write(2, buf, n);
+    raw_write(2, "\n", 1);
+
+    /* fp backtrace (aarch64) */
+    void *fp;
+    __asm__ volatile("mov %0, x29" : "=r"(fp));
+    for (int i = 0; i < 8 && fp; i++) {
+        void *lr = *((void**)((char*)fp + 8));
+        n = snprintf(buf, sizeof(buf), "  #%d fp=%p lr=%p", i, fp, lr);
+        raw_write(2, buf, n);
+        raw_write(2, "\n", 1);
+        fp = *(void**)fp;
+    }
+
+    siglongjmp(g_crash_jmp, sig);
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Basic PTY / fd operations
+ * ------------------------------------------------------------------ */
+
 JNIEXPORT jintArray JNICALL Java_TestTermuxSession_openPty(JNIEnv *env, jobject obj) {
     int master, slave;
     if (openpty(&master, &slave, NULL, NULL, NULL) < 0) {
@@ -42,23 +114,42 @@ JNIEXPORT jintArray JNICALL Java_TestTermuxSession_openPty(JNIEnv *env, jobject 
     return result;
 }
 
-/* Close a file descriptor. */
 JNIEXPORT void JNICALL Java_TestTermuxSession_closeFd(JNIEnv *env, jobject obj, jint fd) {
     (void)env; (void)obj;
     close(fd);
 }
 
-/* Read up to len bytes from fd into byte[]. Returns number of bytes read, or -1 on error. */
-JNIEXPORT jint JNICALL Java_TestTermuxSession_readFd(JNIEnv *env, jobject obj, jint fd, jbyteArray buf, jint off, jint len) {
+JNIEXPORT jint JNICALL Java_TestTermuxSession_readFd(
+    JNIEnv *env, jobject obj, jint fd, jbyteArray buf, jint off, jint len)
+{
     (void)obj;
+    /* poll with 1s timeout to avoid blocking */
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int pret = poll(&pfd, 1, 1000);
+    if (pret <= 0) return (jint)pret;
+
     jbyte *data = (*env)->GetByteArrayElements(env, buf, NULL);
     if (!data) return -1;
-    int n = read(fd, data + off, len);
+    int n = (int)raw_read(fd, data + off, (size_t)len);
     (*env)->ReleaseByteArrayElements(env, buf, data, 0);
     return n;
 }
 
-/* Create a virtual process via vproc FFI. Returns vpid (>0 on success, 0 on error). */
+JNIEXPORT jint JNICALL Java_TestTermuxSession_writeFd(
+    JNIEnv *env, jobject obj, jint fd, jbyteArray buf, jint off, jint len)
+{
+    (void)obj;
+    jbyte *data = (*env)->GetByteArrayElements(env, buf, NULL);
+    if (!data) return -1;
+    int n = (int)raw_write(fd, data + off, (size_t)len);
+    (*env)->ReleaseByteArrayElements(env, buf, data, JNI_ABORT);
+    return n;
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Process creation (basic, no crash recovery)
+ * ------------------------------------------------------------------ */
+
 JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
     JNIEnv *env, jobject obj,
     jstring path, jobjectArray argv, jobjectArray envp,
@@ -68,7 +159,6 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
 
     const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
 
-    /* Build argv C array */
     int argc = (*env)->GetArrayLength(env, argv);
     const char **c_argv = malloc((argc + 1) * sizeof(char *));
     for (int i = 0; i < argc; i++) {
@@ -77,7 +167,6 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
     }
     c_argv[argc] = NULL;
 
-    /* Build envp C array */
     int envc = (*env)->GetArrayLength(env, envp);
     const char **c_envp = malloc((envc + 1) * sizeof(char *));
     for (int i = 0; i < envc; i++) {
@@ -89,7 +178,6 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
     unsigned int vpid = vproc_ffi_create_process(
         c_path, c_argv, c_envp, stdin_fd, stdout_fd, stderr_fd);
 
-    /* Cleanup */
     for (int i = 0; i < argc; i++) {
         jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
         (*env)->ReleaseStringUTFChars(env, s, c_argv[i]);
@@ -105,8 +193,222 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
     return (jint)vpid;
 }
 
-/* Block until the virtual process exits. Returns exit code. */
 JNIEXPORT jint JNICALL Java_TestTermuxSession_runUntilExit(JNIEnv *env, jobject obj, jint vpid) {
     (void)env; (void)obj;
     return vproc_ffi_run_until_exit((unsigned int)vpid);
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Crash recovery installation
+ * ------------------------------------------------------------------ */
+
+JNIEXPORT void JNICALL Java_TestTermuxSession_installCrashRecovery(JNIEnv *env, jobject obj) {
+    (void)env; (void)obj;
+
+    g_crash_stack = malloc(64 * 1024);
+    if (!g_crash_stack) {
+        raw_log("[jni] sigaltstack alloc failed");
+        return;
+    }
+
+    stack_t ss = {
+        .ss_sp = g_crash_stack,
+        .ss_size = 64 * 1024,
+        .ss_flags = 0,
+    };
+    if (sigaltstack(&ss, NULL) != 0) {
+        raw_log("[jni] sigaltstack failed");
+        return;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
+    raw_log("[jni] crash recovery installed");
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Process creation with crash recovery
+ * Returns int[5]: {vpid, crashed(0/1), fault_addr_low, fault_addr_high, crash_stage}
+ *   crash_stage: 0=none, 1=dlopen, 2=create_process, 3=run_until_exit
+ * ------------------------------------------------------------------ */
+
+JNIEXPORT jintArray JNICALL Java_TestTermuxSession_createProcessWithRecovery(
+    JNIEnv *env, jobject obj,
+    jstring path, jobjectArray argv, jobjectArray envp,
+    jint stdin_fd, jint stdout_fd, jint stderr_fd)
+{
+    int result[5] = {0, 0, 0, 0, 0};
+
+    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+
+    int argc = (*env)->GetArrayLength(env, argv);
+    const char **c_argv = malloc((argc + 1) * sizeof(char *));
+    for (int i = 0; i < argc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
+        c_argv[i] = (*env)->GetStringUTFChars(env, s, NULL);
+    }
+    c_argv[argc] = NULL;
+
+    int envc = (*env)->GetArrayLength(env, envp);
+    const char **c_envp = malloc((envc + 1) * sizeof(char *));
+    for (int i = 0; i < envc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, envp, i);
+        c_envp[i] = (*env)->GetStringUTFChars(env, s, NULL);
+    }
+    c_envp[envc] = NULL;
+
+    /* Stage 2: create_process */
+    g_crash_stage = 2;
+    g_crash_signal = 0;
+    g_crash_fault_addr = NULL;
+
+    int jmp_ret = sigsetjmp(g_crash_jmp, 1);
+    if (jmp_ret != 0) {
+        result[1] = 1;
+        result[2] = (int)((uintptr_t)g_crash_fault_addr & 0xFFFFFFFF);
+        result[3] = (int)((uintptr_t)g_crash_fault_addr >> 32);
+        result[4] = g_crash_stage;
+        goto cleanup;
+    }
+
+    {
+        char logbuf[256];
+        snprintf(logbuf, sizeof(logbuf), "[jni] vproc_ffi_create_process(%s, fd=%d/%d/%d)...",
+            c_path, stdin_fd, stdout_fd, stderr_fd);
+        raw_log(logbuf);
+    }
+
+    unsigned int vpid = vproc_ffi_create_process(
+        c_path, c_argv, c_envp, stdin_fd, stdout_fd, stderr_fd);
+
+    if (vpid == 0) {
+        raw_log("[jni] create_process failed (vpid=0)");
+        goto cleanup;
+    }
+
+    result[0] = (int)vpid;
+    g_crash_stage = 0;
+
+cleanup:
+    for (int i = 0; i < argc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
+        (*env)->ReleaseStringUTFChars(env, s, c_argv[i]);
+    }
+    free(c_argv);
+    for (int i = 0; i < envc; i++) {
+        jstring s = (jstring)(*env)->GetObjectArrayElement(env, envp, i);
+        (*env)->ReleaseStringUTFChars(env, s, c_envp[i]);
+    }
+    free(c_envp);
+    (*env)->ReleaseStringUTFChars(env, path, c_path);
+
+    jintArray arr = (*env)->NewIntArray(env, 5);
+    (*env)->SetIntArrayRegion(env, arr, 0, 5, result);
+    return arr;
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Device info detection
+ * Returns String[] with CPU, SoC, MTE, Seccomp, Kernel info
+ * ------------------------------------------------------------------ */
+
+JNIEXPORT jobjectArray JNICALL Java_TestTermuxSession_detectDeviceInfo(
+    JNIEnv *env, jobject obj)
+{
+    char buf[512];
+    int count = 0;
+    char *lines[32];
+
+    #define ADD_LINE(fmt, ...) do { \
+        if (count < 32) { \
+            int _n = snprintf(buf, sizeof(buf), fmt, ##__VA_ARGS__); \
+            lines[count] = strndup(buf, _n); \
+            count++; \
+        } \
+    } while(0)
+
+    /* CPU info -- deduplicate CPU part lines */
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        int saw_hardware = 0;
+        int saw_a710 = 0, saw_a715 = 0, saw_x3 = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "Hardware")) {
+                char *p = strchr(line, ':');
+                ADD_LINE("CPU: %s", p ? p + 2 : "?");
+                if (lines[count-1]) {
+                    char *nl = strchr(lines[count-1], '\n');
+                    if (nl) *nl = 0;
+                }
+                saw_hardware = 1;
+            }
+            if (strstr(line, "CPU part") && !saw_hardware) {
+                char *p = strchr(line, ':');
+                if (p) {
+                    int part;
+                    sscanf(p + 2, "0x%x", &part);
+                    if (part == 0xd81 && !saw_a710) { ADD_LINE("CPU part: 0xd81 (Cortex-A710)"); saw_a710 = 1; }
+                    else if (part == 0xd82 && !saw_a715) { ADD_LINE("CPU part: 0xd82 (Cortex-A715)"); saw_a715 = 1; }
+                    else if (part == 0xd85 && !saw_x3) { ADD_LINE("CPU part: 0xd85 (Cortex-X3)"); saw_x3 = 1; }
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    /* MTE detection */
+    f = fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[512];
+        int total = 0, tagged = 0;
+        while (fgets(line, sizeof(line), f)) {
+            total++;
+            if (strstr(line, "mt") || strstr(line, "tag")) tagged++;
+        }
+        fclose(f);
+        ADD_LINE("MTE: %s (maps: %d/%d tagged)", tagged > 0 ? "enabled" : "disabled", tagged, total);
+    }
+
+    /* Seccomp */
+    f = fopen("/proc/self/status", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "Seccomp:")) {
+                char *p = strchr(line, ':');
+                if (p) {
+                    int level = atoi(p + 1);
+                    ADD_LINE("Seccomp: %d (%s)", level,
+                        level == 0 ? "disabled" : level == 1 ? "strict" : "filter");
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    /* Kernel */
+    struct utsname u;
+    if (uname(&u) == 0) {
+        ADD_LINE("Kernel: %s", u.release);
+    }
+
+    #undef ADD_LINE
+
+    jclass strClass = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray result = (*env)->NewObjectArray(env, count, strClass, NULL);
+    for (int i = 0; i < count; i++) {
+        jstring s = (*env)->NewStringUTF(env, lines[i]);
+        (*env)->SetObjectArrayElement(env, result, i, s);
+        (*env)->DeleteLocalRef(env, s);
+        free(lines[i]);
+    }
+    return result;
 }
