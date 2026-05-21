@@ -98,7 +98,7 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx) {
  * JNI: Basic PTY / fd operations
  * ------------------------------------------------------------------ */
 
-JNIEXPORT jintArray JNICALL Java_TestTermuxSession_openPty(JNIEnv *env, jobject obj) {
+JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_openPty(JNIEnv *env, jobject obj) {
     int master, slave;
     if (openpty(&master, &slave, NULL, NULL, NULL) < 0) {
         return NULL;
@@ -114,12 +114,12 @@ JNIEXPORT jintArray JNICALL Java_TestTermuxSession_openPty(JNIEnv *env, jobject 
     return result;
 }
 
-JNIEXPORT void JNICALL Java_TestTermuxSession_closeFd(JNIEnv *env, jobject obj, jint fd) {
+JNIEXPORT void JNICALL Java_com_vproc_arttest_TestTermuxSession_closeFd(JNIEnv *env, jobject obj, jint fd) {
     (void)env; (void)obj;
     close(fd);
 }
 
-JNIEXPORT jint JNICALL Java_TestTermuxSession_readFd(
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_readFd(
     JNIEnv *env, jobject obj, jint fd, jbyteArray buf, jint off, jint len)
 {
     (void)obj;
@@ -135,7 +135,7 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_readFd(
     return n;
 }
 
-JNIEXPORT jint JNICALL Java_TestTermuxSession_writeFd(
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_writeFd(
     JNIEnv *env, jobject obj, jint fd, jbyteArray buf, jint off, jint len)
 {
     (void)obj;
@@ -150,7 +150,7 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_writeFd(
  * JNI: Process creation (basic, no crash recovery)
  * ------------------------------------------------------------------ */
 
-JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcess(
     JNIEnv *env, jobject obj,
     jstring path, jobjectArray argv, jobjectArray envp,
     jint stdin_fd, jint stdout_fd, jint stderr_fd)
@@ -193,7 +193,7 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_createProcess(
     return (jint)vpid;
 }
 
-JNIEXPORT jint JNICALL Java_TestTermuxSession_runUntilExit(JNIEnv *env, jobject obj, jint vpid) {
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_runUntilExit(JNIEnv *env, jobject obj, jint vpid) {
     (void)env; (void)obj;
     return vproc_ffi_run_until_exit((unsigned int)vpid);
 }
@@ -202,7 +202,7 @@ JNIEXPORT jint JNICALL Java_TestTermuxSession_runUntilExit(JNIEnv *env, jobject 
  * JNI: Crash recovery installation
  * ------------------------------------------------------------------ */
 
-JNIEXPORT void JNICALL Java_TestTermuxSession_installCrashRecovery(JNIEnv *env, jobject obj) {
+JNIEXPORT void JNICALL Java_com_vproc_arttest_TestTermuxSession_installCrashRecovery(JNIEnv *env, jobject obj) {
     (void)env; (void)obj;
 
     g_crash_stack = malloc(64 * 1024);
@@ -239,7 +239,7 @@ JNIEXPORT void JNICALL Java_TestTermuxSession_installCrashRecovery(JNIEnv *env, 
  *   crash_stage: 0=none, 1=dlopen, 2=create_process, 3=run_until_exit
  * ------------------------------------------------------------------ */
 
-JNIEXPORT jintArray JNICALL Java_TestTermuxSession_createProcessWithRecovery(
+JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcessWithRecovery(
     JNIEnv *env, jobject obj,
     jstring path, jobjectArray argv, jobjectArray envp,
     jint stdin_fd, jint stdout_fd, jint stderr_fd)
@@ -319,7 +319,7 @@ cleanup:
  * Returns String[] with CPU, SoC, MTE, Seccomp, Kernel info
  * ------------------------------------------------------------------ */
 
-JNIEXPORT jobjectArray JNICALL Java_TestTermuxSession_detectDeviceInfo(
+JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_detectDeviceInfo(
     JNIEnv *env, jobject obj)
 {
     char buf[512];

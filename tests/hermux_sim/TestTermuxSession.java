@@ -1,3 +1,5 @@
+package com.vproc.arttest;
+
 import java.io.*;
 import java.util.ArrayList;
 import java.util.concurrent.*;
@@ -17,9 +19,18 @@ public class TestTermuxSession {
     static final String SHELL = "/data/data/com.termux/files/usr/bin/sh";
     static final String BASH  = "/data/data/com.termux/files/usr/bin/bash";
 
-    static {
-        System.loadLibrary("vproc");
-        System.loadLibrary("vproc_jni_bridge");
+    static boolean libsLoaded = false;
+
+    static void ensureLibsLoaded() {
+        if (libsLoaded) return;
+        try {
+            System.loadLibrary("vproc");
+            System.loadLibrary("vproc_jni_bridge");
+        } catch (UnsatisfiedLinkError e) {
+            System.load("/data/data/com.termux/files/home/project/vproc/target/debug/libvproc.so");
+            System.load("/data/data/com.termux/files/home/project/vproc/tests/hermux_sim/libvproc_jni_bridge.so");
+        }
+        libsLoaded = true;
     }
 
     // JNI native methods
@@ -358,6 +369,7 @@ public class TestTermuxSession {
     }
 
     public static void main(String[] args) throws Exception {
+        ensureLibsLoaded();
         TestTermuxSession t = new TestTermuxSession();
 
         System.err.println("============================================================");
