@@ -7,16 +7,18 @@ pub mod preload;
 pub mod vexec;
 pub mod vfd;
 
+pub const VERSION: &str = "0.3.0";
+
 use coroutine::VPid;
 
 /// Spawn a new coroutine.
 pub fn spawn(f: Box<dyn FnOnce()>) -> VPid {
-    unsafe { (*executor::get_global_executor()).spawn(f) }
+    unsafe { (*executor::get_current_executor()).spawn(f) }
 }
 
 /// Spawn a coroutine at the front of the ready queue (high priority).
 pub fn spawn_front(f: Box<dyn FnOnce()>) -> VPid {
-    unsafe { (*executor::get_global_executor()).spawn_front(f) }
+    unsafe { (*executor::get_current_executor()).spawn_front(f) }
 }
 
 /// Yield control to the next ready coroutine.
@@ -25,13 +27,14 @@ pub fn r#yield() {
 }
 
 /// Run all spawned coroutines to completion.
+/// Note: with per-session architecture, this is no longer used externally.
 pub fn block_on_all() {
-    executor::EXECUTOR.with(|e| unsafe { &mut *e.get() }.block_on_all());
+    // Deprecated — session driver loop handles scheduling
 }
 
 /// Get total context switch count.
 pub fn switch_count() -> u64 {
-    unsafe { (*executor::get_global_executor()).switch_count() }
+    unsafe { (*executor::get_current_executor()).switch_count() }
 }
 
 /// Terminate the current coroutine with an exit code.
