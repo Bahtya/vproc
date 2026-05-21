@@ -1,0 +1,94 @@
+# Makefile.art — Build ART test APK for Issue #28 verification
+#
+# Build: make -f Makefile.art
+# Install: make -f Makefile.art install  (then tap Install on screen)
+# Run:     make -f Makefile.art run
+# Read:    make -f Makefile.art read
+# Clean:   make -f Makefile.art clean
+
+JAVA_HOME ?= /data/data/com.termux/files/usr/lib/jvm/java-21-openjdk
+AAPT2     = /data/data/com.termux/files/usr/bin/aapt2
+D8        = /data/data/com.termux/files/usr/bin/bash \
+              /data/data/com.termux/files/home/android-sdk/build-tools/35.0.0/d8
+JAVAC     = javac
+KEYTOOL   = $(JAVA_HOME)/bin/keytool
+JARSIGNER = $(JAVA_HOME)/bin/jarsigner
+PYTHON3   = python3
+
+LIBDIR    = ../../target/debug
+BUILDDIR  = build_art
+SDK_PLATFORM = /data/data/com.termux/files/home/android-sdk/platforms/android-36/android.jar
+
+PACKAGE   = com.vproc.arttest
+ACTIVITY  = $(PACKAGE)/ArtTestActivity
+OUTPUT    = /data/data/com.vproc.arttest/files/art_test_output.txt
+
+.PHONY: all install run read clean
+
+all: $(BUILDDIR)/art_test.apk
+
+# 1. Compile Java sources
+$(BUILDDIR)/.classes: TestTermuxSession.java ArtTestActivity.java
+	mkdir -p $(BUILDDIR)/classes
+	$(JAVAC) -d $(BUILDDIR)/classes \
+		-cp $(SDK_PLATFORM) -source 11 -target 11 \
+		TestTermuxSession.java ArtTestActivity.java
+	touch $@
+
+# 2. Convert to DEX
+$(BUILDDIR)/classes.dex: $(BUILDDIR)/.classes
+	$(D8) --output $(BUILDDIR) \
+		--lib $(SDK_PLATFORM) \
+		$$(find $(BUILDDIR)/classes -name '*.class')
+
+# 3. Compile BuildArtApk.java
+$(BUILDDIR)/BuildArtApk.class: BuildArtApk.java | $(BUILDDIR)
+	$(JAVAC) -d $(BUILDDIR) $<
+
+# 4. Debug keystore
+$(BUILDDIR)/debug.keystore:
+	$(KEYTOOL) -genkeypair -v -keystore $@ \
+		-alias arttest -keyalg RSA -keysize 2048 -validity 10000 \
+		-storepass android -keypass android \
+		-dname "CN=ArtTest,O=Vproc,C=US"
+
+# 5. Assemble unsigned APK (Java generates binary manifest + packages)
+$(BUILDDIR)/unsigned.apk: $(BUILDDIR)/BuildArtApk.class $(BUILDDIR)/classes.dex \
+                          $(LIBDIR)/libvproc.so libvproc_jni_bridge.so
+	java -cp $(BUILDDIR) BuildArtApk $@ --generate \
+		$(BUILDDIR)/classes.dex \
+		$(LIBDIR)/libvproc.so \
+		libvproc_jni_bridge.so
+
+# 6. Sign APK
+$(BUILDDIR)/art_test.apk: $(BUILDDIR)/unsigned.apk $(BUILDDIR)/debug.keystore
+	cp $< $@
+	$(JARSIGNER) -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+		-keystore $(BUILDDIR)/debug.keystore -storepass android -keypass android \
+		$@ arttest
+
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
+
+# Install (triggers system installer UI — tap Install on screen)
+install: $(BUILDDIR)/art_test.apk
+	cp $< /sdcard/art_test.apk
+	am start -a android.intent.action.VIEW \
+		-d file:///sdcard/art_test.apk \
+		-t application/vnd.android.package-archive
+
+# Run the test
+run:
+	am start -n $(ACTIVITY)
+
+# Read output (wait a bit for test to finish)
+read:
+	sleep 15
+	cat $(OUTPUT) 2>/dev/null || echo "Output not found at $(OUTPUT)"
+
+# Uninstall
+uninstall:
+	pm uninstall $(PACKAGE) 2>/dev/null || true
+
+clean:
+	rm -rf $(BUILDDIR) /sdcard/art_test.apk
