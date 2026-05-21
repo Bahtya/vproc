@@ -38,6 +38,7 @@ struct Session {
     saved_fds: [c_int; 3],
     probe_result: Option<c_int>,
     shutdown: bool,
+    wake: Condvar,
 }
 
 // Safety: Session is only accessed by one thread at a time (via Mutex lock).
@@ -68,6 +69,7 @@ pub extern "C" fn vproc_ffi_create_session() -> u32 {
         saved_fds: [-1, -1, -1],
         probe_result: None,
         shutdown: false,
+        wake: Condvar::new(),
     }));
 
     let session_clone = Arc::clone(&session);
@@ -130,6 +132,7 @@ pub extern "C" fn vproc_ffi_create_process(
             stderr_fd,
             result: Arc::clone(&result),
         });
+        s.wake.notify_all();
     }
 
     // Wait for driver to process — use timeout to avoid deadlock if driver crashes
@@ -158,16 +161,26 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
     drop(sessions);
 
     {
+        let s = session.lock().unwrap();
+        // Check if already done (driver thread may have completed it)
+        if let Some(code) = s.executor.vprocs.get(&vpid).and_then(|co| {
+            if co.is_done() { Some(co.exit_code) } else { None }
+        }) {
+            return code;
+        }
+        drop(s);
         let mut s = session.lock().unwrap();
-        // Check if already done
-        crate::executor::set_current_executor(&mut s.executor as *mut _);
-        if let Some(code) = crate::executor::get_exit_code(vpid) {
+        // Re-check after re-acquiring lock (driver could have finished between drops)
+        if let Some(code) = s.executor.vprocs.get(&vpid).and_then(|co| {
+            if co.is_done() { Some(co.exit_code) } else { None }
+        }) {
             return code;
         }
         s.waiters.push(Waiter {
             vpid,
             result: Arc::clone(&result),
         });
+        s.wake.notify_all();
     }
 
     let (lock, cvar) = &*result;
@@ -716,16 +729,20 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
             s.executor.reap_done_coroutines();
         }
 
-        // Brief sleep to avoid busy-waiting
-        // Check if there's work to do
-        let has_work = {
+        // Block until new work arrives (spawn request, waiter, or active coroutines)
+        {
             let s = session.lock().unwrap();
-            !s.spawn_queue.is_empty()
+            let has_work = !s.spawn_queue.is_empty()
                 || !s.waiters.is_empty()
-                || s.executor.vprocs.values().any(|c| !c.is_done())
-        };
-        if !has_work {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+                || s.executor.vprocs.values().any(|c| !c.is_done());
+            if !has_work && !s.shutdown {
+                // addr_of! creates a raw pointer without borrowing the guard,
+                // allowing the guard to be moved into wait_timeout.
+                let wake = std::ptr::addr_of!(s.wake);
+                let _guard = unsafe {
+                    (&*wake).wait_timeout(s, std::time::Duration::from_millis(100))
+                }.unwrap();
+            }
         }
     }
 }
