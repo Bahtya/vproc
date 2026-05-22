@@ -14,6 +14,7 @@ use crate::loader;
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
 
 /// Check if MTE (Memory Tagging Extension) is available — cached after first call.
+#[allow(dead_code)]
 fn mte_available() -> bool {
     use std::sync::atomic::{AtomicI8, Ordering as Ord2};
     static CACHED: AtomicI8 = AtomicI8::new(-1);
@@ -708,6 +709,8 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
             "lseek" => crate::preload::lseek as *const c_void as usize,
             "chdir" => crate::preload::chdir as *const c_void as usize,
             "getcwd" => crate::preload::getcwd as *const c_void as usize,
+            "poll" => crate::preload::poll as *const c_void as usize,
+            "select" => crate::preload::select as *const c_void as usize,
             _ => continue,
         };
 

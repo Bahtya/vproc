@@ -11,7 +11,7 @@ fn main() {
 
     let start = std::time::Instant::now();
 
-    for i in 0..n {
+    for _i in 0..n {
         vproc::spawn(Box::new(move || {
             for _ in 0..yields_per {
                 TOTAL_YIELDS.fetch_add(1, Ordering::Relaxed);

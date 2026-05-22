@@ -715,31 +715,6 @@ pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) -> i32 {
 // Per-session driver loop
 // ---------------------------------------------------------------------------
 
-// sigsetjmp/siglongjmp FFI — not exposed by libc crate on all platforms
-type SigjmpBuf = [c_int; 26]; // large enough for aarch64 sigjmp_buf
-static mut PROBE_JMP: std::mem::MaybeUninit<SigjmpBuf> = std::mem::MaybeUninit::uninit();
-
-unsafe fn probe_sigsetjmp(env: *mut SigjmpBuf, savemask: c_int) -> c_int {
-    extern "C" { fn sigsetjmp(env: *mut c_int, savemask: c_int) -> c_int; }
-    unsafe { sigsetjmp(env as *mut c_int, savemask) }
-}
-
-unsafe fn probe_siglongjmp(env: *mut SigjmpBuf, val: c_int) {
-    #[cfg(target_arch = "aarch64")]
-    std::arch::asm!("xpaclri"); // Strip PAC from lr before siglongjmp
-    extern "C" { fn siglongjmp(env: *mut c_int, val: c_int); }
-    unsafe { siglongjmp(env as *mut c_int, val); }
-}
-
-/// SIGSEGV handler for the driver self-test probe — jumps back to report failure.
-unsafe extern "C" fn probe_sigsegv_handler(
-    _sig: c_int,
-    _info: *mut libc::siginfo_t,
-    _uctx: *mut c_void,
-) {
-    probe_siglongjmp(PROBE_JMP.as_mut_ptr(), 1);
-}
-
 fn run_session_driver(session: Arc<Mutex<Session>>) {
     // 1. Signal isolation — block all signals except SIGWINCH, SIGSEGV, SIGBUS
     unsafe {
@@ -782,20 +757,18 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
 
-    // 4. Main loop
+    // 4. Main loop — I/O-aware event-driven scheduling
     loop {
         {
             let mut s = session.lock().unwrap();
 
             if s.shutdown {
-                // Reap all coroutines and cleanup
                 crate::executor::set_current_executor(&mut s.executor as *mut _);
                 s.executor.reap_done_coroutines();
                 crate::vfd::cleanup();
                 return;
             }
 
-            // Set thread-local for all operations in this iteration
             crate::executor::set_current_executor(&mut s.executor as *mut _);
 
             // Drain spawn queue (uses separate lock, not session mutex)
@@ -816,7 +789,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                     Err(e) => {
                         let msg = format!("vproc_ffi_create_process: {}\n", e);
                         unsafe {
-                            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                            libc::write(2, msg.as_ptr() as *const _, msg.len());
                         }
                         0
                     }
@@ -844,25 +817,53 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
 
             // Reap done coroutines
             s.executor.reap_done_coroutines();
+
+            // Collect I/O-waiting fds and batch poll
+            let (pollfds, pid_map) = crate::executor::collect_io_waits();
+            if !pollfds.is_empty() {
+                // Drop session lock while blocking in poll — other threads
+                // can submit spawn requests during this time.
+                drop(s);
+
+                let ready = unsafe {
+                    libc::poll(
+                        pollfds.as_ptr() as *mut libc::pollfd,
+                        pollfds.len() as libc::nfds_t,
+                        50, // 50ms max wait — balances latency and CPU usage
+                    )
+                };
+
+                // Re-lock and wake ready coroutines
+                let mut s = session.lock().unwrap();
+                crate::executor::set_current_executor(&mut s.executor as *mut _);
+
+                if ready > 0 {
+                    crate::executor::wake_io_ready(&pollfds, &pid_map);
+                } else if ready == 0 {
+                    // Timeout — check if any io_wait coroutines should be re-checked
+                    // (e.g. virtual pipe state may have changed). Push them all back.
+                    crate::executor::wake_io_ready(&pollfds, &pid_map);
+                }
+                // If ready < 0 (error), just continue — coroutines stay in io_wait
+            }
         }
 
-        // Block until new work arrives (spawn request, waiter, or active coroutines)
+        // Check if there's anything left to do before sleeping
         {
             let s = session.lock().unwrap();
             let spawn_has_work = {
                 let (sq_lock, _) = &*s.spawn_queue;
                 !sq_lock.lock().unwrap().is_empty()
             };
+            let has_ready = !s.executor.vprocs.values().all(|c| c.is_done() || c.io_wait.is_some());
             let has_work = spawn_has_work
                 || !s.waiters.is_empty()
-                || s.executor.vprocs.values().any(|c| !c.is_done());
+                || has_ready;
             if !has_work && !s.shutdown {
-                // addr_of! creates a raw pointer without borrowing the guard,
-                // allowing the guard to be moved into wait_timeout.
-                let wake = std::ptr::addr_of!(s.wake);
-                let _guard = unsafe {
-                    (&*wake).wait_timeout(s, std::time::Duration::from_millis(100))
-                }.unwrap();
+                // Use nanosleep instead of Condvar — avoids ART mutex issues
+                drop(s);
+                let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 }; // 10ms
+                unsafe { libc::nanosleep(&ts, std::ptr::null_mut()); }
             }
         }
     }

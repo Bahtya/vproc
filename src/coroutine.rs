@@ -4,11 +4,16 @@
 //! methods for lifecycle management. The minicoro library handles all
 //! aarch64 assembly context switching internally.
 
-use std::os::raw::c_void;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 
 
 pub type VPid = u32;
+
+/// I/O wait state for a coroutine that yielded waiting for fd readiness.
+pub struct IoWait {
+    pub fds: Vec<(c_int, i16)>, // (real_fd, poll_events e.g. POLLIN/POLLOUT)
+}
 
 const DEFAULT_STACK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 
@@ -110,6 +115,7 @@ pub struct Coroutine {
     pub pending_signals: Vec<i32>,
     pub cwd: Option<String>,
     pub binary_path: Option<String>,
+    pub io_wait: Option<IoWait>,
     stack_alloc: Option<(*mut u8, usize)>,
 }
 
@@ -142,6 +148,7 @@ impl Coroutine {
             pending_signals: Vec::new(),
             cwd: None,
             binary_path: None,
+            io_wait: None,
             stack_alloc: None,
         }
     }
@@ -219,6 +226,7 @@ impl Coroutine {
             pending_signals: Vec::new(),
             cwd: None,
             binary_path: None,
+            io_wait: None,
             stack_alloc: Some((stack_base, stack_size)),
         }
     }
@@ -281,6 +289,7 @@ impl Coroutine {
             pending_signals: Vec::new(),
             cwd: parent.cwd.clone(),
             binary_path: None,
+            io_wait: None,
             stack_alloc: None,
         }
     }
