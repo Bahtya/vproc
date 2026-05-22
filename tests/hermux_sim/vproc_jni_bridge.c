@@ -329,7 +329,9 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
             cmd_utf8, pts, pts, pts);
         raw_log(buf);
     }
+    ALOGI("createSubprocess: about to call create_process cmd=%s", cmd_utf8);
     uint32_t vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
+    ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
     ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
     {
         char buf[64];
