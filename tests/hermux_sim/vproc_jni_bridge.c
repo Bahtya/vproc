@@ -33,15 +33,19 @@
 #include <stdatomic.h>
 
 /* ------------------------------------------------------------------
- * Raw syscall I/O -- bypasses vproc interceptors
+ * Raw I/O -- bypasses vproc interceptors
+ * Uses libc write/read (not raw syscall) to avoid seccomp issues
+ * on Android 16 untrusted_app.
  * ------------------------------------------------------------------ */
 
+#include <unistd.h>
+
 static ssize_t raw_write(int fd, const void *buf, size_t count) {
-    return syscall(__NR_write, fd, buf, count);
+    return write(fd, buf, count);
 }
 
 static ssize_t raw_read(int fd, void *buf, size_t count) {
-    return syscall(__NR_read, fd, buf, count);
+    return read(fd, buf, count);
 }
 
 static void raw_log(const char *msg) {
