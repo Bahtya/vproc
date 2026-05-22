@@ -47,6 +47,7 @@ static void jni_log(const char *fmt, ...) {
     }
 }
 #define ALOGI(...) jni_log(__VA_ARGS__)
+#define ALOGE(...) jni_log(__VA_ARGS__)
 
 /* ------------------------------------------------------------------
  * Raw I/O -- bypasses vproc interceptors
