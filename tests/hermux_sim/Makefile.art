@@ -12,7 +12,7 @@ JAVAC     = javac
 KEYTOOL   = $(JAVA_HOME)/bin/keytool
 CFLAGS    = -Wall -Wextra -O2 -fPIC \
             -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/linux
-LDFLAGS   = -shared -lutil -landroid -llog
+LDFLAGS   = -shared -lutil -landroid
 
 LIBDIR    = ../../target/debug
 BUILDDIR  = build_art

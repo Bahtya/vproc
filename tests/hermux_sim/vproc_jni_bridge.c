@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
@@ -31,10 +32,21 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
-#include <android/log.h>
 
-#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, "vproc-jni", __VA_ARGS__)
-#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, "vproc-jni", __VA_ARGS__)
+/* Simple log using write(2) — no liblog dependency */
+static void jni_log(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+        buf[n++] = '\n';
+        write(2, buf, n);
+    }
+}
+#define ALOGI(...) jni_log(__VA_ARGS__)
 
 /* ------------------------------------------------------------------
  * Raw I/O -- bypasses vproc interceptors
