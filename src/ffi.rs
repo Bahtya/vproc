@@ -163,9 +163,8 @@ pub extern "C" fn vproc_ffi_create_process(
         cvar.notify_all();
     }
 
-    // Wait for driver to process — poll with sleep (condvar may not work under ART)
-    // Driver's 100ms timeout will pick up the spawn request.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Wait for driver to process — poll with direct nanosleep
+    let mut attempts = 0;
     loop {
         {
             let (lock, _) = &*result;
@@ -174,10 +173,14 @@ pub extern "C" fn vproc_ffi_create_process(
                 return guard.unwrap_or(0);
             }
         }
-        if std::time::Instant::now() >= deadline {
-            return 0; // timeout
+        attempts += 1;
+        if attempts > 1000 {
+            return 0; // timeout after ~10s
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        unsafe {
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 }; // 10ms
+            libc::nanosleep(&ts, std::ptr::null_mut());
+        }
     }
 }
 
