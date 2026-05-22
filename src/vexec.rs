@@ -64,7 +64,7 @@ fn alloc_elf_stack(size: usize) -> *mut u8 {
 /// Free an ELF stack allocated by alloc_elf_stack.
 pub fn free_elf_stack(ptr: *mut u8, size: usize) {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-    unsafe { libc::munmap(ptr.sub(page_size), page_size + size); }
+    unsafe { libc::munmap(ptr.sub(page_size) as *mut c_void, page_size + size); }
 }
 
 /// MTE-aware mprotect: preserves PROT_MTE on pages that had it.
