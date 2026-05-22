@@ -133,8 +133,20 @@ pub extern "C" fn vproc_ffi_create_process(
             None => return 0,
         };
         drop(sessions);
-        let sq = Arc::clone(&session.lock().unwrap().spawn_queue);
-        sq
+        // Try to get spawn_queue without blocking on session lock
+        // (driver may hold session lock during spawn processing)
+        let mut sq = None;
+        for _ in 0..100 {
+            if let Ok(s) = session.try_lock() {
+                sq = Some(Arc::clone(&s.spawn_queue));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        match sq {
+            Some(q) => q,
+            None => return 0,
+        }
     };
 
     {
@@ -151,17 +163,8 @@ pub extern "C" fn vproc_ffi_create_process(
         cvar.notify_all();
     }
 
-    // Also wake the session's condvar so the driver thread exits its wait
-    {
-        let sessions = SESSIONS.lock().unwrap();
-        if let Some(session) = sessions.get(&session_id) {
-            let s = session.lock().unwrap();
-            // session lock is needed for the condvar, but we just need to notify
-            drop(s);
-        }
-    }
-
     // Wait for driver to process — poll with sleep (condvar may not work under ART)
+    // Driver's 100ms timeout will pick up the spawn request.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         {
