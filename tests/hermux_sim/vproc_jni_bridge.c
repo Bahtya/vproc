@@ -75,8 +75,7 @@ static ssize_t raw_read(int fd, void *buf, size_t count) {
 }
 
 static void raw_log(const char *msg) {
-    raw_write(2, msg, strlen(msg));
-    raw_write(2, "\n", 1);
+    (void)msg; /* disabled — libc write() may be intercepted by vproc GOT hooks */
 }
 
 /* ------------------------------------------------------------------
