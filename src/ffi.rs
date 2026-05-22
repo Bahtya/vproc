@@ -117,15 +117,9 @@ pub extern "C" fn vproc_ffi_create_process(
     stdout_fd: c_int,
     stderr_fd: c_int,
 ) -> u32 {
-    let msg = format!("vproc_ffi_create_process: sid={} path={:?} fds={}/{}/{}\n",
-        session_id, path, stdin_fd, stdout_fd, stderr_fd);
-    unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy().into_owned();
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
-    let msg2 = format!("vproc_ffi_create_process: path={} argc={} envc={}\n",
-        path_str, argv_vec.len(), envp_vec.len());
-    unsafe { libc::syscall(64, 2, msg2.as_ptr(), msg2.len()); }
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
@@ -238,15 +232,8 @@ pub extern "C" fn vproc_ffi_create_process_default(
     stdout_fd: c_int,
     stderr_fd: c_int,
 ) -> u32 {
-    const MSG1: &[u8] = b"vproc_ffi_create_process_default: entered\n";
-    unsafe { libc::syscall(64, 2, MSG1.as_ptr(), MSG1.len()); }
     let sid = ensure_default_session();
-    let msg2 = format!("vproc_ffi_create_process_default: sid={}, calling 7-arg version\n", sid);
-    unsafe { libc::syscall(64, 2, msg2.as_ptr(), msg2.len()); }
-    let r = vproc_ffi_create_process(sid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd);
-    let msg3 = format!("vproc_ffi_create_process_default: result={}\n", r);
-    unsafe { libc::syscall(64, 2, msg3.as_ptr(), msg3.len()); }
-    r
+    vproc_ffi_create_process(sid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd)
 }
 
 /// Drive the scheduler until the given vpid exits using the default session.
