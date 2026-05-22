@@ -1,77 +1,68 @@
-# Makefile.art — Build ART test APK for Issue #28 verification
+# Makefile.art — ART test APK for vproc issue #28 debugging
 #
-# Build: make -f Makefile.art
-# Install: make -f Makefile.art install  (then tap Install on screen)
-# Run:     make -f Makefile.art run
-# Read:    make -f Makefile.art read
-# Clean:   make -f Makefile.art clean
+# Build:     make -f Makefile.art
+# Install:   make -f Makefile.art install    (pm install, no ADB needed)
+# Run:       make -f Makefile.art test       (curl /run)
+# Results:   make -f Makefile.art results    (curl /results)
 
 JAVA_HOME ?= /data/data/com.termux/files/usr/lib/jvm/java-21-openjdk
-AAPT2     = /data/data/com.termux/files/usr/bin/aapt2
 D8        = /data/data/com.termux/files/usr/bin/bash \
               /data/data/com.termux/files/home/android-sdk/build-tools/35.0.0/d8
 JAVAC     = javac
 KEYTOOL   = $(JAVA_HOME)/bin/keytool
-JARSIGNER = $(JAVA_HOME)/bin/jarsigner
-PYTHON3   = python3
+CFLAGS    = -Wall -Wextra -O2 -fPIC \
+            -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/linux
+LDFLAGS   = -shared -lutil -landroid
 
 LIBDIR    = ../../target/debug
 BUILDDIR  = build_art
 SDK_PLATFORM = /data/data/com.termux/files/home/android-sdk/platforms/android-36/android.jar
 
 PACKAGE   = com.vproc.arttest
-ACTIVITY  = $(PACKAGE)/ArtTestActivity
-OUTPUT    = /data/data/com.vproc.arttest/files/art_test_output.txt
+PORT      = 18080
 
-.PHONY: all install run read clean
+.PHONY: all install clean test results log status ping run
 
 all: $(BUILDDIR)/art_test.apk
 
-# 1. Compile Java sources
-$(BUILDDIR)/.classes: TestTermuxSession.java ArtTestActivity.java
+# --- Build ---
+
+$(BUILDDIR)/libvproc_jni_bridge.so: vproc_jni_bridge.c
+	mkdir -p $(BUILDDIR)
+	clang $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+$(BUILDDIR)/.classes: TestTermuxSession.java ArtTestActivity.java TestRunnerService.java HttpServerService.java
 	mkdir -p $(BUILDDIR)/classes
 	$(JAVAC) -d $(BUILDDIR)/classes \
 		-cp $(SDK_PLATFORM) -source 11 -target 11 \
-		TestTermuxSession.java ArtTestActivity.java
+		TestTermuxSession.java ArtTestActivity.java TestRunnerService.java HttpServerService.java
 	touch $@
 
-# 2. Convert to DEX
 $(BUILDDIR)/classes.dex: $(BUILDDIR)/.classes
-	$(D8) --output $(BUILDDIR) \
-		--lib $(SDK_PLATFORM) \
+	$(D8) --output $(BUILDDIR) --lib $(SDK_PLATFORM) \
 		$$(find $(BUILDDIR)/classes -name '*.class')
 
-# 3. Compile BuildArtApk.java
 $(BUILDDIR)/BuildArtApk.class: BuildArtApk.java | $(BUILDDIR)
 	$(JAVAC) -d $(BUILDDIR) $<
 
-# 4. Debug keystore
 $(BUILDDIR)/debug.keystore:
 	$(KEYTOOL) -genkeypair -v -keystore $@ \
 		-alias arttest -keyalg RSA -keysize 2048 -validity 10000 \
-		-storepass android -keypass android \
+		-storepass android -key-pass android \
 		-dname "CN=ArtTest,O=Vproc,C=US"
 
-# 5. Assemble unsigned APK (Java generates binary manifest + packages)
 $(BUILDDIR)/unsigned.apk: $(BUILDDIR)/BuildArtApk.class $(BUILDDIR)/classes.dex \
-                          $(LIBDIR)/libvproc.so libvproc_jni_bridge.so libsh.so libbash.so \
-                          libandroid-support.so libiconv.so libreadline.so libncursesw.so
+                           $(BUILDDIR)/libvproc_jni_bridge.so \
+                           $(LIBDIR)/libvproc.so \
+                           libsh.so libbash.so libandroid-support.so libiconv.so \
+                           libreadline.so libncursesw.so
 	java -cp $(BUILDDIR) BuildArtApk $@ --generate \
 		$(BUILDDIR)/classes.dex \
+		$(BUILDDIR)/libvproc_jni_bridge.so \
 		$(LIBDIR)/libvproc.so \
-		libvproc_jni_bridge.so \
-		libsh.so \
-		libbash.so \
-		libandroid-support.so \
-		libiconv.so \
-		libreadline.so \
-		libncursesw.so
+		libsh.so libbash.so libandroid-support.so \
+		libiconv.so libreadline.so libncursesw.so
 
-# 6. Sign APK
-# *** CRITICAL: Android 16 (SDK 36) 三大签名/打包要求 ***
-# *** 1) 必须用 apksigner (V1+V2+V3)，不能用 jarsigner (仅V1，会报"解析软件包时出现问题") ***
-# *** 2) BuildArtApk.java 中 attr() 第一个参数必须用 ns=3 (URI index)，不能用 ns=0 (prefix) ***
-# *** 3) JNI 函数名必须包含完整包名: Java_com_vproc_arttest_TestTermuxSession_xxx ***
 $(BUILDDIR)/art_test.apk: $(BUILDDIR)/unsigned.apk $(BUILDDIR)/debug.keystore
 	bash /data/data/com.termux/files/home/android-sdk/build-tools/35.0.0/apksigner sign \
 		--ks $(BUILDDIR)/debug.keystore --ks-pass pass:android --key-pass pass:android \
@@ -80,25 +71,33 @@ $(BUILDDIR)/art_test.apk: $(BUILDDIR)/unsigned.apk $(BUILDDIR)/debug.keystore
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-# Install (triggers system installer UI — tap Install on screen)
+# --- Install (pm, no ADB) ---
+
 install: $(BUILDDIR)/art_test.apk
-	cp $< /sdcard/art_test.apk
-	am start -a android.intent.action.VIEW \
-		-d file:///sdcard/art_test.apk \
-		-t application/vnd.android.package-archive
+	pm install -r -t $< || bash auto_install.sh $<
 
-# Run the test
+# --- HTTP endpoints ---
+
 run:
-	am start -n $(ACTIVITY)
+	am start -n com.vproc.arttest/com.vproc.arttest.ArtTestActivity
 
-# Read output (wait a bit for test to finish)
-read:
-	sleep 15
-	cat $(OUTPUT) 2>/dev/null || echo "Output not found at $(OUTPUT)"
+test:
+	curl -s --max-time 10 http://127.0.0.1:$(PORT)/run
 
-# Uninstall
-uninstall:
-	pm uninstall $(PACKAGE) 2>/dev/null || true
+results:
+	curl -s --max-time 10 http://127.0.0.1:$(PORT)/results
+
+log:
+	curl -s --max-time 10 http://127.0.0.1:$(PORT)/log
+
+status:
+	curl -s --max-time 5 http://127.0.0.1:$(PORT)/status
+
+ping:
+	curl -s --max-time 5 http://127.0.0.1:$(PORT)/ping
 
 clean:
-	rm -rf $(BUILDDIR) /sdcard/art_test.apk
+	@mv $(BUILDDIR)/debug.keystore /tmp/art_debug.keystore 2>/dev/null || true
+	rm -rf $(BUILDDIR)
+	@mkdir -p $(BUILDDIR)
+	@mv /tmp/art_debug.keystore $(BUILDDIR)/debug.keystore 2>/dev/null || true
