@@ -25,9 +25,8 @@ fn mte_available() -> bool {
     has
 }
 
-/// Allocate an ELF execution stack with guard page and optional MTE tagging.
-/// Layout: [guard page (PROT_NONE)] [stack (RW [| PROT_MTE])]
-/// Returns pointer to the usable stack area (after the guard page).
+/// Allocate an ELF execution stack with guard page.
+/// PROT_MTE disabled — can cause MTE async SIGKILL on Android 16 untrusted_app.
 fn alloc_elf_stack(size: usize) -> *mut u8 {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
     let guard_size = page_size;
@@ -43,8 +42,9 @@ fn alloc_elf_stack(size: usize) -> *mut u8 {
     };
     if base == libc::MAP_FAILED { return std::ptr::null_mut(); }
     let stack_start = unsafe { (base as *mut u8).add(guard_size) };
-    let mut prot = libc::PROT_READ | libc::PROT_WRITE;
-    if mte_available() { prot |= 0x20; } // PROT_MTE
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    // PROT_MTE disabled — causes MTE async SIGKILL on Android 16 untrusted_app
+    // since ELF stack data is not properly tagged by the virtualized environment.
     let r = unsafe {
         libc::mmap(
             stack_start as *mut c_void,
@@ -67,17 +67,10 @@ pub fn free_elf_stack(ptr: *mut u8, size: usize) {
     unsafe { libc::munmap(ptr.sub(page_size) as *mut c_void, page_size + size); }
 }
 
-/// MTE-aware mprotect: preserves PROT_MTE on data pages.
-/// Does NOT add PROT_MTE to executable pages — code pages mapped by the
-/// dynamic linker don't have MTE tags; adding PROT_MTE via mprotect
-/// would return EINVAL and cause inline hooks to silently fail.
+/// mprotect wrapper — currently passes through without PROT_MTE.
+/// MTE tagging disabled to avoid async SIGKILL on Android 16 untrusted_app.
 fn mprotect_mte_aware(addr: usize, size: usize, base_prot: c_int) -> c_int {
-    let prot = if mte_available() && (base_prot & libc::PROT_EXEC == 0) {
-        base_prot | 0x20 // PROT_MTE
-    } else {
-        base_prot
-    };
-    unsafe { libc::mprotect(addr as *mut c_void, size, prot) }
+    unsafe { libc::mprotect(addr as *mut c_void, size, base_prot) }
 }
 
 struct DlHandle(*mut c_void);
