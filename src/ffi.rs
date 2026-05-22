@@ -151,16 +151,31 @@ pub extern "C" fn vproc_ffi_create_process(
         cvar.notify_all();
     }
 
-    // Wait for driver to process — use timeout to avoid deadlock if driver crashes
-    let (lock, cvar) = &*result;
-    let guard = lock.lock().unwrap();
-    let (guard, timeout) = cvar
-        .wait_timeout(guard, std::time::Duration::from_secs(5))
-        .unwrap();
-    if timeout.timed_out() {
-        return 0;
+    // Also wake the session's condvar so the driver thread exits its wait
+    {
+        let sessions = SESSIONS.lock().unwrap();
+        if let Some(session) = sessions.get(&session_id) {
+            let s = session.lock().unwrap();
+            // session lock is needed for the condvar, but we just need to notify
+            drop(s);
+        }
     }
-    (*guard).unwrap_or(0)
+
+    // Wait for driver to process — poll with sleep (condvar may not work under ART)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        {
+            let (lock, _) = &*result;
+            let guard = lock.lock().unwrap();
+            if guard.is_some() {
+                return guard.unwrap_or(0);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return 0; // timeout
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Drive the scheduler until the given vpid exits within a session.
@@ -199,15 +214,20 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
         s.wake.notify_all();
     }
 
-    let (lock, cvar) = &*result;
-    let guard = lock.lock().unwrap();
-    let (guard, timeout) = cvar
-        .wait_timeout(guard, std::time::Duration::from_secs(300))
-        .unwrap();
-    if timeout.timed_out() {
-        return -1;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        {
+            let (lock, _) = &*result;
+            let guard = lock.lock().unwrap();
+            if guard.is_some() {
+                return guard.unwrap_or(-1);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return -1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    (*guard).unwrap_or(-1)
 }
 
 /// Check if a virtual process exists within a session.
