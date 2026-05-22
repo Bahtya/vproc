@@ -67,9 +67,16 @@ pub fn free_elf_stack(ptr: *mut u8, size: usize) {
     unsafe { libc::munmap(ptr.sub(page_size) as *mut c_void, page_size + size); }
 }
 
-/// MTE-aware mprotect: preserves PROT_MTE on pages that had it.
+/// MTE-aware mprotect: preserves PROT_MTE on data pages.
+/// Does NOT add PROT_MTE to executable pages — code pages mapped by the
+/// dynamic linker don't have MTE tags; adding PROT_MTE via mprotect
+/// would return EINVAL and cause inline hooks to silently fail.
 fn mprotect_mte_aware(addr: usize, size: usize, base_prot: c_int) -> c_int {
-    let prot = if mte_available() { base_prot | 0x20 } else { base_prot };
+    let prot = if mte_available() && (base_prot & libc::PROT_EXEC == 0) {
+        base_prot | 0x20 // PROT_MTE
+    } else {
+        base_prot
+    };
     unsafe { libc::mprotect(addr as *mut c_void, size, prot) }
 }
 

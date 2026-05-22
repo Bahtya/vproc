@@ -51,6 +51,15 @@ static SESSIONS: LazyLock<Mutex<HashMap<u32, Arc<Mutex<Session>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Global default session ID — lazily initialized by compat FFI functions.
+/// This supports callers (like the ART test bridge) that use 6-arg calls
+/// without explicit session management.
+static DEFAULT_SESSION: LazyLock<u32> = LazyLock::new(|| vproc_ffi_create_session());
+
+fn ensure_default_session() -> u32 {
+    *DEFAULT_SESSION
+}
+
 // ---------------------------------------------------------------------------
 // FFI exports — per-session lifecycle
 // ---------------------------------------------------------------------------
@@ -205,6 +214,41 @@ pub extern "C" fn vproc_ffi_vpid_exists(session_id: u32, vpid: u32) -> c_int {
         }
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// FFI compat — 6-arg versions without session_id (for C bridges that
+// don't manage sessions explicitly). Auto-creates a default session.
+// ---------------------------------------------------------------------------
+
+/// Create a virtual process using the default session.
+/// Returns virtual PID (> 0) on success, 0 on error.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_create_process_default(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    stdin_fd: c_int,
+    stdout_fd: c_int,
+    stderr_fd: c_int,
+) -> u32 {
+    let sid = ensure_default_session();
+    vproc_ffi_create_process(sid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd)
+}
+
+/// Drive the scheduler until the given vpid exits using the default session.
+/// Returns the exit code, or -1 on error/timeout.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_run_until_exit_default(vpid: u32) -> c_int {
+    let sid = ensure_default_session();
+    vproc_ffi_run_until_exit(sid, vpid)
+}
+
+/// Check if a virtual process exists using the default session.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_vpid_exists_default(vpid: u32) -> c_int {
+    let sid = ensure_default_session();
+    vproc_ffi_vpid_exists(sid, vpid)
 }
 
 /// Create a temporary session, run a self-test, and return the result.

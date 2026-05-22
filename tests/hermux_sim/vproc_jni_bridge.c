@@ -117,9 +117,10 @@ static void vproc_ensure_loaded(void) {
     raw_log("[jni] vproc: dlopen succeeded, resolving symbols");
     vproc_install_crash_handler();
 
-    g_vproc_create_process = (vproc_create_process_fn)dlsym(lib, "vproc_ffi_create_process");
-    g_vproc_run_until_exit = (vproc_run_until_exit_fn)dlsym(lib, "vproc_ffi_run_until_exit");
-    g_vproc_vpid_exists = (vproc_vpid_exists_fn)dlsym(lib, "vproc_ffi_vpid_exists");
+    /* Use 6-arg compat versions (no session_id) */
+    g_vproc_create_process = (vproc_create_process_fn)dlsym(lib, "vproc_ffi_create_process_default");
+    g_vproc_run_until_exit = (vproc_run_until_exit_fn)dlsym(lib, "vproc_ffi_run_until_exit_default");
+    g_vproc_vpid_exists = (vproc_vpid_exists_fn)dlsym(lib, "vproc_ffi_vpid_exists_default");
 
     {
         char buf[256];
