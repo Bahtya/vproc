@@ -67,6 +67,10 @@ fn ensure_default_session() -> u32 {
 // FFI exports — per-session lifecycle
 // ---------------------------------------------------------------------------
 
+/// Debug progress marker for vproc_ffi_create_process
+#[no_mangle]
+static mut VPROC_CREATE_PROGRESS: u32 = 0;
+
 /// Create a new vproc session with its own driver thread and executor.
 /// Returns a session ID (> 0) on success, 0 on error.
 #[no_mangle]
@@ -123,10 +127,6 @@ pub extern "C" fn vproc_ffi_create_process(
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy().into_owned();
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
-
-    // Progress marker — readable from C via dlsym for debugging
-    #[no_mangle]
-    static mut VPROC_CREATE_PROGRESS: u32 = 0;
 
     unsafe { VPROC_CREATE_PROGRESS = 1; }
 

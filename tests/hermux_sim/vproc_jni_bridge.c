@@ -362,6 +362,7 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
     {
         void *lib = dlopen("libvproc.so", RTLD_NOW);
         if (lib) progress_ptr = (volatile uint32_t *)dlsym(lib, "VPROC_CREATE_PROGRESS");
+        ALOGI("createSubprocess: progress_ptr=%p", (void *)progress_ptr);
     }
 
     ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, g_vproc_session_id, g_vproc_create_process_s ? 1 : 0);
