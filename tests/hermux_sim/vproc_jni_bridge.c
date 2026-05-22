@@ -31,6 +31,10 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <android/log.h>
+
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, "vproc-jni", __VA_ARGS__)
+#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, "vproc-jni", __VA_ARGS__)
 
 /* ------------------------------------------------------------------
  * Raw I/O -- bypasses vproc interceptors
@@ -49,7 +53,8 @@ static ssize_t raw_read(int fd, void *buf, size_t count) {
 }
 
 static void raw_log(const char *msg) {
-    (void)msg; /* disabled — avoid potential seccomp/MTE issues in untrusted_app */
+    raw_write(2, msg, strlen(msg));
+    raw_write(2, "\n", 1);
 }
 
 /* ------------------------------------------------------------------
@@ -171,8 +176,10 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
 {
     (void)cls;
 
+    ALOGI("createSubprocess: enter");
     vproc_ensure_loaded();
     if (!g_vproc_create_process) {
+        ALOGE("createSubprocess: vproc not loaded");
         raw_log("[jni] vproc: not loaded");
         return -1;
     }
@@ -219,6 +226,7 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
 
     /* PTY setup — matches Hermux exactly */
     int ptm = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
+    ALOGI("createSubprocess: ptm=%d errno=%d", ptm, ptm < 0 ? errno : 0);
     if (ptm < 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "[jni] vproc: open /dev/ptmx failed: %s", strerror(errno));
@@ -269,6 +277,7 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
 
     /* Open PTY slave */
     int pts = open(devname, O_RDWR);
+    ALOGI("createSubprocess: pts=%d (%s) errno=%d", pts, devname, pts < 0 ? errno : 0);
     if (pts < 0) {
         raw_log("[jni] vproc: open PTY slave failed");
         close(ptm);
@@ -299,6 +308,7 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         raw_log(buf);
     }
     uint32_t vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
+    ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
     {
         char buf[64];
         snprintf(buf, sizeof(buf), "[jni] vproc: vproc_ffi_create_process returned vpid=%u", vpid);
@@ -347,15 +357,13 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_waitFor(
     JNIEnv *env, jclass cls, jint pid)
 {
     (void)env; (void)cls;
+    ALOGI("waitFor: enter vpid=%d", pid);
     vproc_ensure_loaded();
     if (g_vproc_vpid_exists && g_vproc_run_until_exit &&
         g_vproc_vpid_exists((uint32_t)pid)) {
-        {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "[jni] vproc: waitFor vpid=%d — calling run_until_exit", pid);
-            raw_log(buf);
-        }
+        ALOGI("waitFor: calling run_until_exit vpid=%d", pid);
         int code = g_vproc_run_until_exit((uint32_t)pid);
+        ALOGI("waitFor: run_until_exit returned %d", code);
         {
             char buf[64];
             snprintf(buf, sizeof(buf), "[jni] vproc: run_until_exit(vpid=%d) returned %d", pid, code);
