@@ -5,19 +5,22 @@ import java.util.ArrayList;
 import java.util.concurrent.*;
 
 /**
- * Simulates Hermux's TerminalSession flow:
+ * Matches Hermux's TerminalSession flow exactly:
  *   Java -> JNI -> vproc FFI -> driver thread -> minicoro coroutine -> ELF shell
  *
- * Tests both sh and bash via PTY, with crash recovery for SIGSEGV detection.
- * Issue #28: Hermux bash session crash reproduction on Cortex-A710/A715/X3.
+ * Uses Hermux's exact termux.c integration:
+ *   - createSubprocess (returns ptm fd, like Hermux)
+ *   - waitFor (matches Hermux's waitFor)
+ *   - Persistent InputReader/TermSessionWaiter threads
+ *   - Hermux shell paths and environment variables
  *
- * Build: make -f Makefile.java
- * Run:   make -f Makefile.java test
+ * Issue #29: Hermux v0.3.0 crash reproduction on vivo V2419A.
  */
 public class TestTermuxSession {
 
-    static final String SHELL = "/data/data/com.termux/files/usr/bin/sh";
-    static final String BASH  = "/data/data/com.termux/files/usr/bin/bash";
+    // Hermux's actual shell paths
+    static final String SHELL = "/data/data/com.hermux/files/usr/bin/sh";
+    static final String BASH  = "/data/data/com.hermux/files/usr/bin/bash";
 
     // ART: untrusted_app 无法访问 Termux 数据目录，用 APK 内嵌的 shell
     static String getShellPath() {
@@ -98,7 +101,18 @@ public class TestTermuxSession {
         libsLoaded = true;
     }
 
-    // JNI native methods
+    // --- Hermux-matching native methods ---
+
+    // Matches Hermux's JNI.createSubprocess exactly
+    native int createSubprocess(String cmd, String cwd,
+                                String[] args, String[] envVars,
+                                int[] processIdArray,
+                                int rows, int columns, int cellWidth, int cellHeight);
+    // Matches Hermux's JNI.waitFor
+    native int waitFor(int pid);
+    native void setPtyWindowSize(int fd, int rows, int cols, int cellWidth, int cellHeight);
+
+    // --- Legacy native methods (for backward compat) ---
     native int[] openPty();
     native void closeFd(int fd);
     native int readFd(int fd, byte[] buf, int off, int len);
@@ -107,15 +121,10 @@ public class TestTermuxSession {
                              int stdinFd, int stdoutFd, int stderrFd);
     native int runUntilExit(int vpid);
     native void installCrashRecovery();
-    // Returns int[5]: {vpid, crashed(0/1), fault_addr_low, fault_addr_high, crash_stage}
     native int[] createProcessWithRecovery(String path, String[] argv, String[] envp,
                                            int stdinFd, int stdoutFd, int stderrFd);
     native String[] detectDeviceInfo();
-
-    // Hot-reload: load vproc from custom path
     static native boolean nativeLoadVproc(String path);
-
-    // Diagnostic native methods for ART debugging
     native String diagPathAccess(String path);
     native String diagDlopen(String path);
     native String[] diagDlIterate();
@@ -176,6 +185,77 @@ public class TestTermuxSession {
             if (!list.contains(e)) list.add(e);
         }
         return list.toArray(new String[0]);
+    }
+
+    /**
+     * Run a session matching Hermux's TerminalSession flow exactly:
+     *   createSubprocess → InputReader thread → waitFor thread → join
+     *
+     * This mirrors:
+     *   TerminalSession() → JNI.createSubprocess()
+     *   TerminalSession$1.run() → processOnStdoutRead() (read from ptm)
+     *   TerminalSession$2.run() → JNI.waitFor(pid) (wait for exit)
+     */
+    Result runHermuxSession(String shellPath, String cmd) throws Exception {
+        String cwd = "/data/data/com.hermux/files/home";
+        String[] argv = {shellPath, "-c", cmd};
+        String[] envp = buildEnvp();
+
+        // Matches TerminalSession.java: JNI.createSubprocess(...)
+        int[] pidArr = new int[1];
+        int ptm = createSubprocess(shellPath, cwd, argv, envp, pidArr, 24, 80, 0, 0);
+        if (ptm < 0) {
+            System.err.println("    createSubprocess failed (ptm=" + ptm + ")");
+            return new Result(-1, "", false, 0, 0);
+        }
+        int vpid = pidArr[0];
+        System.err.println("    createSubprocess: ptm=" + ptm + " vpid=" + vpid);
+
+        // Matches TerminalSession.java: InputReader thread
+        final StringBuilder output = new StringBuilder();
+        final byte[] buf = new byte[4096];
+        Thread inputReader = new Thread(() -> {
+            try {
+                while (true) {
+                    int n = readFd(ptm, buf, 0, buf.length);
+                    if (n <= 0) break;
+                    output.append(new String(buf, 0, n, "UTF-8"));
+                }
+            } catch (Exception e) {
+                // Expected when ptm is closed
+            }
+        }, "InputReader-vpid" + vpid);
+        inputReader.setDaemon(true);
+
+        // Matches TerminalSession.java: TermSessionWaiter thread
+        final int[] exitCodeHolder = new int[]{-2};
+        Thread waiter = new Thread(() -> {
+            try {
+                int code = waitFor(vpid);
+                exitCodeHolder[0] = code;
+            } catch (Exception e) {
+                System.err.println("    waitFor exception: " + e);
+            }
+        }, "TermSessionWaiter-vpid" + vpid);
+        waiter.setDaemon(true);
+
+        // Start both threads (matches Hermux's process creation flow)
+        inputReader.start();
+        waiter.start();
+
+        // Wait for process to exit (with timeout)
+        waiter.join(10000);
+        if (waiter.isAlive()) {
+            System.err.println("    TIMEOUT: waitFor did not return in 10s");
+            waiter.interrupt();
+        }
+
+        // Give inputReader a moment to finish reading
+        Thread.sleep(100);
+        closeFd(ptm);
+        inputReader.join(2000);
+
+        return new Result(exitCodeHolder[0], output.toString(), false, 0, 0);
     }
 
     void test(String name, boolean condition) {
@@ -362,6 +442,41 @@ public class TestTermuxSession {
         System.err.println();
     }
 
+    // --- Hermux flow test cases ---
+
+    void testHermuxShEcho() throws Exception {
+        String sh = getShellPath();
+        Result r = runHermuxSession(sh, "echo hermux_sh");
+        test("hermux flow: sh echo (createSubprocess+waitFor)",
+            r.exitCode == 0 && r.output.contains("hermux_sh"));
+        if (r.exitCode != 0) {
+            System.err.println("    exit=" + r.exitCode + " output=" +
+                (r.output.length() > 200 ? r.output.substring(0, 200) + "..." : r.output));
+        }
+    }
+
+    void testHermuxBashEcho() throws Exception {
+        String bash = getBashPath();
+        Result r = runHermuxSession(bash, "echo hermux_bash");
+        test("hermux flow: bash echo (createSubprocess+waitFor)",
+            r.exitCode == 0 && r.output.contains("hermux_bash"));
+        if (r.exitCode != 0) {
+            System.err.println("    exit=" + r.exitCode + " output=" +
+                (r.output.length() > 200 ? r.output.substring(0, 200) + "..." : r.output));
+        }
+    }
+
+    void testHermuxBashPipe() throws Exception {
+        String bash = getBashPath();
+        Result r = runHermuxSession(bash, "echo hello_pipe | cat");
+        test("hermux flow: bash pipe (createSubprocess+waitFor)",
+            r.exitCode == 0 && r.output.contains("hello_pipe"));
+        if (r.exitCode != 0) {
+            System.err.println("    exit=" + r.exitCode + " output=" +
+                (r.output.length() > 200 ? r.output.substring(0, 200) + "..." : r.output));
+        }
+    }
+
     // --- Test cases ---
 
     void testDeviceInfo() {
@@ -526,6 +641,13 @@ public class TestTermuxSession {
 
         // ART diagnostics — isolate which step of createProcess fails
         t.runDiagnostics();
+
+        // --- Hermux flow tests (matches termux.c exactly) ---
+        System.err.println("=== Hermux Flow Tests (createSubprocess + waitFor) ===");
+        t.testHermuxShEcho();
+        t.testHermuxBashEcho();
+        t.testHermuxBashPipe();
+        System.err.println();
 
         // sh baseline tests
         System.err.println("--- sh baseline ---");
