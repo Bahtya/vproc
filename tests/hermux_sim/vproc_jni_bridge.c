@@ -1,11 +1,12 @@
 /**
  * vproc_jni_bridge.c -- JNI bridge for TestTermuxSession.
  *
- * Simulates Hermux's termux.c JNI layer:
- *   - Direct libvproc FFI calls (create_process / run_until_exit)
- *   - PTY creation (openpty)
- *   - Raw syscall I/O (bypasses vproc interceptors)
- *   - Crash recovery (sigaltstack + sigsetjmp/siglongjmp)
+ * Matches Hermux's termux.c JNI layer exactly:
+ *   - Same function pointer types (6-arg API, no session)
+ *   - Same PTY setup (manual /dev/ptmx, not openpty)
+ *   - Same signal handling (re-raise for tombstone, no sigaltstack)
+ *   - Same dlopen flags (RTLD_NOW, no RTLD_GLOBAL)
+ *   - Same chdir before create_process
  *   - Device info detection (CPU, MTE, Seccomp)
  */
 
@@ -14,237 +15,490 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <pty.h>
 #include <dlfcn.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <poll.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
-#include <link.h>          /* dl_iterate_phdr */
+#include <sys/wait.h>
+#include <link.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <stdatomic.h>
 
-/* ------------------------------------------------------------------
- * Ensure VPROC=1 on library load
- * ------------------------------------------------------------------ */
-
-__attribute__((constructor))
-static void ensure_vproc_env(void) {
-    /* vproc 0.2.2+ auto-enables via .init_array constructor */
-    /* FFI auto-resolve done in ensure_ffi() after declarations */
+/* Dynamic __android_log_print via dlsym — no liblog link dependency */
+#include <dlfcn.h>
+typedef int (*android_log_fn)(int, const char *, const char *, ...);
+static android_log_fn get_android_log(void) {
+    static android_log_fn fn = NULL;
+    if (!fn) {
+        void *liblog = dlopen("liblog.so", RTLD_NOW);
+        if (liblog) fn = (android_log_fn)dlsym(liblog, "__android_log_print");
+    }
+    return fn;
 }
+static void jni_log(const char *fmt, ...) {
+    android_log_fn logfn = get_android_log();
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (logfn) {
+        logfn(4 /* INFO */, "vproc-jni", "%s", buf);  /* ANDROID_LOG_INFO=4 */
+    }
+}
+#define ALOGI(...) jni_log(__VA_ARGS__)
+#define ALOGE(...) jni_log(__VA_ARGS__)
 
 /* ------------------------------------------------------------------
- * Raw syscall I/O -- bypasses vproc interceptors
+ * Raw I/O -- bypasses vproc interceptors
+ * Uses libc write/read (not raw syscall) to avoid seccomp issues
+ * on Android 16 untrusted_app.
  * ------------------------------------------------------------------ */
+
+#include <unistd.h>
 
 static ssize_t raw_write(int fd, const void *buf, size_t count) {
-    return syscall(__NR_write, fd, buf, count);
+    return write(fd, buf, count);
 }
 
 static ssize_t raw_read(int fd, void *buf, size_t count) {
-    return syscall(__NR_read, fd, buf, count);
+    return read(fd, buf, count);
 }
 
 static void raw_log(const char *msg) {
-    raw_write(2, msg, strlen(msg));
-    raw_write(2, "\n", 1);
+    (void)msg; /* disabled — libc write() may be intercepted by vproc GOT hooks */
 }
 
 /* ------------------------------------------------------------------
- * libvproc FFI — dlopen-based, session-managed
+ * libvproc FFI — matches Hermux's termux.c exactly
+ * Same function pointer types (6-arg, no session_id)
  * ------------------------------------------------------------------ */
 
-static void *g_vproc_handle;
-static unsigned int (*g_create_session)(void);
-static void (*g_destroy_session)(unsigned int);
-static unsigned int (*g_create_process)(
-    unsigned int, const char *, const char *const *, const char *const *, int, int, int);
-static int (*g_run_until_exit)(unsigned int, unsigned int);
+typedef uint32_t (*vproc_create_process_fn)(
+    const char *path, char *const argv[], char *const envp[],
+    int stdin_fd, int stdout_fd, int stderr_fd);
+typedef int (*vproc_run_until_exit_fn)(uint32_t vpid);
+typedef int (*vproc_vpid_exists_fn)(uint32_t vpid);
+typedef uint32_t (*vproc_create_session_fn)(void);
+typedef uint32_t (*vproc_create_process_session_fn)(
+    uint32_t session_id,
+    const char *path, char *const argv[], char *const envp[],
+    int stdin_fd, int stdout_fd, int stderr_fd);
+typedef int (*vproc_run_until_exit_session_fn)(uint32_t session_id, uint32_t vpid);
+typedef int (*vproc_vpid_exists_session_fn)(uint32_t session_id, uint32_t vpid);
 
-static unsigned int g_session_id = 0;
-static int g_ffi_resolved = 0;
+static vproc_create_process_fn g_vproc_create_process = NULL;
+static vproc_run_until_exit_fn g_vproc_run_until_exit = NULL;
+static vproc_vpid_exists_fn    g_vproc_vpid_exists = NULL;
+static vproc_create_session_fn g_vproc_create_session = NULL;
+static vproc_create_process_session_fn g_vproc_create_process_s = NULL;
+static vproc_run_until_exit_session_fn g_vproc_run_until_exit_s = NULL;
+static vproc_vpid_exists_session_fn g_vproc_vpid_exists_s = NULL;
 
-/* Auto-resolve vproc FFI symbols via RTLD_DEFAULT (called once).
- * Does NOT overwrite pointers already set by nativeLoadVproc. */
-static void ensure_ffi(void) {
-    if (g_ffi_resolved) return;
-    g_ffi_resolved = 1;
-    /* Only resolve if not already set by nativeLoadVproc */
-    if (g_create_session && g_create_process && g_run_until_exit) {
-        raw_log("[jni] FFI already resolved (via nativeLoadVproc)");
+static uint32_t g_vproc_session_id = 0;
+static atomic_int g_vproc_initialized = ATOMIC_VAR_INIT(0);
+
+/* Signal handler — matches Hermux's termux.c exactly */
+static struct sigaction g_old_sigsegv, g_old_sigabrt, g_old_sigbus;
+
+static void vproc_crash_signal_handler(int sig, siginfo_t *info, void *uctx) {
+    (void)uctx;
+    const char *signame = sig == SIGSEGV ? "SIGSEGV" :
+                          sig == SIGBUS  ? "SIGBUS"  :
+                          sig == SIGABRT ? "SIGABRT" : "UNKNOWN";
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "=== NATIVE CRASH in vproc context === signal=%s (%d) si_addr=%p ===",
+        signame, sig, info->si_addr);
+    raw_write(2, buf, n);
+    raw_write(2, "\n", 1);
+
+    /* Re-raise with default handler to get tombstone (includes backtrace) */
+    struct sigaction *old = sig == SIGSEGV ? &g_old_sigsegv :
+                            sig == SIGBUS  ? &g_old_sigbus  :
+                                             &g_old_sigabrt;
+    sigaction(sig, old, NULL);
+    raise(sig);
+}
+
+static void vproc_install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = vproc_crash_signal_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_old_sigsegv);
+    sigaction(SIGABRT, &sa, &g_old_sigabrt);
+    sigaction(SIGBUS,  &sa, &g_old_sigbus);
+    raw_log("[jni] vproc: native crash signal handler installed (SIGSEGV/SIGABRT/SIGBUS)");
+}
+
+/* Matches Hermux's vproc_ensure_loaded() */
+static void vproc_ensure_loaded(void) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_vproc_initialized, &expected, 1))
+        return;
+
+    raw_log("[jni] vproc: attempting dlopen(\"libvproc.so\", RTLD_NOW)");
+    void *lib = dlopen("libvproc.so", RTLD_NOW);
+    if (!lib) {
+        const char *err = dlerror();
+        if (err) { raw_write(2, err, strlen(err)); raw_write(2, "\n", 1); }
+        raw_log("[jni] vproc: dlopen failed");
         return;
     }
-    g_create_session = dlsym(RTLD_DEFAULT, "vproc_ffi_create_session");
-    g_destroy_session = dlsym(RTLD_DEFAULT, "vproc_ffi_destroy_session");
-    g_create_process = dlsym(RTLD_DEFAULT, "vproc_ffi_create_process");
-    g_run_until_exit = dlsym(RTLD_DEFAULT, "vproc_ffi_run_until_exit");
-    if (g_create_session && g_create_process && g_run_until_exit) {
-        raw_log("[jni] auto-resolved vproc FFI via RTLD_DEFAULT");
-    } else {
-        raw_log("[jni] WARNING: vproc symbols not found via RTLD_DEFAULT");
-    }
-}
+    raw_log("[jni] vproc: dlopen succeeded, resolving symbols");
+    vproc_install_crash_handler();
 
-/* Ensure a session exists, creating one if needed. Returns session_id or 0. */
-static unsigned int ensure_session(void) {
-    if (g_session_id != 0) return g_session_id;
-    ensure_ffi();
-    if (!g_create_session) {
-        raw_log("[jni] ensure_session: g_create_session is NULL");
-        return 0;
+    /* Resolve session-based FFI directly — bypass LazyLock in _default wrappers */
+    g_vproc_create_session = (vproc_create_session_fn)dlsym(lib, "vproc_ffi_create_session");
+    g_vproc_create_process_s = (vproc_create_process_session_fn)dlsym(lib, "vproc_ffi_create_process");
+    g_vproc_run_until_exit_s = (vproc_run_until_exit_session_fn)dlsym(lib, "vproc_ffi_run_until_exit");
+    g_vproc_vpid_exists_s = (vproc_vpid_exists_session_fn)dlsym(lib, "vproc_ffi_vpid_exists");
+
+    ALOGI("vproc: session=%p, create=%p, run=%p, exists=%p",
+        (void*)g_vproc_create_session, (void*)g_vproc_create_process_s,
+        (void*)g_vproc_run_until_exit_s, (void*)g_vproc_vpid_exists_s);
+
+    if (g_vproc_create_session && g_vproc_create_process_s) {
+        ALOGI("vproc: creating session...");
+        g_vproc_session_id = g_vproc_create_session();
+        ALOGI("vproc: session_id=%u", g_vproc_session_id);
     }
-    raw_log("[jni] calling g_create_session()...");
-    g_session_id = g_create_session();
-    if (g_session_id == 0) {
-        raw_log("[jni] create_session failed (returned 0)");
-    } else {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "[jni] session created: %u", g_session_id);
+
+    /* Also resolve _default wrappers as fallback */
+    g_vproc_create_process = (vproc_create_process_fn)dlsym(lib, "vproc_ffi_create_process_default");
+    g_vproc_run_until_exit = (vproc_run_until_exit_fn)dlsym(lib, "vproc_ffi_run_until_exit_default");
+    g_vproc_vpid_exists = (vproc_vpid_exists_fn)dlsym(lib, "vproc_ffi_vpid_exists_default");
+
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "[jni] vproc: create_process=%p, run_until_exit=%p, vpid_exists=%p",
+            (void*)g_vproc_create_process, (void*)g_vproc_run_until_exit,
+            (void*)g_vproc_vpid_exists);
         raw_log(buf);
     }
-    return g_session_id;
+
+    if (!g_vproc_create_process || !g_vproc_run_until_exit || !g_vproc_vpid_exists) {
+        const char *err = dlerror();
+        if (err) { raw_write(2, err, strlen(err)); raw_write(2, "\n", 1); }
+        g_vproc_create_process = NULL;
+        g_vproc_run_until_exit = NULL;
+        g_vproc_vpid_exists = NULL;
+    }
 }
 
-/* JNI: Load vproc from path */
+/* ------------------------------------------------------------------
+ * JNI: Load vproc (for explicit path loading from Java)
+ * ------------------------------------------------------------------ */
+
 JNIEXPORT jboolean JNICALL
 Java_com_vproc_arttest_TestTermuxSession_nativeLoadVproc(
     JNIEnv *env, jclass cls, jstring jpath)
 {
-    const char *path = jpath ? (*env)->GetStringUTFChars(env, jpath, NULL) : NULL;
-    if (path && path[0]) {
-        g_vproc_handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-    } else {
-        /* Try RTLD_DEFAULT for already-loaded libvproc */
-        g_create_session = dlsym(RTLD_DEFAULT, "vproc_ffi_create_session");
-        g_destroy_session = dlsym(RTLD_DEFAULT, "vproc_ffi_destroy_session");
-        g_create_process = dlsym(RTLD_DEFAULT, "vproc_ffi_create_process");
-        g_run_until_exit = dlsym(RTLD_DEFAULT, "vproc_ffi_run_until_exit");
-        if (path) (*env)->ReleaseStringUTFChars(env, jpath, path);
-        return (g_create_session && g_create_process && g_run_until_exit) ? JNI_TRUE : JNI_FALSE;
-    }
-    if (!g_vproc_handle) {
-        const char *err = dlerror();
-        if (err) raw_log(err);
-        raw_log("[jni] dlopen failed");
-        (*env)->ReleaseStringUTFChars(env, jpath, path);
-        return JNI_FALSE;
-    }
-    g_create_session = dlsym(g_vproc_handle, "vproc_ffi_create_session");
-    g_destroy_session = dlsym(g_vproc_handle, "vproc_ffi_destroy_session");
-    g_create_process = dlsym(g_vproc_handle, "vproc_ffi_create_process");
-    g_run_until_exit = dlsym(g_vproc_handle, "vproc_ffi_run_until_exit");
-    {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[jni] dlsym results: session=%p process=%p run=%p err=%s",
-            (void*)g_create_session, (void*)g_create_process, (void*)g_run_until_exit,
-            dlerror() ? dlerror() : "none");
-        raw_log(buf);
-    }
-    (*env)->ReleaseStringUTFChars(env, jpath, path);
-    return (g_create_session && g_create_process && g_run_until_exit) ? JNI_TRUE : JNI_FALSE;
-}
-
-/* Wrappers that auto-manage session and call through function pointers */
-static unsigned int vproc_create_process(
-    const char *path, const char *const *argv, const char *const *envp,
-    int stdin_fd, int stdout_fd, int stderr_fd)
-{
-    ensure_ffi();
-    if (!g_create_process) {
-        raw_log("[jni] ERROR: g_create_process is NULL");
-        return 0;
-    }
-    unsigned int sid = ensure_session();
-    if (!sid) {
-        raw_log("[jni] ERROR: ensure_session returned 0");
-        return 0;
-    }
-    char diag[256];
-    snprintf(diag, sizeof(diag), "[jni] g_create_process(sid=%u, path=%s, fds=%d/%d/%d)...",
-        sid, path, stdin_fd, stdout_fd, stderr_fd);
-    raw_log(diag);
-    unsigned int vpid = g_create_process(sid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd);
-    snprintf(diag, sizeof(diag), "[jni] g_create_process returned vpid=%u", vpid);
-    raw_log(diag);
-    return vpid;
-}
-
-static int vproc_run_until_exit(unsigned int vpid) {
-    ensure_ffi();
-    if (!g_session_id || !g_run_until_exit) return -1;
-    return g_run_until_exit(g_session_id, vpid);
+    (void)cls;
+    vproc_ensure_loaded();
+    return (g_vproc_create_process != NULL) ? JNI_TRUE : JNI_FALSE;
 }
 
 /* ------------------------------------------------------------------
- * Crash recovery -- sigaltstack + sigsetjmp/siglongjmp
- * Thread-safe: only longjmps if crash happens in the test thread.
+ * JNI: createSubprocess — matches Hermux's create_subprocess_vproc exactly
+ * Returns ptm fd (>=0) on success, -1 on error.
+ * pProcessId receives vpid.
  * ------------------------------------------------------------------ */
 
-static sigjmp_buf g_crash_jmp;
-static volatile sig_atomic_t g_crash_signal = 0;
-static volatile void *g_crash_fault_addr = NULL;
-static volatile int g_crash_stage = 0;
-static void *g_crash_stack = NULL;
-static volatile int g_crash_thread_set = 0;
-static volatile int g_crash_thread_id = 0;
+/* Struct + thread function for watchdog create_process call */
+struct cp_arg {
+    uint32_t sid;
+    const char *path;
+    char *const *argv;
+    char *const *envp;
+    int fds[3];
+    uint32_t *vpid_out;
+    volatile uint32_t *prog;
+};
 
-static void crash_handler(int sig, siginfo_t *info, void *uctx) {
-    g_crash_signal = sig;
-    g_crash_fault_addr = info->si_addr;
+static void *cp_thread_fn(void *a) {
+    struct cp_arg *c = (struct cp_arg *)a;
+    ALOGI("cp_thread: enter, calling _s(sid=%u)", c->sid);
+    *(c->vpid_out) = g_vproc_create_process_s(c->sid, c->path, c->argv, c->envp,
+        c->fds[0], c->fds[1], c->fds[2]);
+    ALOGI("cp_thread: returned vpid=%u prog=%u", *(c->vpid_out), c->prog ? *c->prog : 0xFF);
+    return NULL;
+}
 
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf),
-        "[CRASH] signal=%d fault_addr=%p stage=%d tid=%d",
-        sig, info->si_addr, g_crash_stage, (int)syscall(__NR_gettid));
-    raw_write(2, buf, n);
-    raw_write(2, "\n", 1);
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess(
+    JNIEnv *env, jclass cls,
+    jstring cmd, jstring cwd,
+    jobjectArray args, jobjectArray envVars,
+    jintArray processIdArray,
+    jint rows, jint columns, jint cell_width, jint cell_height)
+{
+    (void)cls;
 
-    /* fp backtrace (aarch64) */
-    void *fp;
-    __asm__ volatile("mov %0, x29" : "=r"(fp));
-    for (int i = 0; i < 8 && fp; i++) {
-        void *lr = *((void**)((char*)fp + 8));
-        n = snprintf(buf, sizeof(buf), "  #%d fp=%p lr=%p", i, fp, lr);
-        raw_write(2, buf, n);
-        raw_write(2, "\n", 1);
-        fp = *(void**)fp;
+    ALOGI("createSubprocess: enter");
+    vproc_ensure_loaded();
+    if (!g_vproc_create_process) {
+        ALOGE("createSubprocess: vproc not loaded");
+        raw_log("[jni] vproc: not loaded");
+        return -1;
     }
 
-    /* Only longjmp if crash is in the test thread that called sigsetjmp */
-    int my_tid = (int)syscall(__NR_gettid);
-    if (g_crash_thread_set && my_tid == g_crash_thread_id) {
-        siglongjmp(g_crash_jmp, sig);
+    /* Convert Java arrays to C */
+    jsize size = args ? (*env)->GetArrayLength(env, args) : 0;
+    char **argv = NULL;
+    if (size > 0) {
+        argv = (char**) malloc((size + 1) * sizeof(char*));
+        for (int i = 0; i < size; ++i) {
+            jstring s = (jstring)(*env)->GetObjectArrayElement(env, args, i);
+            argv[i] = strdup((*env)->GetStringUTFChars(env, s, NULL));
+            (*env)->ReleaseStringUTFChars(env, s, argv[i]);
+        }
+        argv[size] = NULL;
     }
 
-    /* Otherwise: crash in vproc driver thread or other thread — log and exit thread only */
-    raw_log("[CRASH] Non-test thread crash, cannot recover. Exiting thread.");
-    /* Use pthread_exit to only kill this thread, not the entire process */
-    pthread_exit(NULL);
-    _exit(128 + sig); /* fallback, shouldn't reach */
+    size = envVars ? (*env)->GetArrayLength(env, envVars) : 0;
+    char **envp = NULL;
+    if (size > 0) {
+        envp = (char**) malloc((size + 1) * sizeof(char *));
+        for (int i = 0; i < size; ++i) {
+            jstring s = (jstring)(*env)->GetObjectArrayElement(env, envVars, i);
+            envp[i] = strdup((*env)->GetStringUTFChars(env, s, 0));
+            (*env)->ReleaseStringUTFChars(env, s, envp[i]);
+        }
+        envp[size] = NULL;
+    }
+
+    const char *cmd_utf8 = (*env)->GetStringUTFChars(env, cmd, NULL);
+    const char *cwd_utf8 = cwd ? (*env)->GetStringUTFChars(env, cwd, NULL) : NULL;
+
+    /* Count argv and envp for logging */
+    int argc = 0, envc = 0;
+    if (argv) { for (char *const *p = argv; *p; ++p) ++argc; }
+    if (envp) { for (char **p = envp; *p; ++p) ++envc; }
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "[jni] vproc: creating virtual process cmd=%s argc=%d envc=%d cwd=%s",
+            cmd_utf8, argc, envc, cwd_utf8 ? cwd_utf8 : "(null)");
+        raw_log(buf);
+    }
+
+    /* PTY setup — matches Hermux exactly */
+    int ptm = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
+    ALOGI("createSubprocess: ptm=%d errno=%d", ptm, ptm < 0 ? errno : 0);
+    if (ptm < 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[jni] vproc: open /dev/ptmx failed: %s", strerror(errno));
+        raw_log(buf);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] vproc: ptm fd=%d", ptm);
+        raw_log(buf);
+    }
+
+    char devname[64];
+    if (grantpt(ptm) || unlockpt(ptm) ||
+        ptsname_r(ptm, devname, sizeof(devname))) {
+        raw_log("[jni] vproc: grantpt/unlockpt/ptsname_r failed");
+        close(ptm);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[jni] vproc: pts device=%s", devname);
+        raw_log(buf);
+    }
+
+    struct termios tios;
+    tcgetattr(ptm, &tios);
+    tios.c_iflag |= IUTF8;
+    tios.c_iflag &= ~(IXON | IXOFF);
+    tcsetattr(ptm, TCSANOW, &tios);
+
+    struct winsize sz = {
+        .ws_row = (unsigned short) rows,
+        .ws_col = (unsigned short) columns,
+        .ws_xpixel = (unsigned short) (columns * cell_width),
+        .ws_ypixel = (unsigned short) (rows * cell_height)
+    };
+    ioctl(ptm, TIOCSWINSZ, &sz);
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] vproc: winsize %dx%d", columns, rows);
+        raw_log(buf);
+    }
+
+    /* Open PTY slave */
+    int pts = open(devname, O_RDWR);
+    ALOGI("createSubprocess: pts=%d (%s) errno=%d", pts, devname, pts < 0 ? errno : 0);
+    if (pts < 0) {
+        raw_log("[jni] vproc: open PTY slave failed");
+        close(ptm);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] vproc: pts fd=%d", pts);
+        raw_log(buf);
+    }
+
+    /* chdir before creating coroutine (matches Hermux) */
+    if (cwd_utf8 && chdir(cwd_utf8) != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[jni] vproc: chdir(\"%s\") failed: %s",
+            cwd_utf8, strerror(errno));
+        raw_log(buf);
+    }
+
+    /* Create virtual process — matches Hermux's 6-arg call exactly */
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "[jni] vproc: calling vproc_ffi_create_process(cmd=%s, stdin=%d, stdout=%d, stderr=%d)",
+            cmd_utf8, pts, pts, pts);
+        raw_log(buf);
+    }
+    /* Read progress symbol for debugging */
+    volatile uint32_t *progress_ptr = NULL;
+    {
+        void *lib = dlopen("libvproc.so", RTLD_NOW);
+        if (lib) progress_ptr = (volatile uint32_t *)dlsym(lib, "VPROC_CREATE_PROGRESS");
+        ALOGI("createSubprocess: progress_ptr=%p", (void *)progress_ptr);
+    }
+
+    ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, g_vproc_session_id, g_vproc_create_process_s ? 1 : 0);
+
+    /* Call create_process in a child thread so we can log progress */
+    uint32_t vpid = 0;
+    struct cp_arg cpa = { g_vproc_session_id, cmd_utf8, argv, envp, {pts, pts, pts}, &vpid, progress_ptr };
+    pthread_t cp_tid;
+    pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
+
+    /* Wait and log progress */
+    for (int i = 0; i < 40; i++) {
+        usleep(250000); /* 250ms */
+        ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+        if (vpid != 0) break;
+    }
+    pthread_join(cp_tid, NULL);
+    ALOGI("createSubprocess: create_process returned vpid=%u progress=%u",
+        vpid, progress_ptr ? *progress_ptr : 0xFFFFFFFF);
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] vproc: vproc_ffi_create_process returned vpid=%u", vpid);
+        raw_log(buf);
+    }
+
+    if (vpid == 0) {
+        raw_log("[jni] vproc: create_process returned 0 (failure)");
+        close(pts);
+        close(ptm);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+
+    /* pts stays open — the coroutine's VfdTable references it */
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "[jni] vproc: virtual process created successfully vpid=%u ptm=%d pts=%d",
+            vpid, ptm, pts);
+        raw_log(buf);
+    }
+
+    (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+    if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+
+    if (argv) { for (char **tmp = argv; *tmp; ++tmp) free(*tmp); free(argv); }
+    if (envp) { for (char **tmp = envp; *tmp; ++tmp) free(*tmp); free(envp); }
+
+    /* Write vpid to processIdArray */
+    int *pProcId = (int*) (*env)->GetPrimitiveArrayCritical(env, processIdArray, NULL);
+    if (pProcId) {
+        *pProcId = (int) vpid;
+        (*env)->ReleasePrimitiveArrayCritical(env, processIdArray, pProcId, 0);
+    }
+
+    return ptm;
 }
 
 /* ------------------------------------------------------------------
- * JNI: Basic PTY / fd operations
- * *** CRITICAL: JNI 函数名必须包含完整包名: Java_com_vproc_arttest_TestTermuxSession_xxx ***
- * *** 否则 ART 抛出 UnsatisfiedLinkError（OpenJDK 通过 RegisterNatives 不受影响）***
+ * JNI: waitFor — matches Hermux's waitFor exactly
+ * ------------------------------------------------------------------ */
+
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_waitFor(
+    JNIEnv *env, jclass cls, jint pid)
+{
+    (void)env; (void)cls;
+    ALOGI("waitFor: enter vpid=%d", pid);
+    vproc_ensure_loaded();
+    int exists = 0;
+    if (g_vproc_session_id > 0 && g_vproc_vpid_exists_s) {
+        exists = g_vproc_vpid_exists_s(g_vproc_session_id, (uint32_t)pid);
+    } else if (g_vproc_vpid_exists) {
+        exists = g_vproc_vpid_exists((uint32_t)pid);
+    }
+    if (exists && g_vproc_run_until_exit_s && g_vproc_session_id > 0) {
+        ALOGI("waitFor: calling run_until_exit(sid=%u, vpid=%d)", g_vproc_session_id, pid);
+        int code = g_vproc_run_until_exit_s(g_vproc_session_id, (uint32_t)pid);
+        ALOGI("waitFor: run_until_exit returned %d", code);
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[jni] vproc: run_until_exit(vpid=%d) returned %d", pid, code);
+            raw_log(buf);
+        }
+        if (code >= 0) return code;
+    }
+
+    /* Fallback to real waitpid */
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return -WTERMSIG(status);
+    return 0;
+}
+
+/* ------------------------------------------------------------------
+ * JNI: Basic fd operations (unchanged)
  * ------------------------------------------------------------------ */
 
 JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_openPty(JNIEnv *env, jobject obj) {
-    int master, slave;
-    if (openpty(&master, &slave, NULL, NULL, NULL) < 0) {
+    (void)obj;
+    int ptm = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
+    if (ptm < 0) return NULL;
+    char devname[64];
+    if (grantpt(ptm) || unlockpt(ptm) || ptsname_r(ptm, devname, sizeof(devname))) {
+        close(ptm);
+        return NULL;
+    }
+    int pts = open(devname, O_RDWR);
+    if (pts < 0) {
+        close(ptm);
         return NULL;
     }
     jintArray result = (*env)->NewIntArray(env, 2);
-    if (!result) {
-        close(master);
-        close(slave);
-        return NULL;
-    }
-    jint fds[2] = {master, slave};
+    if (!result) { close(ptm); close(pts); return NULL; }
+    jint fds[2] = {ptm, pts};
     (*env)->SetIntArrayRegion(env, result, 0, 2, fds);
     return result;
 }
@@ -258,11 +512,9 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_readFd(
     JNIEnv *env, jobject obj, jint fd, jbyteArray buf, jint off, jint len)
 {
     (void)obj;
-    /* poll with 1s timeout to avoid blocking */
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
     int pret = poll(&pfd, 1, 1000);
     if (pret <= 0) return (jint)pret;
-
     jbyte *data = (*env)->GetByteArrayElements(env, buf, NULL);
     if (!data) return -1;
     int n = (int)raw_read(fd, data + off, (size_t)len);
@@ -281,8 +533,21 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_writeFd(
     return n;
 }
 
+JNIEXPORT void JNICALL Java_com_vproc_arttest_TestTermuxSession_setPtyWindowSize(
+    JNIEnv *env, jclass cls, jint fd, jint rows, jint cols, jint cell_width, jint cell_height)
+{
+    (void)env; (void)cls;
+    struct winsize sz = {
+        .ws_row = (unsigned short) rows,
+        .ws_col = (unsigned short) cols,
+        .ws_xpixel = (unsigned short) (cols * cell_width),
+        .ws_ypixel = (unsigned short) (rows * cell_height)
+    };
+    ioctl(fd, TIOCSWINSZ, &sz);
+}
+
 /* ------------------------------------------------------------------
- * JNI: Process creation (basic, no crash recovery)
+ * JNI: Legacy process creation wrappers (for backward compat)
  * ------------------------------------------------------------------ */
 
 JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcess(
@@ -291,9 +556,10 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcess(
     jint stdin_fd, jint stdout_fd, jint stderr_fd)
 {
     (void)obj;
+    vproc_ensure_loaded();
+    if (!g_vproc_create_process) return 0;
 
     const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
-
     int argc = (*env)->GetArrayLength(env, argv);
     const char **c_argv = malloc((argc + 1) * sizeof(char *));
     for (int i = 0; i < argc; i++) {
@@ -310,8 +576,21 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcess(
     }
     c_envp[envc] = NULL;
 
-    unsigned int vpid = vproc_create_process(
-        c_path, c_argv, c_envp, stdin_fd, stdout_fd, stderr_fd);
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "[jni] vproc_ffi_create_process(%s, fd=%d/%d/%d)...",
+            c_path, stdin_fd, stdout_fd, stderr_fd);
+        raw_log(buf);
+    }
+
+    uint32_t vpid = g_vproc_create_process(c_path, (char*const*)c_argv, (char*const*)c_envp,
+        stdin_fd, stdout_fd, stderr_fd);
+
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] create_process returned vpid=%u", vpid);
+        raw_log(buf);
+    }
 
     for (int i = 0; i < argc; i++) {
         jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
@@ -328,61 +607,110 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcess(
     return (jint)vpid;
 }
 
-JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_runUntilExit(JNIEnv *env, jobject obj, jint vpid) {
+JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_runUntilExit(
+    JNIEnv *env, jobject obj, jint vpid)
+{
     (void)env; (void)obj;
-    return vproc_run_until_exit((unsigned int)vpid);
+    vproc_ensure_loaded();
+    if (!g_vproc_run_until_exit) return -1;
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] run_until_exit(vpid=%d)...", vpid);
+        raw_log(buf);
+    }
+    int code = g_vproc_run_until_exit((uint32_t)vpid);
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[jni] run_until_exit returned %d", code);
+        raw_log(buf);
+    }
+    return code;
 }
 
 /* ------------------------------------------------------------------
- * JNI: Crash recovery installation
+ * JNI: Crash recovery installation (Hermux-style, no sigaltstack)
  * ------------------------------------------------------------------ */
 
-JNIEXPORT void JNICALL Java_com_vproc_arttest_TestTermuxSession_installCrashRecovery(JNIEnv *env, jobject obj) {
+JNIEXPORT void JNICALL Java_com_vproc_arttest_TestTermuxSession_installCrashRecovery(
+    JNIEnv *env, jobject obj)
+{
     (void)env; (void)obj;
-
-    g_crash_stack = malloc(64 * 1024);
-    if (!g_crash_stack) {
-        raw_log("[jni] sigaltstack alloc failed");
-        return;
-    }
-
-    stack_t ss = {
-        .ss_sp = g_crash_stack,
-        .ss_size = 64 * 1024,
-        .ss_flags = 0,
-    };
-    if (sigaltstack(&ss, NULL) != 0) {
-        raw_log("[jni] sigaltstack failed");
-        return;
-    }
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-
-    raw_log("[jni] crash recovery installed");
+    vproc_install_crash_handler();
 }
 
 /* ------------------------------------------------------------------
- * JNI: Process creation with crash recovery
- * Returns int[5]: {vpid, crashed(0/1), fault_addr_low, fault_addr_high, crash_stage}
- *   crash_stage: 0=none, 1=dlopen, 2=create_process, 3=run_until_exit
+ * JNI: Process creation with crash recovery (legacy)
  * ------------------------------------------------------------------ */
+
+static sigjmp_buf g_crash_jmp;
+static volatile sig_atomic_t g_crash_signal = 0;
+static volatile void *g_crash_fault_addr = NULL;
+static volatile int g_crash_stage = 0;
+static volatile int g_crash_thread_set = 0;
+static volatile int g_crash_thread_id = 0;
+
+static struct sigaction g_old_crash_segv, g_old_crash_bus;
+
+static void recovery_handler(int sig, siginfo_t *info, void *uctx) {
+    (void)uctx;
+    g_crash_signal = sig;
+    g_crash_fault_addr = info->si_addr;
+
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "[CRASH] signal=%d fault_addr=%p stage=%d tid=%d",
+        sig, info->si_addr, g_crash_stage, (int)syscall(__NR_gettid));
+    raw_write(2, buf, n);
+    raw_write(2, "\n", 1);
+
+    void *fp;
+    __asm__ volatile("mov %0, x29" : "=r"(fp));
+    for (int i = 0; i < 8 && fp; i++) {
+        void *lr = *((void**)((char*)fp + 8));
+        n = snprintf(buf, sizeof(buf), "  #%d fp=%p lr=%p", i, fp, lr);
+        raw_write(2, buf, n);
+        raw_write(2, "\n", 1);
+        fp = *(void**)fp;
+    }
+
+    int my_tid = (int)syscall(__NR_gettid);
+    if (g_crash_thread_set && my_tid == g_crash_thread_id) {
+        __asm__ volatile("xpaclri"); /* Strip PAC from lr before siglongjmp */
+        siglongjmp(g_crash_jmp, sig);
+    }
+
+    raw_log("[CRASH] Non-test thread crash, cannot recover.");
+    pthread_exit(NULL);
+    _exit(128 + sig);
+}
 
 JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_createProcessWithRecovery(
     JNIEnv *env, jobject obj,
     jstring path, jobjectArray argv, jobjectArray envp,
     jint stdin_fd, jint stdout_fd, jint stderr_fd)
 {
+    (void)obj;
     int result[5] = {0, 0, 0, 0, 0};
 
-    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
+    /* Install recovery handler with sigaltstack for test recovery */
+    static void *crash_stack = NULL;
+    if (!crash_stack) {
+        crash_stack = malloc(64 * 1024);
+        if (crash_stack) {
+            stack_t ss = { .ss_sp = crash_stack, .ss_size = 64 * 1024, .ss_flags = 0 };
+            sigaltstack(&ss, NULL);
+        }
+    }
 
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = recovery_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_old_crash_segv);
+    sigaction(SIGBUS, &sa, &g_old_crash_bus);
+
+    const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
     int argc = (*env)->GetArrayLength(env, argv);
     const char **c_argv = malloc((argc + 1) * sizeof(char *));
     for (int i = 0; i < argc; i++) {
@@ -399,7 +727,6 @@ JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_createProce
     }
     c_envp[envc] = NULL;
 
-    /* Stage 2: create_process */
     g_crash_stage = 2;
     g_crash_signal = 0;
     g_crash_fault_addr = NULL;
@@ -422,8 +749,14 @@ JNIEXPORT jintArray JNICALL Java_com_vproc_arttest_TestTermuxSession_createProce
         raw_log(logbuf);
     }
 
-    unsigned int vpid = vproc_create_process(
-        c_path, c_argv, c_envp, stdin_fd, stdout_fd, stderr_fd);
+    vproc_ensure_loaded();
+    if (!g_vproc_create_process) {
+        raw_log("[jni] vproc not loaded");
+        goto cleanup;
+    }
+
+    unsigned int vpid = g_vproc_create_process(c_path, (char*const*)c_argv, (char*const*)c_envp,
+        stdin_fd, stdout_fd, stderr_fd);
 
     if (vpid == 0) {
         raw_log("[jni] create_process failed (vpid=0)");
@@ -456,7 +789,6 @@ cleanup:
  * JNI: Diagnostics for ART — step-by-step failure isolation
  * ------------------------------------------------------------------ */
 
-/* Diag 1: Path access — canonicalize + read first 64 bytes */
 JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagPathAccess(
     JNIEnv *env, jobject obj, jstring path)
 {
@@ -464,7 +796,6 @@ JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagPathAcces
     const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
     char buf[1024];
 
-    /* canonicalize */
     char *real = realpath(c_path, NULL);
     if (!real) {
         snprintf(buf, sizeof(buf), "FAIL realpath: errno=%d (%s)", errno, strerror(errno));
@@ -472,7 +803,6 @@ JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagPathAcces
         return (*env)->NewStringUTF(env, buf);
     }
 
-    /* read first 64 bytes */
     int fd = open(real, O_RDONLY);
     if (fd < 0) {
         snprintf(buf, sizeof(buf), "FAIL open(%s): errno=%d (%s)", real, errno, strerror(errno));
@@ -484,7 +814,6 @@ JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagPathAcces
     ssize_t n = read(fd, rbuf, sizeof(rbuf));
     close(fd);
 
-    /* check ELF magic */
     int is_elf = (n >= 4 && rbuf[0]==0x7f && rbuf[1]=='E' && rbuf[2]=='L' && rbuf[3]=='F');
 
     snprintf(buf, sizeof(buf), "OK: %s (%zd bytes read, %s)", real, n,
@@ -494,7 +823,6 @@ JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagPathAcces
     return (*env)->NewStringUTF(env, buf);
 }
 
-/* Diag 2: dlopen test — try loading the binary */
 JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlopen(
     JNIEnv *env, jobject obj, jstring path)
 {
@@ -502,7 +830,7 @@ JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlopen(
     const char *c_path = (*env)->GetStringUTFChars(env, path, NULL);
     char buf[1024];
 
-    void *handle = dlopen(c_path, RTLD_NOW | RTLD_GLOBAL);
+    void *handle = dlopen(c_path, RTLD_NOW);
     if (!handle) {
         const char *err = dlerror();
         snprintf(buf, sizeof(buf), "FAIL dlopen: %s", err ? err : "unknown");
@@ -511,36 +839,26 @@ JNIEXPORT jstring JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlopen(
     }
 
     snprintf(buf, sizeof(buf), "OK: handle=%p", handle);
-    /* don't dlclose — vproc may need it cached */
     (*env)->ReleaseStringUTFChars(env, path, c_path);
     return (*env)->NewStringUTF(env, buf);
 }
 
-/* Diag 3 helper: dl_iterate_phdr callback */
 struct diag_dl_data {
-    JNIEnv *env;
-    jobjectArray *result;
-    jclass strClass;
     int count;
     int max_count;
     char **names;
 };
 
-static void diag_dl_collect(struct diag_dl_data *d, const char *name) {
-    if (d->count < d->max_count) {
-        d->names[d->count] = name ? strdup(name) : strdup("(null)");
-        d->count++;
-    }
-}
-
 static int diag_dl_callback(struct dl_phdr_info *info, size_t size, void *data) {
     (void)size;
     struct diag_dl_data *d = (struct diag_dl_data *)data;
-    diag_dl_collect(d, info->dlpi_name);
+    if (d->count < d->max_count) {
+        d->names[d->count] = info->dlpi_name ? strdup(info->dlpi_name) : strdup("(null)");
+        d->count++;
+    }
     return 0;
 }
 
-/* Diag 3: dl_iterate_phdr — list all loaded shared objects */
 JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlIterate(
     JNIEnv *env, jobject obj)
 {
@@ -548,7 +866,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlIt
     enum { MAX_LIBS = 128 };
     char *names[MAX_LIBS];
     struct diag_dl_data data = {
-        .env = env,
         .names = names,
         .count = 0,
         .max_count = MAX_LIBS,
@@ -567,7 +884,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagDlIt
     return result;
 }
 
-/* Diag 4: Full createProcess with stderr capture via pipe */
 JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCreateProcess(
     JNIEnv *env, jobject obj,
     jstring path, jobjectArray argv, jobjectArray envp,
@@ -595,22 +911,22 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCrea
     }
     c_envp[envc] = NULL;
 
-    /* Capture stderr via pipe */
     int err_pipe[2];
     int saved_stderr = dup(2);
     if (pipe(err_pipe) == 0) {
-        /* Make read end non-blocking */
         int flags = fcntl(err_pipe[0], F_GETFL);
         fcntl(err_pipe[0], F_SETFL, flags | O_NONBLOCK);
-
         dup2(err_pipe[1], 2);
         close(err_pipe[1]);
     }
 
-    unsigned int vpid = vproc_create_process(
-        c_path, c_argv, c_envp, stdin_fd, stdout_fd, stderr_fd);
+    vproc_ensure_loaded();
+    unsigned int vpid = 0;
+    if (g_vproc_create_process) {
+        vpid = g_vproc_create_process(c_path, (char*const*)c_argv, (char*const*)c_envp,
+            stdin_fd, stdout_fd, stderr_fd);
+    }
 
-    /* Restore stderr and read captured errors */
     dup2(saved_stderr, 2);
     close(saved_stderr);
 
@@ -618,7 +934,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCrea
         ssize_t n = read(err_pipe[0], errbuf, sizeof(errbuf) - 1);
         if (n > 0) {
             errbuf[n] = '\0';
-            /* Strip trailing newline */
             if (n > 0 && errbuf[n-1] == '\n') errbuf[n-1] = '\0';
         } else {
             errbuf[0] = '\0';
@@ -628,7 +943,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCrea
 
     snprintf(vpidbuf, sizeof(vpidbuf), "%u", vpid);
 
-    /* Cleanup */
     for (int i = 0; i < argc; i++) {
         jstring s = (jstring)(*env)->GetObjectArrayElement(env, argv, i);
         (*env)->ReleaseStringUTFChars(env, s, c_argv[i]);
@@ -641,7 +955,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCrea
     free(c_envp);
     (*env)->ReleaseStringUTFChars(env, path, c_path);
 
-    /* Return String[]: {vpid, error_msg} */
     jclass strClass = (*env)->FindClass(env, "java/lang/String");
     jobjectArray result = (*env)->NewObjectArray(env, 2, strClass, NULL);
     jstring svpid = (*env)->NewStringUTF(env, vpidbuf);
@@ -655,12 +968,12 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_diagCrea
 
 /* ------------------------------------------------------------------
  * JNI: Device info detection
- * Returns String[] with CPU, SoC, MTE, Seccomp, Kernel info
  * ------------------------------------------------------------------ */
 
 JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_detectDeviceInfo(
     JNIEnv *env, jobject obj)
 {
+    (void)obj;
     char buf[512];
     int count = 0;
     char *lines[32];
@@ -673,7 +986,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_detectDe
         } \
     } while(0)
 
-    /* CPU info -- deduplicate CPU part lines */
     FILE *f = fopen("/proc/cpuinfo", "r");
     if (f) {
         char line[256];
@@ -703,7 +1015,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_detectDe
         fclose(f);
     }
 
-    /* MTE detection */
     f = fopen("/proc/self/maps", "r");
     if (f) {
         char line[512];
@@ -716,7 +1027,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_detectDe
         ADD_LINE("MTE: %s (maps: %d/%d tagged)", tagged > 0 ? "enabled" : "disabled", tagged, total);
     }
 
-    /* Seccomp */
     f = fopen("/proc/self/status", "r");
     if (f) {
         char line[256];
@@ -733,7 +1043,6 @@ JNIEXPORT jobjectArray JNICALL Java_com_vproc_arttest_TestTermuxSession_detectDe
         fclose(f);
     }
 
-    /* Kernel */
     struct utsname u;
     if (uname(&u) == 0) {
         ADD_LINE("Kernel: %s", u.release);

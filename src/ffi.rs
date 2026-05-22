@@ -33,7 +33,10 @@ struct Session {
     #[allow(dead_code)]
     id: u32,
     executor: crate::executor::Executor,
-    spawn_queue: Vec<SpawnRequest>,
+    /// Spawn queue with its own lock — allows pushing without holding the
+    /// session mutex, avoiding deadlock when driver holds session lock
+    /// during virtual_execve_via_entry.
+    spawn_queue: Arc<(Mutex<Vec<SpawnRequest>>, Condvar)>,
     waiters: Vec<Waiter>,
     saved_fds: [c_int; 3],
     probe_result: Option<c_int>,
@@ -51,9 +54,22 @@ static SESSIONS: LazyLock<Mutex<HashMap<u32, Arc<Mutex<Session>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Global default session ID — lazily initialized by compat FFI functions.
+/// This supports callers (like the ART test bridge) that use 6-arg calls
+/// without explicit session management.
+static DEFAULT_SESSION: LazyLock<u32> = LazyLock::new(|| vproc_ffi_create_session());
+
+fn ensure_default_session() -> u32 {
+    *DEFAULT_SESSION
+}
+
 // ---------------------------------------------------------------------------
 // FFI exports — per-session lifecycle
 // ---------------------------------------------------------------------------
+
+/// Debug progress marker for vproc_ffi_create_process
+#[no_mangle]
+static mut VPROC_CREATE_PROGRESS: u32 = 0;
 
 /// Create a new vproc session with its own driver thread and executor.
 /// Returns a session ID (> 0) on success, 0 on error.
@@ -64,7 +80,7 @@ pub extern "C" fn vproc_ffi_create_session() -> u32 {
     let session = Arc::new(Mutex::new(Session {
         id: session_id,
         executor: crate::executor::Executor::new(),
-        spawn_queue: Vec::new(),
+        spawn_queue: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
         waiters: Vec::new(),
         saved_fds: [-1, -1, -1],
         probe_result: None,
@@ -112,18 +128,40 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
+    unsafe { VPROC_CREATE_PROGRESS = 1; }
+
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
-    let sessions = SESSIONS.lock().unwrap();
-    let session = match sessions.get(&session_id) {
-        Some(s) => Arc::clone(s),
-        None => return 0,
+    unsafe { VPROC_CREATE_PROGRESS = 2; }
+
+    let spawn_queue = {
+        let sessions = SESSIONS.lock().unwrap();
+        unsafe { VPROC_CREATE_PROGRESS = 3; }
+        let session = match sessions.get(&session_id) {
+            Some(s) => Arc::clone(s),
+            None => return 0,
+        };
+        drop(sessions);
+        unsafe { VPROC_CREATE_PROGRESS = 4; }
+        let mut sq = None;
+        for _ in 0..100 {
+            if let Ok(s) = session.try_lock() {
+                sq = Some(Arc::clone(&s.spawn_queue));
+                break;
+            }
+            unsafe { libc::nanosleep(&libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 }, std::ptr::null_mut()); }
+        }
+        match sq {
+            Some(q) => q,
+            None => return 0,
+        }
     };
-    drop(sessions);
+
+    unsafe { VPROC_CREATE_PROGRESS = 5; }
 
     {
-        let mut s = session.lock().unwrap();
-        s.spawn_queue.push(SpawnRequest {
+        let (lock, cvar) = &*spawn_queue;
+        lock.lock().unwrap().push(SpawnRequest {
             path: path_str,
             argv: argv_vec,
             envp: envp_vec,
@@ -132,19 +170,30 @@ pub extern "C" fn vproc_ffi_create_process(
             stderr_fd,
             result: Arc::clone(&result),
         });
-        s.wake.notify_all();
+        cvar.notify_all();
     }
 
-    // Wait for driver to process — use timeout to avoid deadlock if driver crashes
-    let (lock, cvar) = &*result;
-    let guard = lock.lock().unwrap();
-    let (guard, timeout) = cvar
-        .wait_timeout(guard, std::time::Duration::from_secs(5))
-        .unwrap();
-    if timeout.timed_out() {
-        return 0;
+    unsafe { VPROC_CREATE_PROGRESS = 6; }
+
+    // Wait for driver to process — poll with direct nanosleep
+    let mut attempts = 0;
+    loop {
+        {
+            let (lock, _) = &*result;
+            let guard = lock.lock().unwrap();
+            if guard.is_some() {
+                return guard.unwrap_or(0);
+            }
+        }
+        attempts += 1;
+        if attempts > 1000 {
+            return 0; // timeout after ~10s
+        }
+        unsafe {
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 }; // 10ms
+            libc::nanosleep(&ts, std::ptr::null_mut());
+        }
     }
-    (*guard).unwrap_or(0)
 }
 
 /// Drive the scheduler until the given vpid exits within a session.
@@ -183,15 +232,20 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
         s.wake.notify_all();
     }
 
-    let (lock, cvar) = &*result;
-    let guard = lock.lock().unwrap();
-    let (guard, timeout) = cvar
-        .wait_timeout(guard, std::time::Duration::from_secs(300))
-        .unwrap();
-    if timeout.timed_out() {
-        return -1;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        {
+            let (lock, _) = &*result;
+            let guard = lock.lock().unwrap();
+            if guard.is_some() {
+                return guard.unwrap_or(-1);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return -1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    (*guard).unwrap_or(-1)
 }
 
 /// Check if a virtual process exists within a session.
@@ -205,6 +259,41 @@ pub extern "C" fn vproc_ffi_vpid_exists(session_id: u32, vpid: u32) -> c_int {
         }
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// FFI compat — 6-arg versions without session_id (for C bridges that
+// don't manage sessions explicitly). Auto-creates a default session.
+// ---------------------------------------------------------------------------
+
+/// Create a virtual process using the default session.
+/// Returns virtual PID (> 0) on success, 0 on error.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_create_process_default(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    stdin_fd: c_int,
+    stdout_fd: c_int,
+    stderr_fd: c_int,
+) -> u32 {
+    let sid = ensure_default_session();
+    vproc_ffi_create_process(sid, path, argv, envp, stdin_fd, stdout_fd, stderr_fd)
+}
+
+/// Drive the scheduler until the given vpid exits using the default session.
+/// Returns the exit code, or -1 on error/timeout.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_run_until_exit_default(vpid: u32) -> c_int {
+    let sid = ensure_default_session();
+    vproc_ffi_run_until_exit(sid, vpid)
+}
+
+/// Check if a virtual process exists using the default session.
+#[no_mangle]
+pub extern "C" fn vproc_ffi_vpid_exists_default(vpid: u32) -> c_int {
+    let sid = ensure_default_session();
+    vproc_ffi_vpid_exists(sid, vpid)
 }
 
 /// Create a temporary session, run a self-test, and return the result.
@@ -355,7 +444,7 @@ pub extern "C" fn vproc_ffi_execve(
         }
         Err(e) => {
             let msg = format!("vproc: virtual_execve: {}\n", e);
-            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
             unsafe { *libc::__errno() = libc::ENOEXEC };
             -1
         }
@@ -617,7 +706,7 @@ pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) -> i32 {
     );
     if ret < 0 {
         let msg = format!("vproc: raw_dup3({}, {}) failed\n", old_fd, new_fd);
-        libc::syscall(64, 2, msg.as_ptr(), msg.len());
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
     ret as i32
 }
@@ -636,6 +725,8 @@ unsafe fn probe_sigsetjmp(env: *mut SigjmpBuf, savemask: c_int) -> c_int {
 }
 
 unsafe fn probe_siglongjmp(env: *mut SigjmpBuf, val: c_int) {
+    #[cfg(target_arch = "aarch64")]
+    std::arch::asm!("xpaclri"); // Strip PAC from lr before siglongjmp
     extern "C" { fn siglongjmp(env: *mut c_int, val: c_int); }
     unsafe { siglongjmp(env as *mut c_int, val); }
 }
@@ -674,7 +765,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         for (i, &fd) in s.saved_fds.iter().enumerate() {
             if fd < 0 {
                 let msg = format!("vproc: warning: saved_fds[{}] = {} (dup failed)\n", i, fd);
-                unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
             }
         }
         // Set the thread-local executor pointer for do_yield
@@ -688,7 +779,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         let mut s = session.lock().unwrap();
         s.probe_result = Some(0);
         let msg = "vproc: self-test skipped (probe=ok)\n";
-        unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
 
     // 4. Main loop
@@ -707,8 +798,11 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
             // Set thread-local for all operations in this iteration
             crate::executor::set_current_executor(&mut s.executor as *mut _);
 
-            // Drain spawn queue
-            let requests: Vec<SpawnRequest> = s.spawn_queue.drain(..).collect();
+            // Drain spawn queue (uses separate lock, not session mutex)
+            let requests: Vec<SpawnRequest> = {
+                let (sq_lock, _) = &*s.spawn_queue;
+                sq_lock.lock().unwrap().drain(..).collect()
+            };
             for req in requests {
                 let vpid = match crate::vexec::virtual_execve_via_entry(
                     &req.path, req.argv, req.envp,
@@ -722,7 +816,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                     Err(e) => {
                         let msg = format!("vproc_ffi_create_process: {}\n", e);
                         unsafe {
-                            libc::syscall(64, 2, msg.as_ptr(), msg.len());
+                            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
                         }
                         0
                     }
@@ -755,7 +849,11 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         // Block until new work arrives (spawn request, waiter, or active coroutines)
         {
             let s = session.lock().unwrap();
-            let has_work = !s.spawn_queue.is_empty()
+            let spawn_has_work = {
+                let (sq_lock, _) = &*s.spawn_queue;
+                !sq_lock.lock().unwrap().is_empty()
+            };
+            let has_work = spawn_has_work
                 || !s.waiters.is_empty()
                 || s.executor.vprocs.values().any(|c| !c.is_done());
             if !has_work && !s.shutdown {

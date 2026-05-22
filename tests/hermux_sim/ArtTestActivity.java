@@ -3,55 +3,49 @@ package com.vproc.arttest;
 import android.app.Activity;
 import android.os.Bundle;
 import android.util.Log;
-import java.io.*;
+import java.io.OutputStream;
+import java.io.PrintStream;
 
+/**
+ * Direct test launcher — runs tests on a background thread, output to logcat.
+ */
 public class ArtTestActivity extends Activity {
-
     static final String TAG = "vproc-arttest";
-    static final String OUTPUT_DIR = "/sdcard";
-    static final String OUTPUT_PATH = OUTPUT_DIR + "/art_test_output.txt";
 
-    private void writeOutput(String msg) {
-        Log.i(TAG, msg);
-        try {
-            new File(OUTPUT_DIR).mkdirs();
-            FileWriter fw = new FileWriter(OUTPUT_PATH, true);
-            fw.write(msg + "\n");
-            fw.close();
-        } catch (Exception e) {
-            Log.e(TAG, "writeOutput failed", e);
+    static class LogcatStream extends OutputStream {
+        StringBuilder buf = new StringBuilder();
+        public void write(int b) {
+            if (b == 10) {
+                if (buf.length() > 0) Log.i(TAG, buf.toString());
+                buf.setLength(0);
+            } else {
+                buf.append((char) b);
+            }
+        }
+        public void flush() {
+            if (buf.length() > 0) { Log.i(TAG, buf.toString()); buf.setLength(0); }
         }
     }
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        writeOutput("=== ArtTestActivity onCreate ===");
-
+        System.setErr(new PrintStream(new LogcatStream()));
+        Log.i(TAG, "ArtTestActivity: starting tests");
+        try {
+            System.loadLibrary("vproc");
+            System.loadLibrary("vproc_jni_bridge");
+        } catch (Throwable e) {
+            Log.e(TAG, "lib load failed", e);
+            return;
+        }
         new Thread(() -> {
             try {
-                writeOutput("Loading libvproc.so...");
-                System.loadLibrary("vproc");
-                writeOutput("libvproc.so loaded OK");
-
-                writeOutput("Loading libvproc_jni_bridge.so...");
-                System.loadLibrary("vproc_jni_bridge");
-                writeOutput("libvproc_jni_bridge.so loaded OK");
-
-                writeOutput("Running TestTermuxSession...");
-                // Redirect System.err to output file so test results are captured
-                PrintStream ps = new PrintStream(new FileOutputStream(OUTPUT_PATH, true));
-                System.setErr(ps);
+                TestTermuxSession.ensureLibsLoaded();
                 TestTermuxSession.main(new String[]{});
-                writeOutput("Test complete.");
-
-            } catch (Throwable t) {
-                writeOutput("FATAL: " + t);
-                StringWriter sw = new StringWriter();
-                t.printStackTrace(new PrintWriter(sw));
-                writeOutput(sw.toString());
+            } catch (Throwable e) {
+                Log.e(TAG, "test error", e);
             }
-            finish();
-        }).start();
+        }, "test-thread").start();
     }
 }

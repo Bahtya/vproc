@@ -6,7 +6,6 @@
 
 use std::os::raw::c_void;
 use std::ptr;
-use std::alloc::{dealloc, Layout};
 
 
 pub type VPid = u32;
@@ -296,8 +295,7 @@ impl Drop for Coroutine {
             unsafe { libc::munmap(base as *mut _, size); }
         }
         if let Some((base, size)) = self.stack_alloc {
-            let layout = Layout::from_size_align(size, 16).unwrap();
-            unsafe { dealloc(base, layout); }
+            crate::vexec::free_elf_stack(base, size);
         }
         unsafe {
             let ud_ptr = mco_get_user_data(self.co);

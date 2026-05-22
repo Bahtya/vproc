@@ -1,6 +1,5 @@
 //! Virtual execve — load and execute ELF binaries inside coroutines.
 
-use std::alloc::{alloc, Layout};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -13,6 +12,66 @@ use crate::elf;
 use crate::loader;
 
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
+
+/// Check if MTE (Memory Tagging Extension) is available — cached after first call.
+fn mte_available() -> bool {
+    use std::sync::atomic::{AtomicI8, Ordering as Ord2};
+    static CACHED: AtomicI8 = AtomicI8::new(-1);
+    let v = CACHED.load(Ord2::Relaxed);
+    if v >= 0 { return v != 0; }
+    let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
+    let has = (hwcap & (1 << 18)) != 0; // HWCAP_MTE
+    CACHED.store(has as i8, Ord2::Relaxed);
+    has
+}
+
+/// Allocate an ELF execution stack with guard page.
+/// PROT_MTE disabled — can cause MTE async SIGKILL on Android 16 untrusted_app.
+fn alloc_elf_stack(size: usize) -> *mut u8 {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    let guard_size = page_size;
+    let total = guard_size + size;
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1, 0,
+        )
+    };
+    if base == libc::MAP_FAILED { return std::ptr::null_mut(); }
+    let stack_start = unsafe { (base as *mut u8).add(guard_size) };
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    // PROT_MTE disabled — causes MTE async SIGKILL on Android 16 untrusted_app
+    // since ELF stack data is not properly tagged by the virtualized environment.
+    let r = unsafe {
+        libc::mmap(
+            stack_start as *mut c_void,
+            size,
+            prot,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1, 0,
+        )
+    };
+    if r == libc::MAP_FAILED {
+        unsafe { libc::munmap(base, total); }
+        return std::ptr::null_mut();
+    }
+    stack_start
+}
+
+/// Free an ELF stack allocated by alloc_elf_stack.
+pub fn free_elf_stack(ptr: *mut u8, size: usize) {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    unsafe { libc::munmap(ptr.sub(page_size) as *mut c_void, page_size + size); }
+}
+
+/// mprotect wrapper — currently passes through without PROT_MTE.
+/// MTE tagging disabled to avoid async SIGKILL on Android 16 untrusted_app.
+fn mprotect_mte_aware(addr: usize, size: usize, base_prot: c_int) -> c_int {
+    unsafe { libc::mprotect(addr as *mut c_void, size, base_prot) }
+}
 
 struct DlHandle(*mut c_void);
 unsafe impl Send for DlHandle {}
@@ -170,9 +229,8 @@ pub fn virtual_execve_static(
     // Build auxiliary vector
     let auxv = loader::build_auxv(&image, 0);
 
-    // Allocate stack
-    let stack_layout = Layout::from_size_align(ELF_STACK_SIZE, 16).map_err(|e| e.to_string())?;
-    let stack_base = unsafe { alloc(stack_layout) };
+    // Allocate stack (mmap + PROT_MTE + guard page)
+    let stack_base = alloc_elf_stack(ELF_STACK_SIZE);
     if stack_base.is_null() {
         return Err("stack allocation failed".into());
     }
@@ -378,9 +436,7 @@ pub fn virtual_execve_via_entry(
     };
     let auxv = loader::build_auxv(&image, 0);
 
-    let stack_layout = Layout::from_size_align(ELF_STACK_SIZE, 16)
-        .map_err(|e| e.to_string())?;
-    let stack_base = unsafe { alloc(stack_layout) };
+    let stack_base = alloc_elf_stack(ELF_STACK_SIZE);
     if stack_base.is_null() {
         return Err("stack allocation failed".into());
     }
@@ -530,8 +586,8 @@ fn restore_writable_segments(segments: &[WritableSegment]) {
         let page_size = page_end - page_start;
         unsafe {
             // Make writable for restore
-            if libc::mprotect(
-                page_start as *mut c_void,
+            if mprotect_mte_aware(
+                page_start,
                 page_size,
                 libc::PROT_READ | libc::PROT_WRITE,
             ) != 0 {
@@ -550,8 +606,8 @@ fn restore_writable_segments(segments: &[WritableSegment]) {
             if prot & (libc::PROT_WRITE as u32) == 0 {
                 prot |= libc::PROT_WRITE as u32;
             }
-            if libc::mprotect(
-                page_start as *mut c_void,
+            if mprotect_mte_aware(
+                page_start,
                 page_size,
                 prot as c_int,
             ) != 0 {
@@ -666,9 +722,7 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 
     // Batch mprotect: make all unique pages writable
     for &page in &pages {
-        unsafe {
-            libc::mprotect(page as *mut c_void, 0x2000, libc::PROT_READ | libc::PROT_WRITE);
-        }
+        mprotect_mte_aware(page, 0x2000, libc::PROT_READ | libc::PROT_WRITE);
     }
 
     // Apply all GOT patches
@@ -678,9 +732,7 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 
     // Restore GOT pages to read-only
     for &page in &pages {
-        unsafe {
-            libc::mprotect(page as *mut c_void, 0x2000, libc::PROT_READ);
-        }
+        mprotect_mte_aware(page, 0x2000, libc::PROT_READ);
     }
 }
 
@@ -810,8 +862,8 @@ fn register_elf_c_strings(vpid: VPid, c_strings: Vec<*mut u8>) {
 ///   .quad target        // 64-bit target address
 unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
     let page = func_addr & !0xfff;
-    if libc::mprotect(
-        page as *mut c_void,
+    if mprotect_mte_aware(
+        page,
         0x2000,
         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
     ) != 0 {
