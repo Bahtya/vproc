@@ -357,6 +357,13 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
             cmd_utf8, pts, pts, pts);
         raw_log(buf);
     }
+    /* Read progress symbol for debugging */
+    volatile uint32_t *progress_ptr = NULL;
+    {
+        void *lib = dlopen("libvproc.so", RTLD_NOW);
+        if (lib) progress_ptr = (volatile uint32_t *)dlsym(lib, "VPROC_CREATE_PROGRESS");
+    }
+
     ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, g_vproc_session_id, g_vproc_create_process_s ? 1 : 0);
     uint32_t vpid;
     if (g_vproc_session_id > 0 && g_vproc_create_process_s) {
@@ -366,7 +373,8 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         ALOGI("createSubprocess: using _default API");
         vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
     }
-    ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
+    ALOGI("createSubprocess: create_process returned vpid=%u progress=%u",
+        vpid, progress_ptr ? *progress_ptr : 0xFFFFFFFF);
     {
         char buf[64];
         snprintf(buf, sizeof(buf), "[jni] vproc: vproc_ffi_create_process returned vpid=%u", vpid);
