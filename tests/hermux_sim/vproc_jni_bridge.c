@@ -33,17 +33,26 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-/* Simple log using write(2) — no liblog dependency */
+/* Dynamic __android_log_print via dlsym — no liblog link dependency */
+#include <dlfcn.h>
+typedef int (*android_log_fn)(int, const char *, const char *, ...);
+static android_log_fn get_android_log(void) {
+    static android_log_fn fn = NULL;
+    if (!fn) {
+        void *liblog = dlopen("liblog.so", RTLD_NOW);
+        if (liblog) fn = (android_log_fn)dlsym(liblog, "__android_log_print");
+    }
+    return fn;
+}
 static void jni_log(const char *fmt, ...) {
+    android_log_fn logfn = get_android_log();
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n > 0) {
-        if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
-        buf[n++] = '\n';
-        write(2, buf, n);
+    if (logfn) {
+        logfn(4 /* INFO */, "vproc-jni", "%s", buf);  /* ANDROID_LOG_INFO=4 */
     }
 }
 #define ALOGI(...) jni_log(__VA_ARGS__)
