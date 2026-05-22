@@ -124,6 +124,30 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
+    // Debug: log entry to Android logcat via dlsym
+    {
+        #[cfg(target_os = "android")]
+        {
+            type LogFn = unsafe extern "C" fn(i32, *const u8, *const u8, ...) -> i32;
+            static mut LOG_FN: Option<LogFn> = None;
+            unsafe {
+                if LOG_FN.is_none() {
+                    let lib = libc::dlopen(b"liblog.so\0".as_ptr() as *const _, libc::RTLD_NOW);
+                    if !lib.is_null() {
+                        LOG_FN = Some(std::mem::transmute(
+                            libc::dlsym(lib, b"__android_log_print\0".as_ptr() as *const _)
+                        ));
+                    }
+                }
+                if let Some(logfn) = LOG_FN {
+                    let msg = format!("vproc_ffi_create_process: enter path={}", path_str);
+                    let c_msg = std::ffi::CString::new(msg).unwrap();
+                    logfn(4, b"vproc-rs\0".as_ptr() as *const _, b"%s\0".as_ptr() as *const _, c_msg.as_ptr());
+                }
+            }
+        }
+    }
+
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
     let spawn_queue = {
