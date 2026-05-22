@@ -124,54 +124,40 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
-    // Debug: log entry to Android logcat via dlsym
-    {
-        #[cfg(target_os = "android")]
-        {
-            type LogFn = unsafe extern "C" fn(i32, *const u8, *const u8, ...) -> i32;
-            static mut LOG_FN: Option<LogFn> = None;
-            unsafe {
-                if LOG_FN.is_none() {
-                    let lib = libc::dlopen(b"liblog.so\0".as_ptr() as *const _, libc::RTLD_NOW);
-                    if !lib.is_null() {
-                        LOG_FN = Some(std::mem::transmute(
-                            libc::dlsym(lib, b"__android_log_print\0".as_ptr() as *const _)
-                        ));
-                    }
-                }
-                if let Some(logfn) = LOG_FN {
-                    let msg = format!("vproc_ffi_create_process: enter path={}", path_str);
-                    let c_msg = std::ffi::CString::new(msg).unwrap();
-                    logfn(4, b"vproc-rs\0".as_ptr() as *const _, b"%s\0".as_ptr() as *const _, c_msg.as_ptr());
-                }
-            }
-        }
-    }
+    // Progress marker — readable from C via dlsym for debugging
+    #[no_mangle]
+    static mut VPROC_CREATE_PROGRESS: u32 = 0;
+
+    unsafe { VPROC_CREATE_PROGRESS = 1; }
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
+    unsafe { VPROC_CREATE_PROGRESS = 2; }
+
     let spawn_queue = {
         let sessions = SESSIONS.lock().unwrap();
+        unsafe { VPROC_CREATE_PROGRESS = 3; }
         let session = match sessions.get(&session_id) {
             Some(s) => Arc::clone(s),
             None => return 0,
         };
         drop(sessions);
-        // Try to get spawn_queue without blocking on session lock
-        // (driver may hold session lock during spawn processing)
+        unsafe { VPROC_CREATE_PROGRESS = 4; }
         let mut sq = None;
         for _ in 0..100 {
             if let Ok(s) = session.try_lock() {
                 sq = Some(Arc::clone(&s.spawn_queue));
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            unsafe { libc::nanosleep(&libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 }, std::ptr::null_mut()); }
         }
         match sq {
             Some(q) => q,
             None => return 0,
         }
     };
+
+    unsafe { VPROC_CREATE_PROGRESS = 5; }
 
     {
         let (lock, cvar) = &*spawn_queue;
@@ -186,6 +172,8 @@ pub extern "C" fn vproc_ffi_create_process(
         });
         cvar.notify_all();
     }
+
+    unsafe { VPROC_CREATE_PROGRESS = 6; }
 
     // Wait for driver to process — poll with direct nanosleep
     let mut attempts = 0;
