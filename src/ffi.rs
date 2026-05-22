@@ -399,7 +399,7 @@ pub extern "C" fn vproc_ffi_execve(
         }
         Err(e) => {
             let msg = format!("vproc: virtual_execve: {}\n", e);
-            unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
             unsafe { *libc::__errno() = libc::ENOEXEC };
             -1
         }
@@ -661,7 +661,7 @@ pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) -> i32 {
     );
     if ret < 0 {
         let msg = format!("vproc: raw_dup3({}, {}) failed\n", old_fd, new_fd);
-        libc::syscall(64, 2, msg.as_ptr(), msg.len());
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
     ret as i32
 }
@@ -720,7 +720,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         for (i, &fd) in s.saved_fds.iter().enumerate() {
             if fd < 0 {
                 let msg = format!("vproc: warning: saved_fds[{}] = {} (dup failed)\n", i, fd);
-                unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
             }
         }
         // Set the thread-local executor pointer for do_yield
@@ -734,7 +734,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         let mut s = session.lock().unwrap();
         s.probe_result = Some(0);
         let msg = "vproc: self-test skipped (probe=ok)\n";
-        unsafe { libc::syscall(64, 2, msg.as_ptr(), msg.len()); }
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
 
     // 4. Main loop
@@ -768,7 +768,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                     Err(e) => {
                         let msg = format!("vproc_ffi_create_process: {}\n", e);
                         unsafe {
-                            libc::syscall(64, 2, msg.as_ptr(), msg.len());
+                            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
                         }
                         0
                     }

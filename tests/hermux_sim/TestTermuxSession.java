@@ -639,8 +639,8 @@ public class TestTermuxSession {
         t.testDeviceInfo();
         System.err.println();
 
-        // ART diagnostics — isolate which step of createProcess fails
-        t.runDiagnostics();
+        // ART diagnostics — skip; creates orphan vpid that blocks driver
+        // t.runDiagnostics();
 
         // --- Hermux flow tests (matches termux.c exactly) ---
         System.err.println("=== Hermux Flow Tests (createSubprocess + waitFor) ===");
