@@ -217,6 +217,26 @@ Java_com_vproc_arttest_TestTermuxSession_nativeLoadVproc(
  * pProcessId receives vpid.
  * ------------------------------------------------------------------ */
 
+/* Struct + thread function for watchdog create_process call */
+struct cp_arg {
+    uint32_t sid;
+    const char *path;
+    char *const *argv;
+    char *const *envp;
+    int fds[3];
+    uint32_t *vpid_out;
+    volatile uint32_t *prog;
+};
+
+static void *cp_thread_fn(void *a) {
+    struct cp_arg *c = (struct cp_arg *)a;
+    ALOGI("cp_thread: enter, calling _s(sid=%u)", c->sid);
+    *(c->vpid_out) = g_vproc_create_process_s(c->sid, c->path, c->argv, c->envp,
+        c->fds[0], c->fds[1], c->fds[2]);
+    ALOGI("cp_thread: returned vpid=%u prog=%u", *(c->vpid_out), c->prog ? *c->prog : 0xFF);
+    return NULL;
+}
+
 JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess(
     JNIEnv *env, jclass cls,
     jstring cmd, jstring cwd,
@@ -366,14 +386,20 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
     }
 
     ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, g_vproc_session_id, g_vproc_create_process_s ? 1 : 0);
-    uint32_t vpid;
-    if (g_vproc_session_id > 0 && g_vproc_create_process_s) {
-        ALOGI("createSubprocess: using session-based API sid=%u", g_vproc_session_id);
-        vpid = g_vproc_create_process_s(g_vproc_session_id, cmd_utf8, argv, envp, pts, pts, pts);
-    } else {
-        ALOGI("createSubprocess: using _default API");
-        vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
+
+    /* Call create_process in a child thread so we can log progress */
+    uint32_t vpid = 0;
+    struct cp_arg cpa = { g_vproc_session_id, cmd_utf8, argv, envp, {pts, pts, pts}, &vpid, progress_ptr };
+    pthread_t cp_tid;
+    pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
+
+    /* Wait and log progress */
+    for (int i = 0; i < 40; i++) {
+        usleep(250000); /* 250ms */
+        ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+        if (vpid != 0) break;
     }
+    pthread_join(cp_tid, NULL);
     ALOGI("createSubprocess: create_process returned vpid=%u progress=%u",
         vpid, progress_ptr ? *progress_ptr : 0xFFFFFFFF);
     {
