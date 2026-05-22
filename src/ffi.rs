@@ -33,7 +33,10 @@ struct Session {
     #[allow(dead_code)]
     id: u32,
     executor: crate::executor::Executor,
-    spawn_queue: Vec<SpawnRequest>,
+    /// Spawn queue with its own lock — allows pushing without holding the
+    /// session mutex, avoiding deadlock when driver holds session lock
+    /// during virtual_execve_via_entry.
+    spawn_queue: Arc<(Mutex<Vec<SpawnRequest>>, Condvar)>,
     waiters: Vec<Waiter>,
     saved_fds: [c_int; 3],
     probe_result: Option<c_int>,
@@ -73,7 +76,7 @@ pub extern "C" fn vproc_ffi_create_session() -> u32 {
     let session = Arc::new(Mutex::new(Session {
         id: session_id,
         executor: crate::executor::Executor::new(),
-        spawn_queue: Vec::new(),
+        spawn_queue: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
         waiters: Vec::new(),
         saved_fds: [-1, -1, -1],
         probe_result: None,
@@ -123,16 +126,20 @@ pub extern "C" fn vproc_ffi_create_process(
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
-    let sessions = SESSIONS.lock().unwrap();
-    let session = match sessions.get(&session_id) {
-        Some(s) => Arc::clone(s),
-        None => return 0,
+    let spawn_queue = {
+        let sessions = SESSIONS.lock().unwrap();
+        let session = match sessions.get(&session_id) {
+            Some(s) => Arc::clone(s),
+            None => return 0,
+        };
+        drop(sessions);
+        let sq = Arc::clone(&session.lock().unwrap().spawn_queue);
+        sq
     };
-    drop(sessions);
 
     {
-        let mut s = session.lock().unwrap();
-        s.spawn_queue.push(SpawnRequest {
+        let (lock, cvar) = &*spawn_queue;
+        lock.lock().unwrap().push(SpawnRequest {
             path: path_str,
             argv: argv_vec,
             envp: envp_vec,
@@ -141,7 +148,7 @@ pub extern "C" fn vproc_ffi_create_process(
             stderr_fd,
             result: Arc::clone(&result),
         });
-        s.wake.notify_all();
+        cvar.notify_all();
     }
 
     // Wait for driver to process — use timeout to avoid deadlock if driver crashes
@@ -753,8 +760,11 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
             // Set thread-local for all operations in this iteration
             crate::executor::set_current_executor(&mut s.executor as *mut _);
 
-            // Drain spawn queue
-            let requests: Vec<SpawnRequest> = s.spawn_queue.drain(..).collect();
+            // Drain spawn queue (uses separate lock, not session mutex)
+            let requests: Vec<SpawnRequest> = {
+                let (sq_lock, _) = &*s.spawn_queue;
+                sq_lock.lock().unwrap().drain(..).collect()
+            };
             for req in requests {
                 let vpid = match crate::vexec::virtual_execve_via_entry(
                     &req.path, req.argv, req.envp,
@@ -801,7 +811,11 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         // Block until new work arrives (spawn request, waiter, or active coroutines)
         {
             let s = session.lock().unwrap();
-            let has_work = !s.spawn_queue.is_empty()
+            let spawn_has_work = {
+                let (sq_lock, _) = &*s.spawn_queue;
+                !sq_lock.lock().unwrap().is_empty()
+            };
+            let has_work = spawn_has_work
                 || !s.waiters.is_empty()
                 || s.executor.vprocs.values().any(|c| !c.is_done());
             if !has_work && !s.shutdown {
