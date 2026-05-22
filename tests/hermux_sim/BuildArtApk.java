@@ -22,6 +22,7 @@ public class BuildArtApk {
     static final int TYPE_END_ELEM    = 0x0103;
 
     static final int TYPE_STRING    = 0x03;
+    static final int TYPE_INT_DEC   = 0x10;
     static final int TYPE_INT_BOOL  = 0x12;
 
     static final int NO_RAW = 0xFFFFFFFF;
@@ -182,21 +183,37 @@ public class BuildArtApk {
         //  13: "android.intent.category.LAUNCHER"
         //  14: "ArtTestActivity"
         String[] strings = {
-            "android",
-            "application",
-            "com.vproc.arttest",
-            "http://schemas.android.com/apk/res/android",
-            "manifest",
-            "package",
-            "name",
-            "exported",
-            "activity",
-            "intent-filter",
-            "action",
-            "category",
-            "android.intent.action.MAIN",
-            "android.intent.category.LAUNCHER",
-            "ArtTestActivity",
+            "android",                                          // 0
+            "application",                                      // 1
+            "com.vproc.arttest",                                // 2
+            "http://schemas.android.com/apk/res/android",       // 3
+            "manifest",                                         // 4
+            "package",                                          // 5
+            "name",                                             // 6
+            "exported",                                         // 7
+            "activity",                                         // 8
+            "intent-filter",                                    // 9
+            "action",                                           // 10
+            "category",                                         // 11
+            "android.intent.action.MAIN",                       // 12
+            "android.intent.category.LAUNCHER",                 // 13
+            "ArtTestActivity",                                  // 14
+            "uses-permission",                                  // 15
+            "android.permission.INTERNET",                      // 16
+            "android.permission.FOREGROUND_SERVICE",            // 17
+            "service",                                          // 18
+            "TestRunnerService",                                // 19
+            ":testrunner",                                      // 20
+            "process",                                          // 21
+            "stopWithTask",                                     // 22
+            "HttpServerService",                                // 23
+            "versionCode",                                      // 24
+            "versionName",                                      // 25
+            "1",                                                // 26
+            "uses-sdk",                                         // 27
+            "minSdkVersion",                                    // 28
+            "targetSdkVersion",                                 // 29
+            "28",                                               // 30
         };
 
         byte[] sp = buildStringPool(strings);
@@ -206,6 +223,12 @@ public class BuildArtApk {
         Map<Integer, Integer> resIds = new HashMap<>();
         resIds.put(6, 0x01010003);  // "name" → attr/name
         resIds.put(7, 0x01010010);  // "exported" → attr/exported
+        resIds.put(21, 0x01010011); // "process" → attr/process
+        resIds.put(22, 0x01010012); // "stopWithTask" → attr/stopWithTask
+        resIds.put(24, 0x0101021b); // "versionCode" → attr/versionCode
+        resIds.put(25, 0x0101021c); // "versionName" → attr/versionName
+        resIds.put(28, 0x0101020c); // "minSdkVersion" → attr/minSdkVersion
+        resIds.put(29, 0x01010270); // "targetSdkVersion" → attr/targetSdkVersion
         byte[] resmap = buildResMap(strings.length, resIds);
 
         // Namespace start
@@ -217,9 +240,27 @@ public class BuildArtApk {
         try {
             xml.write(nsStart);
 
-            // <manifest package="com.vproc.arttest">
+            // <manifest package="com.vproc.arttest" versionCode="1" versionName="1">
             xml.write(startElem(1, -1, 4,
-                attr(-1, 5, 2, TYPE_STRING, 2)));
+                attr(-1, 5, 2, TYPE_STRING, 2),                     // package
+                attr(3, 24, NO_RAW, 0x10, 2),                       // versionCode=2
+                attr(3, 25, 26, TYPE_STRING, 26)));                  // versionName="1"
+
+            // <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28"/>
+            xml.write(startElem(2, -1, 27,
+                attr(3, 28, NO_RAW, 0x10, 28),                      // minSdkVersion=28
+                attr(3, 29, NO_RAW, 0x10, 28)));                     // targetSdkVersion=28
+            xml.write(endElem(2, -1, 27));
+
+            // <uses-permission android:name="android.permission.INTERNET"/>
+            xml.write(startElem(2, -1, 15,
+                attr(3, 6, 16, TYPE_STRING, 16)));
+            xml.write(endElem(2, -1, 15));
+
+            // <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            xml.write(startElem(2, -1, 15,
+                attr(3, 6, 17, TYPE_STRING, 17)));
+            xml.write(endElem(2, -1, 15));
 
             // <application>
             xml.write(startElem(2, -1, 1));
@@ -246,6 +287,24 @@ public class BuildArtApk {
 
             xml.write(endElem(4, -1, 9));   // </intent-filter>
             xml.write(endElem(3, -1, 8));   // </activity>
+
+            // <service android:name="TestRunnerService" android:process=":testrunner"
+            //          android:exported="false" android:stopWithTask="false"/>
+            xml.write(startElem(7, -1, 18,
+                attr(3, 6, 19, TYPE_STRING, 19),                      // name
+                attr(3, 21, 20, TYPE_STRING, 20),                     // process
+                attr(3, 7, NO_RAW, TYPE_INT_BOOL, 0),                 // exported=false
+                attr(3, 22, NO_RAW, TYPE_INT_BOOL, 0)));              // stopWithTask=false
+            xml.write(endElem(7, -1, 18));
+
+            // <service android:name="HttpServerService"
+            //          android:exported="false" android:stopWithTask="false"/>
+            xml.write(startElem(7, -1, 18,
+                attr(3, 6, 23, TYPE_STRING, 23),                      // name
+                attr(3, 7, NO_RAW, TYPE_INT_BOOL, 0),                 // exported=false
+                attr(3, 22, NO_RAW, TYPE_INT_BOOL, 0)));              // stopWithTask=false
+            xml.write(endElem(7, -1, 18));
+
             xml.write(endElem(2, -1, 1));   // </application>
             xml.write(endElem(1, -1, 4));   // </manifest>
 
