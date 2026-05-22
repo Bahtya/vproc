@@ -565,6 +565,7 @@ static void recovery_handler(int sig, siginfo_t *info, void *uctx) {
 
     int my_tid = (int)syscall(__NR_gettid);
     if (g_crash_thread_set && my_tid == g_crash_thread_id) {
+        __asm__ volatile("xpaclri"); /* Strip PAC from lr before siglongjmp */
         siglongjmp(g_crash_jmp, sig);
     }
 

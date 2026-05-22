@@ -636,6 +636,8 @@ unsafe fn probe_sigsetjmp(env: *mut SigjmpBuf, savemask: c_int) -> c_int {
 }
 
 unsafe fn probe_siglongjmp(env: *mut SigjmpBuf, val: c_int) {
+    #[cfg(target_arch = "aarch64")]
+    std::arch::asm!("xpaclri"); // Strip PAC from lr before siglongjmp
     extern "C" { fn siglongjmp(env: *mut c_int, val: c_int); }
     unsafe { siglongjmp(env as *mut c_int, val); }
 }
