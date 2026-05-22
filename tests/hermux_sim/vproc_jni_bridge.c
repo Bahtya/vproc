@@ -89,10 +89,23 @@ typedef uint32_t (*vproc_create_process_fn)(
     int stdin_fd, int stdout_fd, int stderr_fd);
 typedef int (*vproc_run_until_exit_fn)(uint32_t vpid);
 typedef int (*vproc_vpid_exists_fn)(uint32_t vpid);
+typedef uint32_t (*vproc_create_session_fn)(void);
+typedef uint32_t (*vproc_create_process_session_fn)(
+    uint32_t session_id,
+    const char *path, char *const argv[], char *const envp[],
+    int stdin_fd, int stdout_fd, int stderr_fd);
+typedef int (*vproc_run_until_exit_session_fn)(uint32_t session_id, uint32_t vpid);
+typedef int (*vproc_vpid_exists_session_fn)(uint32_t session_id, uint32_t vpid);
 
 static vproc_create_process_fn g_vproc_create_process = NULL;
 static vproc_run_until_exit_fn g_vproc_run_until_exit = NULL;
 static vproc_vpid_exists_fn    g_vproc_vpid_exists = NULL;
+static vproc_create_session_fn g_vproc_create_session = NULL;
+static vproc_create_process_session_fn g_vproc_create_process_s = NULL;
+static vproc_run_until_exit_session_fn g_vproc_run_until_exit_s = NULL;
+static vproc_vpid_exists_session_fn g_vproc_vpid_exists_s = NULL;
+
+static uint32_t g_vproc_session_id = 0;
 static atomic_int g_vproc_initialized = ATOMIC_VAR_INIT(0);
 
 /* Signal handler — matches Hermux's termux.c exactly */
@@ -147,7 +160,23 @@ static void vproc_ensure_loaded(void) {
     raw_log("[jni] vproc: dlopen succeeded, resolving symbols");
     vproc_install_crash_handler();
 
-    /* Use 6-arg compat versions (no session_id) */
+    /* Resolve session-based FFI directly — bypass LazyLock in _default wrappers */
+    g_vproc_create_session = (vproc_create_session_fn)dlsym(lib, "vproc_ffi_create_session");
+    g_vproc_create_process_s = (vproc_create_process_session_fn)dlsym(lib, "vproc_ffi_create_process");
+    g_vproc_run_until_exit_s = (vproc_run_until_exit_session_fn)dlsym(lib, "vproc_ffi_run_until_exit");
+    g_vproc_vpid_exists_s = (vproc_vpid_exists_session_fn)dlsym(lib, "vproc_ffi_vpid_exists");
+
+    ALOGI("vproc: session=%p, create=%p, run=%p, exists=%p",
+        (void*)g_vproc_create_session, (void*)g_vproc_create_process_s,
+        (void*)g_vproc_run_until_exit_s, (void*)g_vproc_vpid_exists_s);
+
+    if (g_vproc_create_session && g_vproc_create_process_s) {
+        ALOGI("vproc: creating session...");
+        g_vproc_session_id = g_vproc_create_session();
+        ALOGI("vproc: session_id=%u", g_vproc_session_id);
+    }
+
+    /* Also resolve _default wrappers as fallback */
     g_vproc_create_process = (vproc_create_process_fn)dlsym(lib, "vproc_ffi_create_process_default");
     g_vproc_run_until_exit = (vproc_run_until_exit_fn)dlsym(lib, "vproc_ffi_run_until_exit_default");
     g_vproc_vpid_exists = (vproc_vpid_exists_fn)dlsym(lib, "vproc_ffi_vpid_exists_default");
@@ -329,9 +358,14 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
             cmd_utf8, pts, pts, pts);
         raw_log(buf);
     }
-    ALOGI("createSubprocess: about to call create_process cmd=%s", cmd_utf8);
-    uint32_t vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
-    ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
+    ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u", cmd_utf8, g_vproc_session_id);
+    uint32_t vpid;
+    if (g_vproc_session_id > 0 && g_vproc_create_process_s) {
+        /* Use session-based API directly — bypass _default LazyLock */
+        vpid = g_vproc_create_process_s(g_vproc_session_id, cmd_utf8, argv, envp, pts, pts, pts);
+    } else {
+        vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
+    }
     ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
     {
         char buf[64];
@@ -383,10 +417,15 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_waitFor(
     (void)env; (void)cls;
     ALOGI("waitFor: enter vpid=%d", pid);
     vproc_ensure_loaded();
-    if (g_vproc_vpid_exists && g_vproc_run_until_exit &&
-        g_vproc_vpid_exists((uint32_t)pid)) {
-        ALOGI("waitFor: calling run_until_exit vpid=%d", pid);
-        int code = g_vproc_run_until_exit((uint32_t)pid);
+    int exists = 0;
+    if (g_vproc_session_id > 0 && g_vproc_vpid_exists_s) {
+        exists = g_vproc_vpid_exists_s(g_vproc_session_id, (uint32_t)pid);
+    } else if (g_vproc_vpid_exists) {
+        exists = g_vproc_vpid_exists((uint32_t)pid);
+    }
+    if (exists && g_vproc_run_until_exit_s && g_vproc_session_id > 0) {
+        ALOGI("waitFor: calling run_until_exit(sid=%u, vpid=%d)", g_vproc_session_id, pid);
+        int code = g_vproc_run_until_exit_s(g_vproc_session_id, (uint32_t)pid);
         ALOGI("waitFor: run_until_exit returned %d", code);
         {
             char buf[64];
