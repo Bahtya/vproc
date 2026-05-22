@@ -357,12 +357,13 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
             cmd_utf8, pts, pts, pts);
         raw_log(buf);
     }
-    ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u", cmd_utf8, g_vproc_session_id);
+    ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, g_vproc_session_id, g_vproc_create_process_s ? 1 : 0);
     uint32_t vpid;
     if (g_vproc_session_id > 0 && g_vproc_create_process_s) {
-        /* Use session-based API directly — bypass _default LazyLock */
+        ALOGI("createSubprocess: using session-based API sid=%u", g_vproc_session_id);
         vpid = g_vproc_create_process_s(g_vproc_session_id, cmd_utf8, argv, envp, pts, pts, pts);
     } else {
+        ALOGI("createSubprocess: using _default API");
         vpid = g_vproc_create_process(cmd_utf8, argv, envp, pts, pts, pts);
     }
     ALOGI("createSubprocess: create_process returned vpid=%u", vpid);
