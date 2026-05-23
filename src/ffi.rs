@@ -190,6 +190,8 @@ pub extern "C" fn vproc_ffi_create_process(
     unsafe { VPROC_CREATE_PROGRESS = 6; }
 
     // Wait for driver to process — poll with direct nanosleep
+    // (condvar.wait causes Android scheduler latency ~50ms per wake,
+    //  worse than 10ms poll with prctl-reduced timer slack)
     let mut attempts = 0;
     loop {
         {
@@ -258,6 +260,7 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
     }
 
     // Wait for exit — poll with 10ms sleep
+    // (condvar.wait causes Android scheduler latency ~50ms per wake)
     for _ in 0..30000 {
         let (lock, _) = &*result;
         if let Some(code) = *lock.lock().unwrap() {
