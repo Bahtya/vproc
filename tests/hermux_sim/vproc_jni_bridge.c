@@ -508,9 +508,9 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
     pthread_t cp_tid;
     pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
 
-    /* Wait and log progress */
+    /* Wait and log progress — 250ms poll up to 10s */
     for (int i = 0; i < 40; i++) {
-        usleep(250000); /* 250ms */
+        usleep(250000);
         ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
         if (vpid != 0) break;
     }

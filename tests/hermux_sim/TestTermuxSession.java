@@ -550,6 +550,11 @@ public class TestTermuxSession {
             if (c == 'a') count++;
         }
         test("sh 100 chars through PTY", ok && count == 100);
+        if (!ok || count != 100) {
+            System.err.printf("    exit=%d a_count=%d output_len=%d output=[%s]%n",
+                r.exitCode, count, r.output.length(),
+                r.output.length() > 200 ? r.output.substring(0, 200) + "..." : r.output);
+        }
     }
 
     // bash crash recovery tests
@@ -620,6 +625,230 @@ public class TestTermuxSession {
         test("3 sequential bash -c sessions (PTY)", ok);
     }
 
+    // --- Timing tests ---
+
+    void testShColdStart() throws Exception {
+        TimedResult r = runTimedCmdPty("echo cold_sh");
+        boolean ok = r.exitCode == 0 && r.output.contains("cold_sh") && r.elapsedMs < 10000;
+        test("sh cold start latency", ok);
+        System.err.printf("    %d ms%n", r.elapsedMs);
+    }
+
+    void testShWarmStart() throws Exception {
+        TimedResult r = runTimedCmdPty("echo warm_sh");
+        boolean ok = r.exitCode == 0 && r.output.contains("warm_sh") && r.elapsedMs < 10000;
+        test("sh warm start latency (cached)", ok);
+        System.err.printf("    %d ms%n", r.elapsedMs);
+    }
+
+    void testBashColdStart() throws Exception {
+        long start = System.nanoTime();
+        Result br = runBashCmd("echo cold_bash", false);
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = br.exitCode == 0 && br.output.contains("cold_bash") && elapsed < 10000;
+        test("bash cold start latency", ok);
+        System.err.printf("    %d ms%n", elapsed);
+    }
+
+    void testBashWarmStart() throws Exception {
+        long start = System.nanoTime();
+        Result br = runBashCmd("echo warm_bash", false);
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = br.exitCode == 0 && br.output.contains("warm_bash") && elapsed < 10000;
+        test("bash warm start latency (cached)", ok);
+        System.err.printf("    %d ms%n", elapsed);
+    }
+
+    void testLargeOutputThroughput() throws Exception {
+        long start = System.nanoTime();
+        Result r = runCmdPty("seq 1 1000");
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        int lines = 0;
+        for (int i = 0; i < r.output.length(); i++) {
+            if (r.output.charAt(i) == '\n') lines++;
+        }
+        boolean ok = r.exitCode == 0 && lines >= 1000 && elapsed < 10000;
+        test("sh large output (seq 1000) throughput", ok);
+        System.err.printf("    %d ms, %d lines, %d bytes%n", elapsed, lines, r.output.length());
+    }
+
+    void testHermuxSessionLatency() throws Exception {
+        String bash = getBashPath();
+        long start = System.nanoTime();
+        Result r = runHermuxSession(bash, "echo hermux_timed");
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = r.exitCode == 0 && r.output.contains("hermux_timed") && elapsed < 10000;
+        test("hermux session round-trip latency", ok);
+        System.err.printf("    %d ms%n", elapsed);
+    }
+
+    // --- Concurrency tests ---
+
+    void testParallelSh() throws Exception {
+        // Sequential hermux sessions — the driver thread is single-threaded,
+        // so true parallelism requires separate sessions (not yet supported by JNI bridge).
+        int n = 3;
+        String[] expected = {"par_sh_0", "par_sh_1", "par_sh_2"};
+        long start = System.nanoTime();
+        boolean ok = true;
+        for (int i = 0; i < n; i++) {
+            Result r = runHermuxSession(getShellPath(), "echo " + expected[i]);
+            if (r.exitCode != 0 || !r.output.contains(expected[i])) {
+                System.err.printf("    session %d: exit=%d output=[%s]%n", i, r.exitCode,
+                    r.output.length() > 100 ? r.output.substring(0, 100) + "..." : r.output);
+                ok = false;
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        test("3 sequential hermux sh sessions", ok);
+        System.err.printf("    total %d ms%n", elapsed);
+    }
+
+    void testParallelBash() throws Exception {
+        int n = 3;
+        String[] expected = {"par_bash_0", "par_bash_1", "par_bash_2"};
+        long start = System.nanoTime();
+        boolean ok = true;
+        for (int i = 0; i < n; i++) {
+            Result r = runHermuxSession(getBashPath(), "echo " + expected[i]);
+            if (r.exitCode != 0 || !r.output.contains(expected[i])) {
+                System.err.printf("    session %d: exit=%d output=[%s]%n", i, r.exitCode,
+                    r.output.length() > 100 ? r.output.substring(0, 100) + "..." : r.output);
+                ok = false;
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        test("3 sequential hermux bash sessions", ok);
+        System.err.printf("    total %d ms%n", elapsed);
+    }
+
+    void testMixedConcurrent() throws Exception {
+        String[] expected = {"mix_sh", "mix_bash", "mix_sh2", "mix_bash2"};
+        long start = System.nanoTime();
+        boolean ok = true;
+        for (int i = 0; i < 4; i++) {
+            String shell = (i % 2 == 0) ? getShellPath() : getBashPath();
+            Result r = runHermuxSession(shell, "echo " + expected[i]);
+            if (r.exitCode != 0 || !r.output.contains(expected[i])) {
+                System.err.printf("    mixed %d: exit=%d output=[%s]%n", i, r.exitCode,
+                    r.output.length() > 100 ? r.output.substring(0, 100) + "..." : r.output);
+                ok = false;
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        test("4 mixed sh+bash sequential sessions", ok);
+        System.err.printf("    total %d ms%n", elapsed);
+    }
+
+    // --- Stress tests ---
+
+    void testStressShRapid() throws Exception {
+        int iterations = 20;
+        int failures = 0;
+        long start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            Result r = runHermuxSession(getShellPath(), "echo stress_" + i);
+            if (r.exitCode != 0 || !r.output.contains("stress_" + i)) {
+                failures++;
+                if (failures <= 3) {
+                    System.err.printf("    iter %d: exit=%d output=[%s]%n", i, r.exitCode,
+                        r.output.length() > 80 ? r.output.substring(0, 80) + "..." : r.output);
+                }
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = failures == 0;
+        test("stress: 20 rapid sh sessions", ok);
+        System.err.printf("    %d/%d ok, %d ms total, %.0f ms avg%n",
+            iterations - failures, iterations, elapsed, (double)elapsed / iterations);
+    }
+
+    void testStressBashRapid() throws Exception {
+        int iterations = 20;
+        int failures = 0;
+        long start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            Result r = runHermuxSession(getBashPath(), "echo bstress_" + i);
+            if (r.exitCode != 0 || !r.output.contains("bstress_" + i)) {
+                failures++;
+                if (failures <= 3) {
+                    System.err.printf("    iter %d: exit=%d output=[%s]%n", i, r.exitCode,
+                        r.output.length() > 80 ? r.output.substring(0, 80) + "..." : r.output);
+                }
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = failures == 0;
+        test("stress: 20 rapid bash sessions", ok);
+        System.err.printf("    %d/%d ok, %d ms total, %.0f ms avg%n",
+            iterations - failures, iterations, elapsed, (double)elapsed / iterations);
+    }
+
+    void testStressBashHeavyInit() throws Exception {
+        // Each bash invocation does full __libc_init + init file parsing
+        // Tests that _start path reinitializes correctly every time
+        int iterations = 10;
+        int failures = 0;
+        long start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            Result r = runHermuxSession(getBashPath(), "echo heavy_" + i + " $(echo nested_" + i + ")");
+            if (r.exitCode != 0 || !r.output.contains("heavy_" + i) || !r.output.contains("nested_" + i)) {
+                failures++;
+                if (failures <= 3) {
+                    System.err.printf("    iter %d: exit=%d output=[%s]%n", i, r.exitCode,
+                        r.output.length() > 80 ? r.output.substring(0, 80) + "..." : r.output);
+                }
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = failures == 0;
+        test("stress: 10 bash heavy init (large envp + subshell)", ok);
+        System.err.printf("    %d/%d ok, %d ms total, %.0f ms avg%n",
+            iterations - failures, iterations, elapsed, (double)elapsed / iterations);
+    }
+
+    void testStressHermuxRapid() throws Exception {
+        int iterations = 10;
+        int failures = 0;
+        long start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            String bash = getBashPath();
+            Result r = runHermuxSession(bash, "echo hermx_" + i);
+            if (r.exitCode != 0 || !r.output.contains("hermx_" + i)) {
+                failures++;
+                if (failures <= 3) {
+                    System.err.printf("    iter %d: exit=%d output=[%s]%n", i, r.exitCode,
+                        r.output.length() > 80 ? r.output.substring(0, 80) + "..." : r.output);
+                }
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = failures == 0;
+        test("stress: 10 rapid hermux bash sessions", ok);
+        System.err.printf("    %d/%d ok, %d ms total, %.0f ms avg%n",
+            iterations - failures, iterations, elapsed, (double)elapsed / iterations);
+    }
+
+    void testStressShBashAlternating() throws Exception {
+        int iterations = 10;
+        int failures = 0;
+        long start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            String cmd = "echo alt_" + (i % 2 == 0 ? "sh" : "bash") + "_" + i;
+            String shell = (i % 2 == 0) ? getShellPath() : getBashPath();
+            Result r = runHermuxSession(shell, cmd);
+            String expected = (i % 2 == 0) ? "alt_sh_" + i : "alt_bash_" + i;
+            if (r.exitCode != 0 || !r.output.contains(expected)) {
+                failures++;
+            }
+        }
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        boolean ok = failures == 0;
+        test("stress: 10 alternating sh/bash sessions", ok);
+        System.err.printf("    %d/%d ok, %d ms total, %.0f ms avg%n",
+            iterations - failures, iterations, elapsed, (double)elapsed / iterations);
+    }
+
     public static void main(String[] args) throws Exception {
         ensureLibsLoaded();
         TestTermuxSession t = new TestTermuxSession();
@@ -682,6 +911,75 @@ public class TestTermuxSession {
 
         System.err.println();
 
+        // Timing tests
+        System.err.println("--- Timing Tests ---");
+        t.testShColdStart();
+        t.testShWarmStart();
+        t.testBashColdStart();
+        t.testBashWarmStart();
+        t.testLargeOutputThroughput();
+        t.testHermuxSessionLatency();
+
+        System.err.println();
+
+        // Stress tests (before concurrency — uses hermux sessions, no default session corruption)
+        System.err.println("--- Stress Tests ---");
+        try {
+            t.testStressShRapid();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: stress sh crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testStressBashRapid();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: stress bash crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testStressBashHeavyInit();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: stress bash heavy crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testStressHermuxRapid();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: stress hermux crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testStressShBashAlternating();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: stress alternating crashed: " + e);
+            t.failed++;
+        }
+
+        System.err.println();
+
+        // Concurrency tests (last — uses separate hermux sessions for parallelism)
+        System.err.println("--- Concurrency Tests ---");
+        try {
+            t.testParallelSh();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: parallel sh crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testParallelBash();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: parallel bash crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testMixedConcurrent();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: mixed concurrent crashed: " + e);
+            t.failed++;
+        }
+
+        System.err.println();
+
         // Summary
         System.err.println("============================================================");
         System.err.printf("Results: %d passed, %d failed%n", t.passed, t.failed);
@@ -712,5 +1010,20 @@ public class TestTermuxSession {
             this.faultAddr = faultAddr;
             this.crashStage = crashStage;
         }
+    }
+
+    static class TimedResult extends Result {
+        long elapsedMs;
+        TimedResult(Result r, long elapsedMs) {
+            super(r.exitCode, r.output, r.crashed, r.faultAddr, r.crashStage);
+            this.elapsedMs = elapsedMs;
+        }
+    }
+
+    TimedResult runTimedCmdPty(String cmd) throws Exception {
+        long start = System.nanoTime();
+        Result r = runCmdPty(cmd);
+        long elapsed = (System.nanoTime() - start) / 1_000_000;
+        return new TimedResult(r, elapsed);
     }
 }

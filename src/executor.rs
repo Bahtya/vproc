@@ -25,7 +25,7 @@ pub struct Executor {
     switch_count: u64,
     pub children: HashMap<VPid, Vec<VPid>>,
     pub saved_fork_lr: Option<u64>,
-    exit_codes: HashMap<VPid, i32>,
+    pub(crate) exit_codes: HashMap<VPid, i32>,
 }
 
 impl Executor {

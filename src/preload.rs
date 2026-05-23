@@ -1006,10 +1006,7 @@ pub extern "C" fn select(
 #[no_mangle]
 pub extern "C" fn close(fd: c_int) -> c_int {
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            return f(fd);
-        }
+        return unsafe { real_close(fd) };
     }
     if fd < 0 {
         unsafe { *libc::__errno() = libc::EBADF };
@@ -1017,17 +1014,11 @@ pub extern "C" fn close(fd: c_int) -> c_int {
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            return f(fd);
-        }
+        None => return unsafe { real_close(fd) },
     };
     let table = match crate::vfd::get_table(vpid) {
         Some(t) => t,
-        None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            return f(fd);
-        }
+        None => return unsafe { real_close(fd) },
     };
     match table.get(fd as u32) {
         Some(crate::vfd::Vfd::Real(_real_fd)) => {
@@ -1050,10 +1041,7 @@ pub extern "C" fn close(fd: c_int) -> c_int {
                 -1
             }
         },
-        None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            f(fd)
-        },
+        None => unsafe { real_close(fd) },
     }
 }
 

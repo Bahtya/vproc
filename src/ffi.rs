@@ -10,19 +10,6 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
-/// Diagnostic logging for ART APK debugging.
-/// Uses libc::write to stderr — safe because vproc hooks target the loaded binary's GOT, not our own.
-macro_rules! diag_log {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        unsafe {
-            let bytes = msg.as_bytes();
-            libc::write(2, bytes.as_ptr() as *const _, bytes.len());
-            libc::write(2, b"\n".as_ptr() as *const _, 1);
-        }
-    }};
-}
-
 // ---------------------------------------------------------------------------
 // Per-session state
 // ---------------------------------------------------------------------------
@@ -141,8 +128,6 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
-    diag_log!("[ffi] create_process: enter path={} sid={}", path_str, session_id);
-
     unsafe { VPROC_CREATE_PROGRESS = 1; }
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
@@ -155,7 +140,6 @@ pub extern "C" fn vproc_ffi_create_process(
         let session = match sessions.get(&session_id) {
             Some(s) => Arc::clone(s),
             None => {
-                diag_log!("[ffi] create_process: session {} not found", session_id);
                 return 0;
             }
         };
@@ -172,13 +156,10 @@ pub extern "C" fn vproc_ffi_create_process(
         match sq {
             Some(q) => q,
             None => {
-                diag_log!("[ffi] create_process: failed to lock session spawn_queue");
                 return 0;
             }
         }
     };
-
-    diag_log!("[ffi] create_process: pushing to spawn_queue");
 
     unsafe { VPROC_CREATE_PROGRESS = 5; }
 
@@ -197,7 +178,6 @@ pub extern "C" fn vproc_ffi_create_process(
     }
 
     unsafe { VPROC_CREATE_PROGRESS = 6; }
-    diag_log!("[ffi] create_process: waiting for driver to process");
 
     // Wait for driver to process — poll with direct nanosleep
     let mut attempts = 0;
@@ -207,13 +187,11 @@ pub extern "C" fn vproc_ffi_create_process(
             let guard = lock.lock().unwrap();
             if guard.is_some() {
                 let vpid = guard.unwrap_or(0);
-                diag_log!("[ffi] create_process: driver returned vpid={}", vpid);
                 return vpid;
             }
         }
         attempts += 1;
         if attempts > 1000 {
-            diag_log!("[ffi] create_process: TIMEOUT waiting for driver");
             return 0; // timeout after ~10s
         }
         unsafe {
@@ -238,7 +216,11 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
 
     {
         let s = session.lock().unwrap();
-        // Check if already done (driver thread may have completed it)
+        // Check stored exit code first (works even after coroutine was reaped)
+        if let Some(&code) = s.executor.exit_codes.get(&vpid) {
+            return code;
+        }
+        // Check live coroutine
         if let Some(code) = s.executor.vprocs.get(&vpid).and_then(|co| {
             if co.is_done() { Some(co.exit_code) } else { None }
         }) {
@@ -247,6 +229,9 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
         drop(s);
         let mut s = session.lock().unwrap();
         // Re-check after re-acquiring lock (driver could have finished between drops)
+        if let Some(&code) = s.executor.exit_codes.get(&vpid) {
+            return code;
+        }
         if let Some(code) = s.executor.vprocs.get(&vpid).and_then(|co| {
             if co.is_done() { Some(co.exit_code) } else { None }
         }) {
@@ -259,29 +244,27 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
         s.wake.notify_all();
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    loop {
-        {
-            let (lock, _) = &*result;
-            let guard = lock.lock().unwrap();
-            if guard.is_some() {
-                return guard.unwrap_or(-1);
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return -1;
+    // Wait for exit — poll with 10ms sleep
+    for _ in 0..30000 {
+        let (lock, _) = &*result;
+        if let Some(code) = *lock.lock().unwrap() {
+            return code;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    -1
 }
 
 /// Check if a virtual process exists within a session.
+/// Also returns 1 for already-exited (reaped) processes whose exit code is stored.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_vpid_exists(session_id: u32, vpid: u32) -> c_int {
     let sessions = SESSIONS.lock().unwrap();
     if let Some(session) = sessions.get(&session_id) {
         let s = session.lock().unwrap();
-        if s.executor.vprocs.contains_key(&vpid) {
+        if s.executor.vprocs.contains_key(&vpid)
+            || s.executor.exit_codes.contains_key(&vpid)
+        {
             return 1;
         }
     }
@@ -804,7 +787,6 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                 sq_lock.lock().unwrap().drain(..).collect()
             };
             for req in requests {
-                diag_log!("[driver] processing spawn: path={}", req.path);
                 let vpid = match crate::vexec::virtual_execve_via_entry(
                     &req.path, req.argv, req.envp,
                 ) {
@@ -888,9 +870,8 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                 || !s.waiters.is_empty()
                 || has_ready;
             if !has_work && !s.shutdown {
-                // Use nanosleep instead of Condvar — avoids ART mutex issues
                 drop(s);
-                let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 }; // 10ms
+                let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
                 unsafe { libc::nanosleep(&ts, std::ptr::null_mut()); }
             }
         }
