@@ -341,6 +341,8 @@ struct cp_arg {
 
 static void *cp_thread_fn(void *a) {
     struct cp_arg *c = (struct cp_arg *)a;
+    /* Reduce timer slack for this thread */
+    prctl(29, 50000, 0, 0, 0);
     ALOGI("cp_thread: enter, calling _s(sid=%u)", c->sid);
     *(c->vpid_out) = g_vproc_create_process_s(c->sid, c->path, c->argv, c->envp,
         c->fds[0], c->fds[1], c->fds[2]);
@@ -508,10 +510,16 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
     pthread_t cp_tid;
     pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
 
-    /* Wait and log progress — 250ms poll up to 10s */
-    for (int i = 0; i < 40; i++) {
-        usleep(250000);
-        ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+    /* Reduce timer slack from ~40ms (Android background) to 50µs.
+     * PR_SET_TIMERSLACK = 29. Safe for untrusted apps. */
+    prctl(29, 50000, 0, 0, 0);
+
+    /* Wait and log progress — 10ms poll up to 10s */
+    for (int i = 0; i < 1000; i++) {
+        usleep(10000);
+        if (i % 25 == 0) {
+            ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+        }
         if (vpid != 0) break;
     }
     pthread_join(cp_tid, NULL);

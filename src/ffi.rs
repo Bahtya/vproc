@@ -128,13 +128,17 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
+    // Reduce timer slack from ~40ms (Android background default) to 50µs.
+    // This makes nanosleep(10ms) actually sleep ~10ms instead of ~50ms.
+    unsafe { libc::prctl(29, 50_000, 0, 0, 0); }
+
     unsafe { VPROC_CREATE_PROGRESS = 1; }
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
     unsafe { VPROC_CREATE_PROGRESS = 2; }
 
-    let spawn_queue = {
+    let (spawn_queue, session) = {
         let sessions = SESSIONS.lock().unwrap();
         unsafe { VPROC_CREATE_PROGRESS = 3; }
         let session = match sessions.get(&session_id) {
@@ -154,7 +158,7 @@ pub extern "C" fn vproc_ffi_create_process(
             unsafe { libc::nanosleep(&libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 }, std::ptr::null_mut()); }
         }
         match sq {
-            Some(q) => q,
+            Some(q) => (q, session),
             None => {
                 return 0;
             }
@@ -175,6 +179,12 @@ pub extern "C" fn vproc_ffi_create_process(
             result: Arc::clone(&result),
         });
         cvar.notify_all();
+    }
+
+    // Wake driver thread — it waits on Session.wake, not spawn_queue's condvar
+    {
+        let s = session.lock().unwrap();
+        s.wake.notify_all();
     }
 
     unsafe { VPROC_CREATE_PROGRESS = 6; }
@@ -205,6 +215,9 @@ pub extern "C" fn vproc_ffi_create_process(
 /// Returns the exit code, or -1 on error/timeout.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int {
+    // Reduce timer slack for this thread
+    unsafe { libc::prctl(29, 50_000, 0, 0, 0); }
+
     let result = Arc::new((Mutex::new(None::<i32>), Condvar::new()));
 
     let sessions = SESSIONS.lock().unwrap();
@@ -858,21 +871,26 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
             }
         }
 
-        // Check if there's anything left to do before sleeping
+        // Wait for work using condvar — untimed wait is NOT affected by timer slack.
+        // Must loop to guard against spurious wakeups.
+        // Use raw pointer to wake field to avoid borrow-after-move (wake lives inside
+        // Session behind Arc<Mutex>, so it's stable for the lifetime of the wait).
         {
-            let s = session.lock().unwrap();
-            let spawn_has_work = {
-                let (sq_lock, _) = &*s.spawn_queue;
-                !sq_lock.lock().unwrap().is_empty()
-            };
-            let has_ready = !s.executor.vprocs.values().all(|c| c.is_done() || c.io_wait.is_some());
-            let has_work = spawn_has_work
-                || !s.waiters.is_empty()
-                || has_ready;
-            if !has_work && !s.shutdown {
-                drop(s);
-                let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
-                unsafe { libc::nanosleep(&ts, std::ptr::null_mut()); }
+            let mut s = session.lock().unwrap();
+            let wake_ptr = &s.wake as *const Condvar;
+            loop {
+                let spawn_has_work = {
+                    let (sq_lock, _) = &*s.spawn_queue;
+                    !sq_lock.lock().unwrap().is_empty()
+                };
+                let has_ready = !s.executor.vprocs.values().all(|c| c.is_done() || c.io_wait.is_some());
+                let has_work = spawn_has_work
+                    || !s.waiters.is_empty()
+                    || has_ready;
+                if has_work || s.shutdown {
+                    break;
+                }
+                s = unsafe { &*wake_ptr }.wait(s).unwrap();
             }
         }
     }

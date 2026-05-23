@@ -45,7 +45,7 @@ $(BUILDDIR)/classes.dex: $(BUILDDIR)/.classes
 $(BUILDDIR)/BuildArtApk.class: BuildArtApk.java | $(BUILDDIR)
 	$(JAVAC) -d $(BUILDDIR) $<
 
-$(BUILDDIR)/debug.keystore:
+debug.keystore:
 	$(KEYTOOL) -genkeypair -v -keystore $@ \
 		-alias arttest -keyalg RSA -keysize 2048 -validity 10000 \
 		-storepass android -key-pass android \
@@ -63,9 +63,9 @@ $(BUILDDIR)/unsigned.apk: $(BUILDDIR)/BuildArtApk.class $(BUILDDIR)/classes.dex 
 		libsh.so libbash.so libandroid-support.so \
 		libiconv.so libreadline.so libncursesw.so
 
-$(BUILDDIR)/art_test.apk: $(BUILDDIR)/unsigned.apk $(BUILDDIR)/debug.keystore
+$(BUILDDIR)/art_test.apk: $(BUILDDIR)/unsigned.apk debug.keystore
 	bash /data/data/com.termux/files/home/android-sdk/build-tools/35.0.0/apksigner sign \
-		--ks $(BUILDDIR)/debug.keystore --ks-pass pass:android --key-pass pass:android \
+		--ks debug.keystore --ks-pass pass:android --key-pass pass:android \
 		--out $@ $<
 
 $(BUILDDIR):
@@ -97,7 +97,5 @@ ping:
 	curl -s --max-time 5 http://127.0.0.1:$(PORT)/ping
 
 clean:
-	@mv $(BUILDDIR)/debug.keystore /tmp/art_debug.keystore 2>/dev/null || true
 	rm -rf $(BUILDDIR)
-	@mkdir -p $(BUILDDIR)
-	@mv /tmp/art_debug.keystore $(BUILDDIR)/debug.keystore 2>/dev/null || true
+	mkdir -p $(BUILDDIR)
