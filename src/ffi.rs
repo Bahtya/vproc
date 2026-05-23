@@ -10,6 +10,19 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+/// Diagnostic logging for ART APK debugging.
+/// Uses libc::write to stderr — safe because vproc hooks target the loaded binary's GOT, not our own.
+macro_rules! diag_log {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        unsafe {
+            let bytes = msg.as_bytes();
+            libc::write(2, bytes.as_ptr() as *const _, bytes.len());
+            libc::write(2, b"\n".as_ptr() as *const _, 1);
+        }
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // Per-session state
 // ---------------------------------------------------------------------------
@@ -128,6 +141,8 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
+    diag_log!("[ffi] create_process: enter path={} sid={}", path_str, session_id);
+
     unsafe { VPROC_CREATE_PROGRESS = 1; }
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
@@ -139,7 +154,10 @@ pub extern "C" fn vproc_ffi_create_process(
         unsafe { VPROC_CREATE_PROGRESS = 3; }
         let session = match sessions.get(&session_id) {
             Some(s) => Arc::clone(s),
-            None => return 0,
+            None => {
+                diag_log!("[ffi] create_process: session {} not found", session_id);
+                return 0;
+            }
         };
         drop(sessions);
         unsafe { VPROC_CREATE_PROGRESS = 4; }
@@ -153,9 +171,14 @@ pub extern "C" fn vproc_ffi_create_process(
         }
         match sq {
             Some(q) => q,
-            None => return 0,
+            None => {
+                diag_log!("[ffi] create_process: failed to lock session spawn_queue");
+                return 0;
+            }
         }
     };
+
+    diag_log!("[ffi] create_process: pushing to spawn_queue");
 
     unsafe { VPROC_CREATE_PROGRESS = 5; }
 
@@ -174,6 +197,7 @@ pub extern "C" fn vproc_ffi_create_process(
     }
 
     unsafe { VPROC_CREATE_PROGRESS = 6; }
+    diag_log!("[ffi] create_process: waiting for driver to process");
 
     // Wait for driver to process — poll with direct nanosleep
     let mut attempts = 0;
@@ -182,11 +206,14 @@ pub extern "C" fn vproc_ffi_create_process(
             let (lock, _) = &*result;
             let guard = lock.lock().unwrap();
             if guard.is_some() {
-                return guard.unwrap_or(0);
+                let vpid = guard.unwrap_or(0);
+                diag_log!("[ffi] create_process: driver returned vpid={}", vpid);
+                return vpid;
             }
         }
         attempts += 1;
         if attempts > 1000 {
+            diag_log!("[ffi] create_process: TIMEOUT waiting for driver");
             return 0; // timeout after ~10s
         }
         unsafe {
@@ -777,6 +804,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                 sq_lock.lock().unwrap().drain(..).collect()
             };
             for req in requests {
+                diag_log!("[driver] processing spawn: path={}", req.path);
                 let vpid = match crate::vexec::virtual_execve_via_entry(
                     &req.path, req.argv, req.envp,
                 ) {

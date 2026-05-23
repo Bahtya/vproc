@@ -645,8 +645,18 @@ public class TestTermuxSession {
         // --- Hermux flow tests (matches termux.c exactly) ---
         System.err.println("=== Hermux Flow Tests (createSubprocess + waitFor) ===");
         t.testHermuxShEcho();
-        t.testHermuxBashEcho();
-        t.testHermuxBashPipe();
+        try {
+            t.testHermuxBashEcho();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: bash test crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testHermuxBashPipe();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: bash pipe test crashed: " + e);
+            t.failed++;
+        }
         System.err.println();
 
         // sh baseline tests

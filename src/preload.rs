@@ -173,8 +173,38 @@ fn is_real_fork_child() -> bool {
     REAL_FORK_CHILD.load(Ordering::SeqCst)
 }
 
+/// Clear the fdsan ownership tag on an fd.
+/// Prevents fdsan abort when closing fds owned by unique_fd objects in other
+/// code (ART runtime, JNI bridge, etc.) — unavoidable when bash inherits all
+/// process fds in our dlopen-based virtual exec model.
+unsafe fn fdsan_clear_tag(fd: c_int) {
+    use std::sync::OnceLock;
+    type GetTagFn = unsafe extern "C" fn(c_int) -> u64;
+    type ExchangeTagFn = unsafe extern "C" fn(c_int, u64, u64);
+    static FUNCS: OnceLock<(Option<GetTagFn>, Option<ExchangeTagFn>)> = OnceLock::new();
+    let (get_tag, exchange_tag) = FUNCS.get_or_init(|| {
+        let gt = unsafe {
+            libc::dlsym(libc::RTLD_DEFAULT, b"android_fdsan_get_fd_tag\0".as_ptr() as *const _)
+        };
+        let et = unsafe {
+            libc::dlsym(libc::RTLD_DEFAULT, b"android_fdsan_exchange_owner_tag\0".as_ptr() as *const _)
+        };
+        (
+            if gt.is_null() { None } else { Some(std::mem::transmute(gt)) },
+            if et.is_null() { None } else { Some(std::mem::transmute(et)) },
+        )
+    });
+    if let (Some(gt), Some(et)) = (get_tag, exchange_tag) {
+        let tag = unsafe { gt(fd) };
+        if tag != 0 {
+            unsafe { et(fd, tag, 0); }
+        }
+    }
+}
+
 /// Call the real libc close() bypassing our interceptor.
 pub unsafe fn real_close(fd: c_int) -> c_int {
+    fdsan_clear_tag(fd);
     let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
     f(fd)
 }

@@ -253,18 +253,41 @@ pub fn build_auxv(image: &LoadedImage, interp_base: usize) -> Vec<[u64; 2]> {
     if let Some(hwcap) = hwcap {
         auxv.push([elf::AT_HWCAP, hwcap]);
     }
-    // AT_RANDOM: point to 16 static random bytes
-    auxv.push([elf::AT_RANDOM, RANDOM_BYTES.as_ptr() as u64]);
+    // AT_RANDOM: point to 16 random bytes (matches host process)
+    let random = get_random_bytes();
+    auxv.push([elf::AT_RANDOM, random.as_ptr() as u64]);
     auxv.push([elf::AT_NULL, 0]);
 
     auxv
 }
 
 /// Random bytes for AT_RANDOM (16 bytes).
-static RANDOM_BYTES: [u8; 16] = [
-    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-    0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-];
+/// Initialized from /proc/self/auxv on first use to match the host process's
+/// stack canary and MTE keys.
+static RANDOM_BYTES: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+
+fn get_random_bytes() -> &'static [u8; 16] {
+    RANDOM_BYTES.get_or_init(|| {
+        // Try reading AT_RANDOM from /proc/self/auxv
+        if let Some(data) = std::fs::read("/proc/self/auxv").ok() {
+            for i in (0..data.len().saturating_sub(15)).step_by(16) {
+                let kind = u64::from_ne_bytes(data[i..i + 8].try_into().unwrap_or([0; 8]));
+                let value = u64::from_ne_bytes(data[i + 8..i + 16].try_into().unwrap_or([0; 8]));
+                if kind == elf::AT_RANDOM {
+                    // value is a pointer to 16 random bytes
+                    let ptr = value as *const u8;
+                    let mut buf = [0u8; 16];
+                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16); }
+                    return buf;
+                }
+                if kind == elf::AT_NULL { break; }
+            }
+        }
+        // Fallback: static bytes (not ideal but safe)
+        [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+         0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]
+    })
+}
 
 /// Read AT_HWCAP from /proc/self/auxv.
 fn read_hwcap() -> Option<u64> {

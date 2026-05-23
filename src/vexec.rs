@@ -11,6 +11,18 @@ use crate::coroutine::VPid;
 use crate::elf;
 use crate::loader;
 
+/// Diagnostic logging for ART APK debugging.
+macro_rules! vdiag {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        unsafe {
+            let bytes = msg.as_bytes();
+            libc::write(2, bytes.as_ptr() as *const _, bytes.len());
+            libc::write(2, b"\n".as_ptr() as *const _, 1);
+        }
+    }};
+}
+
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
 
 /// Check if MTE (Memory Tagging Extension) is available — cached after first call.
@@ -316,6 +328,8 @@ pub fn virtual_execve_via_entry(
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<VirtualExec, String> {
+    vdiag!("[vexec] enter: path={}", path);
+
     let real_path = std::fs::canonicalize(path)
         .map_err(|e| format!("cannot canonicalize {}: {}", path, e))?;
     let real_path_str = real_path.to_str().ok_or("invalid path")?.to_string();
@@ -333,51 +347,71 @@ pub fn virtual_execve_via_entry(
         lock.get(&real_path_str).map(|e| (e.main_addr, Arc::clone(&e.saved_writable), e.handle.0))
     };
 
-    if let Some((main_addr, saved_writable, _handle)) = cached {
-        if main_addr == 0 {
-            // main() address couldn't be extracted on first load — this binary
-            // is not compatible. Remove the cache entry and dlclose the handle
-            // since no coroutine will ever reference it (active_users == 0).
-            let mut cache = BINARY_CACHE.lock().unwrap();
-            if let Some(entry) = cache.remove(&real_path_str) {
-                if !entry.handle.0.is_null() {
-                    unsafe { libc::dlclose(entry.handle.0); }
-                }
-            }
-            return Err(format!("cannot extract main() from {}", path));
-        }
-        // Binary already initialized — restore writable segments and re-patch GOT,
-        // then call main() directly, skipping _start/__libc_init.
+    if let Some((_main_addr, saved_writable, _handle)) = cached {
+        vdiag!("[vexec] cached: re-using dlopen'd binary via _start");
+
+        // Restore writable segments (.data/.bss) to post-dlopen state so
+        // __libc_init reinitializes from a clean slate.
         restore_writable_segments(&saved_writable);
 
-        // Re-read ELF to get phdrs for GOT re-patching after restore.
-        // The snapshot was taken before _start ran, so __libc_init may have
-        // modified GOT entries (e.g. resolved lazy bindings). Restore brings
-        // back the pre-_start GOT, so we must re-apply our hooks.
+        // Re-read ELF for phdrs and entry point
         let re_data = std::fs::read(&real_path)
             .map_err(|e| format!("cannot read {}: {}", path, e))?;
         let re_hdr = elf::parse_header(&re_data)?;
         let re_phdrs = elf::program_headers(&re_data, &re_hdr)?;
         let re_base = find_loaded_base(path).ok_or("cannot find re-loaded base")?;
+        let e_entry = re_hdr.e_entry as usize;
         patch_got_for_loaded_binary(re_base, &re_phdrs);
 
-        let vpid = spawn_main_coroutine(main_addr, argc, argv_c, envp_c, c_strings);
+        // Build ELF stack + auxv, same as first-load path
+        let entry_addr = re_base + e_entry;
+        let image = loader::LoadedImage {
+            base: re_base,
+            total_size: 0,
+            entry: entry_addr,
+            phdr_addr: re_base + (re_hdr.e_phoff as usize),
+            phnum: re_hdr.e_phnum,
+            phentsize: re_hdr.e_phentsize,
+            interp_path: None,
+        };
+        let auxv = loader::build_auxv(&image, 0);
+
+        let stack_base = alloc_elf_stack(ELF_STACK_SIZE);
+        if stack_base.is_null() {
+            return Err("stack allocation failed".into());
+        }
+        vdiag!("[vexec] cached: spawning _start coroutine at {:#x}", entry_addr);
+
+        let vpid = unsafe {
+            let ex = &mut *crate::executor::get_current_executor();
+            crate::executor::set_current_executor(ex as *mut _);
+            ex.spawn_elf(
+                entry_addr,
+                stack_base,
+                ELF_STACK_SIZE,
+                argc,
+                argv_c,
+                envp_c,
+                auxv,
+            )
+        };
+        register_elf_c_strings(vpid, c_strings);
         track_binary_user(vpid, &real_path_str);
-        // Inherit fd table from current coroutine (Linux execve preserves fds)
         if let Some(pid) = current_pid {
             crate::vfd::fork_fd_table(pid, vpid);
         }
-        // Close fds marked close-on-exec in the new process
         if let Some(child_table) = crate::vfd::get_table(vpid) {
             let real_fds = child_table.close_cloexec();
             for rfd in real_fds {
                 unsafe { crate::preload::real_close(rfd); }
             }
         }
+        vdiag!("[vexec] cached: done, vpid={}", vpid);
         return Ok(VirtualExec { vpid });
     }
 
     // First time: need to dlopen and run _start
+    vdiag!("[vexec] first load: reading ELF");
     let data = std::fs::read(&real_path)
         .map_err(|e| format!("cannot read {}: {}", path, e))?;
     let hdr = elf::parse_header(&data)?;
@@ -385,37 +419,52 @@ pub fn virtual_execve_via_entry(
     let phdrs = elf::program_headers(&data, &hdr)?;
 
     let c_path = std::ffi::CString::new(real_path_str.clone()).map_err(|e| e.to_string())?;
+
+    vdiag!("[vexec] calling dlopen({})", real_path_str);
     let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
     if handle.is_null() {
         let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) }
             .to_string_lossy()
             .into_owned();
+        vdiag!("[vexec] dlopen FAILED: {}", err);
         return Err(format!("dlopen({}): {}", path, err));
     }
+    vdiag!("[vexec] dlopen OK: handle={:?}", handle);
     // Guard dlclose's on early return; forgotten when handle is cached.
     let guard = DlGuard(handle);
 
+    vdiag!("[vexec] finding loaded base...");
     let base = find_loaded_base(path).ok_or_else(|| format!(
         "dlopen({}) succeeded but dl_iterate_phdr cannot find it", path
     ))?;
+    vdiag!("[vexec] base={:#x} entry_offset={:#x}", base, e_entry);
 
     let entry_addr = base + e_entry;
 
-    // Extract main() address from _start instructions before running it
-    let extracted = unsafe { extract_main_addr(entry_addr) };
+    // Extract main() address — try dlsym first (most reliable), then _start parsing
+    let mut main_addr: usize = 0;
+    let main_sym = unsafe { libc::dlsym(handle, b"main\0".as_ptr() as *const _) };
+    if !main_sym.is_null() {
+        main_addr = main_sym as usize;
+        vdiag!("[vexec] dlsym(main) = {:#x}", main_addr);
+    } else {
+        vdiag!("[vexec] dlsym(main) failed, trying extract_main_addr...");
+        let extracted = unsafe { extract_main_addr(entry_addr) };
+        vdiag!("[vexec] extract_main_addr: {:?}", extracted);
+        main_addr = extracted.unwrap_or(0);
+    }
 
+    vdiag!("[vexec] clear_init_arrays...");
     clear_init_arrays(base, &phdrs);
+    vdiag!("[vexec] hook_libc_exit...");
     hook_libc_exit();
+    vdiag!("[vexec] hook_libc_execve...");
     hook_libc_execve();
+    vdiag!("[vexec] patch_got_for_loaded_binary...");
     patch_got_for_loaded_binary(base, &phdrs);
+    vdiag!("[vexec] GOT patched, saving writable segments...");
 
-    // Save writable segment state AFTER clear_init_arrays + GOT patch but
-    // BEFORE _start runs. The snapshot has zeroed init_arrays and patched GOT,
-    // which is exactly what subsequent calls need restored before calling main().
-    // Always cache the entry so the handle is tracked for auto-dlclose.
-    // main_addr=0 means we couldn't extract main() — cache-hit path will
-    // skip the optimized main() call and fall through to _start instead.
-    let main_addr = extracted.unwrap_or(0);
+    // Save writable segment state AFTER clear_init_arrays + GOT patch.
     let saved = save_writable_segments(base, &phdrs);
     BINARY_CACHE.lock().unwrap().insert(real_path_str.clone(), BinaryCacheEntry {
         main_addr,
@@ -426,6 +475,10 @@ pub fn virtual_execve_via_entry(
     // Handle is now owned by the cache — prevent guard from dlclose'ing it.
     std::mem::forget(guard);
 
+    // Always use _start → __libc_init → main() path.
+    // Calling main() directly skips __libc_init which sets up TLS/stack canary
+    // state that bash needs — without it, initialize_shell_variables corrupts envp.
+    vdiag!("[vexec] no main() found, falling back to _start");
     let image = loader::LoadedImage {
         base,
         total_size: 0,
@@ -441,6 +494,7 @@ pub fn virtual_execve_via_entry(
     if stack_base.is_null() {
         return Err("stack allocation failed".into());
     }
+    vdiag!("[vexec] stack allocated at {:?}, spawning ELF coroutine at {:#x}...", stack_base, entry_addr);
 
     let vpid = unsafe {
         let ex = &mut *crate::executor::get_current_executor();
@@ -459,6 +513,7 @@ pub fn virtual_execve_via_entry(
     };
     register_elf_c_strings(vpid, c_strings);
     track_binary_user(vpid, &real_path_str);
+    vdiag!("[vexec] coroutine spawned: vpid={}", vpid);
 
     // Inherit fd table from current coroutine (Linux execve preserves fds)
     if let Some(pid) = current_pid {
@@ -472,6 +527,7 @@ pub fn virtual_execve_via_entry(
         }
     }
 
+    vdiag!("[vexec] done: vpid={}", vpid);
     Ok(VirtualExec { vpid })
 }
 
@@ -624,6 +680,7 @@ fn restore_writable_segments(segments: &[WritableSegment]) {
 /// real functions. We overwrite GOT entries for intercepted symbols (fork, execve,
 /// pipe, etc.) so they point to our `#[no_mangle]` overrides instead.
 fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
+    vdiag!("[vexec] patch_got: base={:#x}", base);
     let dyn_phdr = match phdrs.iter().find(|p| p.p_type == elf::PT_DYNAMIC) {
         Some(p) => p,
         None => return,
@@ -720,8 +777,11 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
     }
 
     if patches.is_empty() {
+        vdiag!("[vexec] patch_got: no patches needed");
         return;
     }
+
+    vdiag!("[vexec] patch_got: {} patches across {} pages", patches.len(), pages.len());
 
     // Batch mprotect: make all unique pages writable
     for &page in &pages {
@@ -737,6 +797,7 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
     for &page in &pages {
         mprotect_mte_aware(page, 0x2000, libc::PROT_READ);
     }
+    vdiag!("[vexec] patch_got: done");
 }
 
 /// Extract main() address from _start's instruction sequence.
@@ -817,6 +878,7 @@ fn spawn_main_coroutine(
     envp: Vec<*const u8>,
     c_strings: Vec<*mut u8>,
 ) -> VPid {
+    let envp_len = envp.len();
     let vpid = crate::spawn(Box::new(move || {
         let main_fn: extern "C" fn(c_int, *const *const u8, *const *const u8) -> c_int =
             unsafe { std::mem::transmute(main_addr) };
@@ -827,6 +889,28 @@ fn spawn_main_coroutine(
         let envp_ptr = envp.as_ptr();
         std::mem::forget(argv);
         std::mem::forget(envp);
+
+        // Diagnostic: dump envp state before calling main()
+        vdiag!("[vexec] about to call main({:#x}): argc={} argv_ptr={:?} envp_ptr={:?} envp_len={}",
+            main_addr, argc, argv_ptr, envp_ptr, envp_len);
+        for i in 0..std::cmp::min(envp_len, 5) {
+            let p = unsafe { *envp_ptr.add(i) };
+            let bytes = if !p.is_null() {
+                let mut b = [0u8; 16];
+                unsafe { std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), 16); }
+                Some(b)
+            } else { None };
+            vdiag!("[vexec]   envp[{}]={:#x} bytes={:?}", i, p as usize, bytes);
+        }
+        // Also check global __environ
+        let environ_sym = unsafe { libc::dlsym(std::ptr::null_mut(), b"__environ\0".as_ptr() as *const _) };
+        if !environ_sym.is_null() {
+            let env_global = unsafe { *(environ_sym as *const *const std::os::raw::c_char) };
+            vdiag!("[vexec]   __environ={:#x} (envp_ptr={:#x} diff={})",
+                env_global as usize, envp_ptr as usize,
+                env_global as isize - envp_ptr as isize);
+        }
+
         let result = main_fn(argc as c_int, argv_ptr, envp_ptr);
         crate::executor::vproc_exit_with_code(result);
     }));
@@ -864,14 +948,18 @@ fn register_elf_c_strings(vpid: VPid, c_strings: Vec<*mut u8>) {
 ///   br  x16             // branch to target
 ///   .quad target        // 64-bit target address
 unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
+    vdiag!("[vexec] write_inline_hook: addr={:#x} target={:#x}", func_addr, target);
     let page = func_addr & !0xfff;
     if mprotect_mte_aware(
         page,
         0x2000,
         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
     ) != 0 {
+        let errno = unsafe { *libc::__errno() };
+        vdiag!("[vexec] write_inline_hook: mprotect RWX FAILED errno={}", errno);
         return false;
     }
+    vdiag!("[vexec] write_inline_hook: mprotect RWX OK, writing trampoline");
 
     let code = func_addr as *mut u32;
     std::ptr::write_unaligned(code, 0x58000050);       // ldr x16, [pc, #8]
