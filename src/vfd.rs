@@ -407,16 +407,24 @@ pub fn remove_table_and_get_fds(vpid: u32) -> Vec<i32> {
         None => return Vec::new(),
     };
     let mut fds = Vec::new();
-    let mut seen: Vec<*const FileRef> = Vec::new();
+    let mut seen_real: Vec<i32> = Vec::new();
+    let mut seen_file: Vec<*const FileRef> = Vec::new();
     for vfd in table.fds.values() {
-        if let Vfd::File(arc) = vfd {
-            let arc_ptr = Arc::as_ptr(arc);
-            if seen.iter().all(|&p| p != arc_ptr) {
-                if Arc::strong_count(arc) == 1 {
-                    fds.push(arc.real_fd);
-                }
-                seen.push(arc_ptr);
+        match vfd {
+            Vfd::Real(fd) if !seen_real.contains(fd) => {
+                fds.push(*fd);
+                seen_real.push(*fd);
             }
+            Vfd::File(arc) => {
+                let arc_ptr = Arc::as_ptr(arc);
+                if seen_file.iter().all(|&p| p != arc_ptr) {
+                    if Arc::strong_count(arc) == 1 {
+                        fds.push(arc.real_fd);
+                    }
+                    seen_file.push(arc_ptr);
+                }
+            }
+            _ => {}
         }
     }
     // Now drop the table (decrements Arc refcounts for shared fds).

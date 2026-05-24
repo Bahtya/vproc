@@ -152,6 +152,20 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
     ptr
 }
 
+/// Resolve a libc symbol via dlsym and transmute to the given function pointer type.
+///
+/// # Safety
+///
+/// - `$name` must be a null-terminated C string identifying a valid libc symbol
+/// - `$ty` must be an `extern "C" fn(...)` type matching the symbol's actual ABI
+macro_rules! real_fn {
+    ($name:expr, $ty:ty) => {{
+        let ptr = real($name);
+        debug_assert!(!ptr.is_null(), "real_fn: dlsym returned null for {}", $name);
+        std::mem::transmute::<*mut std::ffi::c_void, $ty>(ptr)
+    }};
+}
+
 fn current_vpid() -> Option<crate::coroutine::VPid> {
     let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
@@ -207,7 +221,7 @@ unsafe fn fdsan_clear_tag(fd: c_int) {
 /// `fd` must be a valid open file descriptor (or -1, which is a no-op).
 pub unsafe fn real_close(fd: c_int) -> c_int {
     fdsan_clear_tag(fd);
-    let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
+    let f = unsafe { real_fn!("close\0", extern "C" fn(c_int) -> c_int) };
     f(fd)
 }
 
@@ -242,8 +256,7 @@ fn get_cwd() -> Option<String> {
 fn process_cwd() -> String {
     let mut buf = [0u8; 4096];
     unsafe {
-        let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
-            std::mem::transmute(real("getcwd\0"));
+        let f = real_fn!("getcwd\0", extern "C" fn(*mut c_char, usize) -> *mut c_char);
         let ptr = f(buf.as_mut_ptr() as *mut c_char, buf.len());
         if !ptr.is_null() {
             let len = libc::strlen(buf.as_ptr() as *const c_char);
@@ -262,7 +275,7 @@ fn process_cwd() -> String {
 pub extern "C" fn _exit(code: c_int) -> ! {
     if !enabled() || is_real_fork_child() {
         unsafe {
-            let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
+            let f = real_fn!("_exit\0", extern "C" fn(c_int) -> !);
             f(code);
         }
     }
@@ -284,7 +297,7 @@ pub extern "C" fn _exit(code: c_int) -> ! {
 pub extern "C" fn exit(code: c_int) -> ! {
     if !enabled() || is_real_fork_child() {
         unsafe {
-            let f: extern "C" fn(c_int) -> ! = std::mem::transmute(real("_exit\0"));
+            let f = real_fn!("_exit\0", extern "C" fn(c_int) -> !);
             f(code);
         }
     }
@@ -311,14 +324,14 @@ pub extern "C" fn exit(code: c_int) -> ! {
 pub extern "C" fn getpid() -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpid\0"));
+            let f = real_fn!("getpid\0", extern "C" fn() -> c_int);
             return f();
         }
     }
     match current_vpid() {
         Some(p) => p as c_int,
         None => unsafe {
-            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpid\0"));
+            let f = real_fn!("getpid\0", extern "C" fn() -> c_int);
             f()
         },
     }
@@ -328,14 +341,14 @@ pub extern "C" fn getpid() -> c_int {
 pub extern "C" fn getppid() -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
+            let f = real_fn!("getppid\0", extern "C" fn() -> c_int);
             return f();
         }
     }
     let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
         unsafe {
-            let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
+            let f = real_fn!("getppid\0", extern "C" fn() -> c_int);
             return f();
         }
     }
@@ -348,7 +361,7 @@ pub extern "C" fn getppid() -> c_int {
                 .map(|co| co.ppid as c_int)
                 .unwrap_or(0),
             None => {
-                let f: extern "C" fn() -> c_int = std::mem::transmute(real("getppid\0"));
+                let f = real_fn!("getppid\0", extern "C" fn() -> c_int);
                 f()
             }
         }
@@ -363,7 +376,7 @@ pub extern "C" fn getppid() -> c_int {
 pub extern "C" fn fork() -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+            let f = real_fn!("fork\0", extern "C" fn() -> c_int);
             return f();
         }
     }
@@ -374,7 +387,7 @@ pub extern "C" fn fork() -> c_int {
     // per-process bookkeeping. Raw clone skips these, leaving the child
     // in an inconsistent state.
     let pid = unsafe {
-        let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+        let f = real_fn!("fork\0", extern "C" fn() -> c_int);
         f()
     };
     if pid == 0 {
@@ -509,7 +522,7 @@ pub extern "C" fn execve(
             let c_path = std::ffi::CString::new(path_str.into_owned())
                 .unwrap_or_default();
             let pid = unsafe {
-                let f: extern "C" fn() -> c_int = std::mem::transmute(real("fork\0"));
+                let f = real_fn!("fork\0", extern "C" fn() -> c_int);
                 f()
             };
             if pid < 0 {
@@ -576,14 +589,14 @@ static EXECVE_CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
+            let f = real_fn!("pipe\0", extern "C" fn(*mut c_int) -> c_int);
             return f(fds);
         }
     }
     // Use real pipe() so that real fork() children inherit working pipe fds.
     // Virtual pipes can't cross real fork() boundaries.
     unsafe {
-        let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(real("pipe\0"));
+        let f = real_fn!("pipe\0", extern "C" fn(*mut c_int) -> c_int);
         f(fds)
     }
 }
@@ -592,13 +605,13 @@ pub extern "C" fn pipe(fds: *mut c_int) -> c_int {
 pub extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn(*mut c_int, c_int) -> c_int = std::mem::transmute(real("pipe2\0"));
+            let f = real_fn!("pipe2\0", extern "C" fn(*mut c_int, c_int) -> c_int);
             return f(fds, flags);
         }
     }
     // Same as pipe() — use real pipe2 so real fork children inherit working fds.
     unsafe {
-        let f: extern "C" fn(*mut c_int, c_int) -> c_int = std::mem::transmute(real("pipe2\0"));
+        let f = real_fn!("pipe2\0", extern "C" fn(*mut c_int, c_int) -> c_int);
         f(fds, flags)
     }
 }
@@ -611,8 +624,7 @@ pub extern "C" fn pipe2(fds: *mut c_int, flags: c_int) -> c_int {
 pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
     if !enabled() || is_real_fork_child() {
         unsafe {
-            let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-                std::mem::transmute(real("read\0"));
+            let f = real_fn!("read\0", extern "C" fn(c_int, *mut c_void, usize) -> isize);
             return f(fd, buf, count);
         }
     }
@@ -623,8 +635,7 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
     let vpid = match current_vpid() {
         Some(p) => p,
         None => unsafe {
-            let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-                std::mem::transmute(real("read\0"));
+            let f = real_fn!("read\0", extern "C" fn(c_int, *mut c_void, usize) -> isize);
             return f(fd, buf, count);
         }
     };
@@ -645,27 +656,17 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
             })
             .unwrap_or(fd);
         // poll-before-read: check readiness with timeout=0 to avoid blocking the driver thread.
+        let real_poll = unsafe { real_fn!("poll\0", extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int) };
+        let real_read = unsafe { real_fn!("read\0", extern "C" fn(c_int, *mut c_void, usize) -> isize) };
         loop {
             let mut pfd = libc::pollfd { fd: real_fd, events: libc::POLLIN, revents: 0 };
-            let ready = unsafe {
-                let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                    std::mem::transmute(real("poll\0"));
-                f(&mut pfd, 1, 0)
-            };
+            let ready = real_poll(&mut pfd, 1, 0);
             if ready > 0 {
                 if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                    unsafe {
-                        let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-                            std::mem::transmute(real("read\0"));
-                        return f(real_fd, buf, count);
-                    }
+                    return real_read(real_fd, buf, count);
                 }
                 // POLLERR/POLLNVAL — fall through to read to get proper errno
-                unsafe {
-                    let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-                        std::mem::transmute(real("read\0"));
-                    return f(real_fd, buf, count);
-                }
+                return real_read(real_fd, buf, count);
             }
             if ready < 0 { return -1; }
             // Not ready — yield waiting for I/O (driver thread will batch poll)
@@ -698,8 +699,7 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
 pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
     if !enabled() || is_real_fork_child() {
         unsafe {
-            let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
-                std::mem::transmute(real("write\0"));
+            let f = real_fn!("write\0", extern "C" fn(c_int, *const c_void, usize) -> isize);
             return f(fd, buf, count);
         }
     }
@@ -710,8 +710,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
     let vpid = match current_vpid() {
         Some(p) => p,
         None => unsafe {
-            let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
-                std::mem::transmute(real("write\0"));
+            let f = real_fn!("write\0", extern "C" fn(c_int, *const c_void, usize) -> isize);
             return f(fd, buf, count);
         }
     };
@@ -731,27 +730,17 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
             })
             .unwrap_or(fd);
         // poll-before-write: check readiness with timeout=0.
+        let real_poll = unsafe { real_fn!("poll\0", extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int) };
+        let real_write = unsafe { real_fn!("write\0", extern "C" fn(c_int, *const c_void, usize) -> isize) };
         loop {
             let mut pfd = libc::pollfd { fd: real_fd, events: libc::POLLOUT, revents: 0 };
-            let ready = unsafe {
-                let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                    std::mem::transmute(real("poll\0"));
-                f(&mut pfd, 1, 0)
-            };
+            let ready = real_poll(&mut pfd, 1, 0);
             if ready > 0 {
                 if pfd.revents & libc::POLLOUT != 0 {
-                    unsafe {
-                        let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
-                            std::mem::transmute(real("write\0"));
-                        return f(real_fd, buf, count);
-                    }
+                    return real_write(real_fd, buf, count);
                 }
                 // POLLERR/POLLHUP — fall through to write to get proper errno
-                unsafe {
-                    let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
-                        std::mem::transmute(real("write\0"));
-                    return f(real_fd, buf, count);
-                }
+                return real_write(real_fd, buf, count);
             }
             if ready < 0 { return -1; }
             // Not ready — yield waiting for I/O
@@ -791,28 +780,17 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
 
 #[no_mangle]
 pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_int) -> c_int {
+    let real_poll = unsafe { real_fn!("poll\0", extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                std::mem::transmute(real("poll\0"));
-            return f(fds, nfds, timeout);
-        }
+        return real_poll(fds, nfds, timeout);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                std::mem::transmute(real("poll\0"));
-            return f(fds, nfds, timeout);
-        }
+        None => return real_poll(fds, nfds, timeout),
     };
 
     if fds.is_null() || nfds == 0 {
-        unsafe {
-            let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                std::mem::transmute(real("poll\0"));
-            return f(fds, nfds, timeout);
-        }
+        return real_poll(fds, nfds, timeout);
     }
 
     loop {
@@ -846,11 +824,7 @@ pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_in
                 Some(crate::vfd::Vfd::Real(r)) => {
                     let real_fd = *r;
                     let mut check = libc::pollfd { fd: real_fd, events: pfd.events, revents: 0 };
-                    let ready = unsafe {
-                        let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                            std::mem::transmute(real("poll\0"));
-                        f(&mut check, 1, 0)
-                    };
+                    let ready = real_poll(&mut check, 1, 0);
                     if ready > 0 {
                         pfd.revents = check.revents;
                     } else {
@@ -860,11 +834,7 @@ pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_in
                 Some(crate::vfd::Vfd::File(file_ref)) => {
                     let real_fd = file_ref.real_fd;
                     let mut check = libc::pollfd { fd: real_fd, events: pfd.events, revents: 0 };
-                    let ready = unsafe {
-                        let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                            std::mem::transmute(real("poll\0"));
-                        f(&mut check, 1, 0)
-                    };
+                    let ready = real_poll(&mut check, 1, 0);
                     if ready > 0 {
                         pfd.revents = check.revents;
                     } else {
@@ -874,11 +844,7 @@ pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_in
                 None => {
                     // Unknown fd — real poll with timeout=0
                     let mut check = libc::pollfd { fd: pfd.fd, events: pfd.events, revents: 0 };
-                    let ready = unsafe {
-                        let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
-                            std::mem::transmute(real("poll\0"));
-                        f(&mut check, 1, 0)
-                    };
+                    let ready = real_poll(&mut check, 1, 0);
                     if ready > 0 {
                         pfd.revents = check.revents;
                     } else {
@@ -925,18 +891,12 @@ pub extern "C" fn select(
     timeout: *mut libc::timeval,
 ) -> c_int {
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int, *mut libc::fd_set, *mut libc::fd_set, *mut libc::fd_set, *mut libc::timeval) -> c_int =
-                std::mem::transmute(real("select\0"));
-            return f(nfds, readfds, writefds, exceptfds, timeout);
-        }
+        let f = unsafe { real_fn!("select\0", extern "C" fn(c_int, *mut libc::fd_set, *mut libc::fd_set, *mut libc::fd_set, *mut libc::timeval) -> c_int) };
+        return f(nfds, readfds, writefds, exceptfds, timeout);
     }
     if current_vpid().is_none() {
-        unsafe {
-            let f: extern "C" fn(c_int, *mut libc::fd_set, *mut libc::fd_set, *mut libc::fd_set, *mut libc::timeval) -> c_int =
-                std::mem::transmute(real("select\0"));
-            return f(nfds, readfds, writefds, exceptfds, timeout);
-        }
+        let f = unsafe { real_fn!("select\0", extern "C" fn(c_int, *mut libc::fd_set, *mut libc::fd_set, *mut libc::fd_set, *mut libc::timeval) -> c_int) };
+        return f(nfds, readfds, writefds, exceptfds, timeout);
     }
 
     // Convert timeout to poll-style milliseconds
@@ -1045,21 +1005,21 @@ pub extern "C" fn close(fd: c_int) -> c_int {
 pub extern "C" fn dup(old_fd: c_int) -> c_int {
     if !enabled() || is_real_fork_child() {
         unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("dup\0"));
+            let f = real_fn!("dup\0", extern "C" fn(c_int) -> c_int);
             return f(old_fd);
         }
     }
     let vpid = match current_vpid() {
         Some(p) => p,
         None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("dup\0"));
+            let f = real_fn!("dup\0", extern "C" fn(c_int) -> c_int);
             return f(old_fd);
         }
     };
     let table = match crate::vfd::get_table(vpid) {
         Some(t) => t,
         None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("dup\0"));
+            let f = real_fn!("dup\0", extern "C" fn(c_int) -> c_int);
             return f(old_fd);
         }
     };
@@ -1076,21 +1036,21 @@ pub extern "C" fn dup(old_fd: c_int) -> c_int {
 pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
     if !enabled() || is_real_fork_child() {
         unsafe {
-            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("dup2\0"));
+            let f = real_fn!("dup2\0", extern "C" fn(c_int, c_int) -> c_int);
             return f(old_fd, new_fd);
         }
     }
     let vpid = match current_vpid() {
         Some(p) => p,
         None => unsafe {
-            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("dup2\0"));
+            let f = real_fn!("dup2\0", extern "C" fn(c_int, c_int) -> c_int);
             return f(old_fd, new_fd);
         }
     };
     let table = match crate::vfd::get_table(vpid) {
         Some(t) => t,
         None => unsafe {
-            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("dup2\0"));
+            let f = real_fn!("dup2\0", extern "C" fn(c_int, c_int) -> c_int);
             return f(old_fd, new_fd);
         }
     };
@@ -1111,7 +1071,7 @@ pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
 pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("kill\0"));
+            let f = real_fn!("kill\0", extern "C" fn(c_int, c_int) -> c_int);
             return f(pid, sig);
         }
     }
@@ -1130,7 +1090,7 @@ pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
     }
     // Real process or process group (negative pid / pid=0) — pass through
     unsafe {
-        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("kill\0"));
+        let f = real_fn!("kill\0", extern "C" fn(c_int, c_int) -> c_int);
         f(pid, sig)
     }
 }
@@ -1143,7 +1103,7 @@ pub extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {
 pub extern "C" fn getpgid(pid: c_int) -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("getpgid\0"));
+            let f = real_fn!("getpgid\0", extern "C" fn(c_int) -> c_int);
             return f(pid);
         }
     }
@@ -1163,7 +1123,7 @@ pub extern "C" fn getpgid(pid: c_int) -> c_int {
     }
     // Real process — pass through
     unsafe {
-        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("getpgid\0"));
+        let f = real_fn!("getpgid\0", extern "C" fn(c_int) -> c_int);
         f(pid)
     }
 }
@@ -1172,7 +1132,7 @@ pub extern "C" fn getpgid(pid: c_int) -> c_int {
 pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
     if !enabled() {
         unsafe {
-            let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("setpgid\0"));
+            let f = real_fn!("setpgid\0", extern "C" fn(c_int, c_int) -> c_int);
             return f(pid, pgid);
         }
     }
@@ -1191,7 +1151,7 @@ pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
     }
     // Real process — pass through
     unsafe {
-        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("setpgid\0"));
+        let f = real_fn!("setpgid\0", extern "C" fn(c_int, c_int) -> c_int);
         f(pid, pgid)
     }
 }
@@ -1204,7 +1164,7 @@ pub extern "C" fn setsid() -> c_int {
         }
     }
     unsafe {
-        let f: extern "C" fn() -> c_int = std::mem::transmute(real("setsid\0"));
+        let f = real_fn!("setsid\0", extern "C" fn() -> c_int);
         f()
     }
 }
@@ -1217,7 +1177,7 @@ pub extern "C" fn getpgrp() -> c_int {
         }
     }
     unsafe {
-        let f: extern "C" fn() -> c_int = std::mem::transmute(real("getpgrp\0"));
+        let f = real_fn!("getpgrp\0", extern "C" fn() -> c_int);
         f()
     }
 }
@@ -1236,7 +1196,7 @@ pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
         }
     }
     unsafe {
-        let f: extern "C" fn(c_int, c_int) -> c_int = std::mem::transmute(real("tcsetpgrp\0"));
+        let f = real_fn!("tcsetpgrp\0", extern "C" fn(c_int, c_int) -> c_int);
         f(fd, pgid)
     }
 }
@@ -1255,7 +1215,7 @@ pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
         }
     }
     unsafe {
-        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("tcgetpgrp\0"));
+        let f = real_fn!("tcgetpgrp\0", extern "C" fn(c_int) -> c_int);
         f(fd)
     }
 }
@@ -1287,7 +1247,7 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
     }
     // Not in a coroutine or not enabled — pass through to real raise
     unsafe {
-        let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("raise\0"));
+        let f = real_fn!("raise\0", extern "C" fn(c_int) -> c_int);
         f(sig)
     }
 }
@@ -1298,31 +1258,20 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn chdir(path: *const c_char) -> c_int {
+    let real_chdir = unsafe { real_fn!("chdir\0", extern "C" fn(*const c_char) -> c_int) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(*const c_char) -> c_int =
-                std::mem::transmute(real("chdir\0"));
-            return f(path);
-        }
+        return real_chdir(path);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(*const c_char) -> c_int =
-                std::mem::transmute(real("chdir\0"));
-            return f(path);
-        }
+        None => return real_chdir(path),
     };
 
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
 
     let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
-        unsafe {
-            let f: extern "C" fn(*const c_char) -> c_int =
-                std::mem::transmute(real("chdir\0"));
-            return f(path);
-        }
+        return real_chdir(path);
     }
 
     unsafe {
@@ -1342,9 +1291,7 @@ pub extern "C" fn chdir(path: *const c_char) -> c_int {
             // Call real chdir so that real fork() children inherit the correct cwd.
             // Cooperative scheduling guarantees only one coroutine runs at a time,
             // so the real process cwd always matches the currently-running coroutine's cwd.
-            let f: extern "C" fn(*const c_char) -> c_int =
-                std::mem::transmute(real("chdir\0"));
-            let ret = f(c_resolved.as_ptr());
+            let ret = real_chdir(c_resolved.as_ptr());
             if ret == 0 {
                 co.cwd = Some(resolved);
             }
@@ -1352,29 +1299,18 @@ pub extern "C" fn chdir(path: *const c_char) -> c_int {
         }
     }
 
-    unsafe {
-        let f: extern "C" fn(*const c_char) -> c_int =
-            std::mem::transmute(real("chdir\0"));
-        f(path)
-    }
+    real_chdir(path)
 }
 
 #[no_mangle]
 pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
+    let real_getcwd = unsafe { real_fn!("getcwd\0", extern "C" fn(*mut c_char, usize) -> *mut c_char) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
-                std::mem::transmute(real("getcwd\0"));
-            return f(buf, size);
-        }
+        return real_getcwd(buf, size);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
-                std::mem::transmute(real("getcwd\0"));
-            return f(buf, size);
-        }
+        None => return real_getcwd(buf, size),
     };
 
     let ptr = crate::executor::get_current_executor();
@@ -1396,11 +1332,7 @@ pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
     }
 
     // No per-coroutine cwd — fall back to real getcwd
-    unsafe {
-        let f: extern "C" fn(*mut c_char, usize) -> *mut c_char =
-            std::mem::transmute(real("getcwd\0"));
-        f(buf, size)
-    }
+    real_getcwd(buf, size)
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,20 +1341,13 @@ pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    let real_open = unsafe { real_fn!("open\0", extern "C" fn(*const c_char, c_int, c_int) -> c_int) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
-                std::mem::transmute(real("open\0"));
-            return f(path, flags, mode);
-        }
+        return real_open(path, flags, mode);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
-                std::mem::transmute(real("open\0"));
-            return f(path, flags, mode);
-        }
+        None => return real_open(path, flags, mode),
     };
 
     // Resolve relative paths against per-coroutine cwd
@@ -1447,11 +1372,7 @@ pub extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int 
         .map(|cs| cs.as_ptr())
         .unwrap_or(path);
 
-    let real_fd = unsafe {
-        let f: extern "C" fn(*const c_char, c_int, c_int) -> c_int =
-            std::mem::transmute(real("open\0"));
-        f(open_path, flags, mode)
-    };
+    let real_fd = real_open(open_path, flags, mode);
     if real_fd < 0 {
         return real_fd;
     }
@@ -1463,20 +1384,13 @@ pub extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int 
 
 #[no_mangle]
 pub extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    let real_openat = unsafe { real_fn!("openat\0", extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
-                std::mem::transmute(real("openat\0"));
-            return f(dirfd, path, flags, mode);
-        }
+        return real_openat(dirfd, path, flags, mode);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
-                std::mem::transmute(real("openat\0"));
-            return f(dirfd, path, flags, mode);
-        }
+        None => return real_openat(dirfd, path, flags, mode),
     };
 
     // Resolve relative paths against per-coroutine cwd when dirfd == AT_FDCWD
@@ -1506,11 +1420,7 @@ pub extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: 
         .map(|cs| cs.as_ptr())
         .unwrap_or(path);
 
-    let real_fd = unsafe {
-        let f: extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int =
-            std::mem::transmute(real("openat\0"));
-        f(dirfd, open_path, flags, mode)
-    };
+    let real_fd = real_openat(dirfd, open_path, flags, mode);
     if real_fd < 0 {
         return real_fd;
     }
@@ -1522,27 +1432,16 @@ pub extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: 
 
 #[no_mangle]
 pub extern "C" fn creat(path: *const c_char, mode: c_int) -> c_int {
+    let real_creat = unsafe { real_fn!("creat\0", extern "C" fn(*const c_char, c_int) -> c_int) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(*const c_char, c_int) -> c_int =
-                std::mem::transmute(real("creat\0"));
-            return f(path, mode);
-        }
+        return real_creat(path, mode);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(*const c_char, c_int) -> c_int =
-                std::mem::transmute(real("creat\0"));
-            return f(path, mode);
-        }
+        None => return real_creat(path, mode),
     };
 
-    let real_fd = unsafe {
-        let f: extern "C" fn(*const c_char, c_int) -> c_int =
-            std::mem::transmute(real("creat\0"));
-        f(path, mode)
-    };
+    let real_fd = real_creat(path, mode);
     if real_fd < 0 {
         return real_fd;
     }
@@ -1557,42 +1456,23 @@ pub extern "C" fn creat(path: *const c_char, mode: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
+    let real_fstat = unsafe { real_fn!("fstat\0", extern "C" fn(c_int, *mut libc::stat) -> c_int) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
-                std::mem::transmute(real("fstat\0"));
-            return f(fd, buf);
-        }
+        return real_fstat(fd, buf);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
-                std::mem::transmute(real("fstat\0"));
-            return f(fd, buf);
-        }
+        None => return real_fstat(fd, buf),
     };
 
     let table = match crate::vfd::get_table(vpid) {
         Some(t) => t,
-        None => unsafe {
-            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
-                std::mem::transmute(real("fstat\0"));
-            return f(fd, buf);
-        }
+        None => return real_fstat(fd, buf),
     };
 
     match table.get(fd as u32) {
-        Some(crate::vfd::Vfd::Real(real_fd)) => unsafe {
-            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
-                std::mem::transmute(real("fstat\0"));
-            f(*real_fd, buf)
-        },
-        Some(crate::vfd::Vfd::File(file_ref)) => unsafe {
-            let f: extern "C" fn(c_int, *mut libc::stat) -> c_int =
-                std::mem::transmute(real("fstat\0"));
-            f(file_ref.real_fd, buf)
-        },
+        Some(crate::vfd::Vfd::Real(real_fd)) => real_fstat(*real_fd, buf),
+        Some(crate::vfd::Vfd::File(file_ref)) => real_fstat(file_ref.real_fd, buf),
         Some(_) => {
             unsafe { *libc::__errno() = libc::ESPIPE; }
             -1
@@ -1606,42 +1486,23 @@ pub extern "C" fn fstat(fd: c_int, buf: *mut libc::stat) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn lseek(fd: c_int, offset: isize, whence: c_int) -> isize {
+    let real_lseek = unsafe { real_fn!("lseek\0", extern "C" fn(c_int, isize, c_int) -> isize) };
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int, isize, c_int) -> isize =
-                std::mem::transmute(real("lseek\0"));
-            return f(fd, offset, whence);
-        }
+        return real_lseek(fd, offset, whence);
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(c_int, isize, c_int) -> isize =
-                std::mem::transmute(real("lseek\0"));
-            return f(fd, offset, whence);
-        }
+        None => return real_lseek(fd, offset, whence),
     };
 
     let table = match crate::vfd::get_table(vpid) {
         Some(t) => t,
-        None => unsafe {
-            let f: extern "C" fn(c_int, isize, c_int) -> isize =
-                std::mem::transmute(real("lseek\0"));
-            return f(fd, offset, whence);
-        }
+        None => return real_lseek(fd, offset, whence),
     };
 
     match table.get(fd as u32) {
-        Some(crate::vfd::Vfd::Real(real_fd)) => unsafe {
-            let f: extern "C" fn(c_int, isize, c_int) -> isize =
-                std::mem::transmute(real("lseek\0"));
-            f(*real_fd, offset, whence)
-        },
-        Some(crate::vfd::Vfd::File(file_ref)) => unsafe {
-            let f: extern "C" fn(c_int, isize, c_int) -> isize =
-                std::mem::transmute(real("lseek\0"));
-            f(file_ref.real_fd, offset, whence)
-        },
+        Some(crate::vfd::Vfd::Real(real_fd)) => real_lseek(*real_fd, offset, whence),
+        Some(crate::vfd::Vfd::File(file_ref)) => real_lseek(file_ref.real_fd, offset, whence),
         Some(_) => {
             unsafe { *libc::__errno() = libc::ESPIPE; }
             -1
