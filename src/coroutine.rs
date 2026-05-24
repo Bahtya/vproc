@@ -13,6 +13,7 @@ pub type VPid = u32;
 /// I/O wait state for a coroutine that yielded waiting for fd readiness.
 pub struct IoWait {
     pub fds: Vec<(c_int, i16)>, // (real_fd, poll_events e.g. POLLIN/POLLOUT)
+    pub deadline: Option<std::time::Instant>, // None = wait indefinitely
 }
 
 const DEFAULT_STACK_SIZE: usize = 2 * 1024 * 1024; // 2 MiB

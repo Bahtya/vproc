@@ -337,6 +337,9 @@ struct cp_arg {
     int fds[3];
     uint32_t *vpid_out;
     volatile uint32_t *prog;
+    pthread_mutex_t *mutex;
+    pthread_cond_t *cond;
+    int *done; /* 0=pending, 1=success, -1=error */
 };
 
 static void *cp_thread_fn(void *a) {
@@ -344,9 +347,15 @@ static void *cp_thread_fn(void *a) {
     /* Reduce timer slack for this thread */
     prctl(29, 50000, 0, 0, 0);
     ALOGI("cp_thread: enter, calling _s(sid=%u)", c->sid);
-    *(c->vpid_out) = g_vproc_create_process_s(c->sid, c->path, c->argv, c->envp,
+    uint32_t result = g_vproc_create_process_s(c->sid, c->path, c->argv, c->envp,
         c->fds[0], c->fds[1], c->fds[2]);
-    ALOGI("cp_thread: returned vpid=%u prog=%u", *(c->vpid_out), c->prog ? *c->prog : 0xFF);
+    ALOGI("cp_thread: returned vpid=%u prog=%u", result, c->prog ? *c->prog : 0xFF);
+
+    pthread_mutex_lock(c->mutex);
+    *(c->vpid_out) = result;
+    *(c->done) = (result > 0) ? 1 : -1;
+    pthread_cond_signal(c->cond);
+    pthread_mutex_unlock(c->mutex);
     return NULL;
 }
 
@@ -506,7 +515,10 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
 
     /* Call create_process in a child thread so we can log progress */
     uint32_t vpid = 0;
-    struct cp_arg cpa = { g_vproc_session_id, cmd_utf8, argv, envp, {pts, pts, pts}, &vpid, progress_ptr };
+    int cp_done = 0;
+    pthread_mutex_t cp_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cp_cond = PTHREAD_COND_INITIALIZER;
+    struct cp_arg cpa = { g_vproc_session_id, cmd_utf8, argv, envp, {pts, pts, pts}, &vpid, progress_ptr, &cp_mutex, &cp_cond, &cp_done };
     pthread_t cp_tid;
     pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
 
@@ -514,15 +526,26 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
      * PR_SET_TIMERSLACK = 29. Safe for untrusted apps. */
     prctl(29, 50000, 0, 0, 0);
 
-    /* Wait and log progress — 10ms poll up to 10s */
-    for (int i = 0; i < 1000; i++) {
-        usleep(10000);
-        if (i % 25 == 0) {
-            ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+    /* Wait with condvar + 500ms deadline (replaces spin-lock) */
+    {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 500000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
         }
-        if (vpid != 0) break;
+        pthread_mutex_lock(&cp_mutex);
+        while (cp_done == 0) {
+            int rc = pthread_cond_timedwait(&cp_cond, &cp_mutex, &deadline);
+            ALOGI("watchdog: progress=%u vpid=%u rc=%d", progress_ptr ? *progress_ptr : 0xFF, vpid, rc);
+            if (rc == ETIMEDOUT) break;
+        }
+        pthread_mutex_unlock(&cp_mutex);
     }
     pthread_join(cp_tid, NULL);
+    pthread_mutex_destroy(&cp_mutex);
+    pthread_cond_destroy(&cp_cond);
     ALOGI("createSubprocess: create_process returned vpid=%u progress=%u",
         vpid, progress_ptr ? *progress_ptr : 0xFFFFFFFF);
     {

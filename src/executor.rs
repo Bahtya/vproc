@@ -329,7 +329,13 @@ unsafe fn mco_yield_raw(co: *mut crate::coroutine::McoCoro) {
 /// Yield the current coroutine waiting for I/O readiness.
 /// Sets io_wait state and yields WITHOUT pushing to ready_queue.
 /// The driver thread's batch poll() will push it back when fds are ready.
-pub fn yield_for_io(fds: Vec<(c_int, i16)>) {
+/// `timeout_ms`: -1 = infinite, 0 = already checked (shouldn't reach here), >0 = finite wait.
+pub fn yield_for_io(fds: Vec<(c_int, i16)>, timeout_ms: c_int) {
+    let deadline = if timeout_ms < 0 {
+        None
+    } else {
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64))
+    };
     unsafe {
         let co = mco_running_raw();
         if !co.is_null() {
@@ -337,8 +343,7 @@ pub fn yield_for_io(fds: Vec<(c_int, i16)>) {
             if let Some(pid) = ex.current {
                 if let Some(co_inner) = ex.vprocs.get_mut(&pid) {
                     if !co_inner.is_done() {
-                        co_inner.io_wait = Some(IoWait { fds });
-                        // Do NOT push to ready_queue — driver poll will re-queue when ready
+                        co_inner.io_wait = Some(IoWait { fds, deadline });
                     }
                 }
             }
@@ -368,11 +373,14 @@ pub fn collect_io_waits() -> (Vec<libc::pollfd>, Vec<VPid>) {
     (pollfds, pid_map)
 }
 
-/// Move coroutines whose io_wait fds are ready back to the ready queue.
+/// Move coroutines whose io_wait fds are ready (or timed out) back to the ready queue.
 /// Called by the driver thread after batch poll() returns.
 pub fn wake_io_ready(pollfds: &[libc::pollfd], pid_map: &[VPid]) {
     let ex = unsafe { &mut *get_current_executor() };
+    let now = std::time::Instant::now();
     let mut ready_pids: Vec<VPid> = Vec::new();
+
+    // Wake coroutines whose fds are ready
     for (i, pfd) in pollfds.iter().enumerate() {
         if pfd.revents != 0 {
             let pid = pid_map[i];
@@ -381,6 +389,18 @@ pub fn wake_io_ready(pollfds: &[libc::pollfd], pid_map: &[VPid]) {
             }
         }
     }
+
+    // Wake coroutines whose deadline has expired
+    for (&pid, co) in &ex.vprocs {
+        if let Some(ref iowait) = co.io_wait {
+            if let Some(deadline) = iowait.deadline {
+                if now >= deadline && !ready_pids.contains(&pid) {
+                    ready_pids.push(pid);
+                }
+            }
+        }
+    }
+
     for pid in ready_pids {
         if let Some(co) = ex.vprocs.get_mut(&pid) {
             co.io_wait = None;

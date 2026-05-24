@@ -669,7 +669,7 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
             }
             if ready < 0 { return -1; }
             // Not ready — yield waiting for I/O (driver thread will batch poll)
-            crate::executor::yield_for_io(vec![(real_fd, libc::POLLIN)]);
+            crate::executor::yield_for_io(vec![(real_fd, libc::POLLIN)], -1);
         }
     }
 
@@ -755,7 +755,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
             }
             if ready < 0 { return -1; }
             // Not ready — yield waiting for I/O
-            crate::executor::yield_for_io(vec![(real_fd, libc::POLLOUT)]);
+            crate::executor::yield_for_io(vec![(real_fd, libc::POLLOUT)], -1);
         }
     }
 
@@ -900,7 +900,7 @@ pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_in
         }
 
         // Nothing ready — yield waiting for I/O
-        crate::executor::yield_for_io(wait_fds);
+        crate::executor::yield_for_io(wait_fds, timeout);
     }
 }
 
@@ -910,19 +910,11 @@ pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_in
 
 const FD_SETSIZE: c_int = 1024;
 
-unsafe fn fd_isset(fd: c_int, set: *const libc::fd_set) -> bool {
-    let mask = 1u32 << (fd % 32);
-    let idx = (fd / 32) as usize;
-    let arr = set as *const [u32; 32];
-    (*arr)[idx] & mask != 0
-}
-
-unsafe fn fd_set(fd: c_int, set: *mut libc::fd_set) {
-    let mask = 1u32 << (fd % 32);
-    let idx = (fd / 32) as usize;
-    let arr = set as *mut [u32; 32];
-    (*arr)[idx] |= mask;
-}
+// Compile-time sanity check: fd_set must be 128 bytes on aarch64 (16 × u64).
+const _: () = assert!(
+    std::mem::size_of::<libc::fd_set>() == 128,
+    "fd_set size mismatch — expected 128 bytes on aarch64"
+);
 
 #[no_mangle]
 pub extern "C" fn select(
@@ -962,14 +954,15 @@ pub extern "C" fn select(
     let max_fd = nfds.min(FD_SETSIZE);
 
     for fd in 0..max_fd {
+        if fd >= FD_SETSIZE { continue; }
         let mut events: i16 = 0;
-        if !readfds.is_null() && unsafe { fd_isset(fd, readfds) } {
+        if !readfds.is_null() && unsafe { libc::FD_ISSET(fd, readfds) } {
             events |= libc::POLLIN;
         }
-        if !writefds.is_null() && unsafe { fd_isset(fd, writefds) } {
+        if !writefds.is_null() && unsafe { libc::FD_ISSET(fd, writefds) } {
             events |= libc::POLLOUT;
         }
-        if !exceptfds.is_null() && unsafe { fd_isset(fd, exceptfds) } {
+        if !exceptfds.is_null() && unsafe { libc::FD_ISSET(fd, exceptfds) } {
             events |= libc::POLLPRI;
         }
         if events != 0 {
@@ -986,14 +979,15 @@ pub extern "C" fn select(
 
     if ret > 0 {
         for pfd in &pollfds {
+            if pfd.fd >= FD_SETSIZE { continue; }
             if pfd.revents & libc::POLLIN != 0 && !readfds.is_null() {
-                unsafe { fd_set(pfd.fd, readfds); }
+                unsafe { libc::FD_SET(pfd.fd, readfds); }
             }
             if pfd.revents & libc::POLLOUT != 0 && !writefds.is_null() {
-                unsafe { fd_set(pfd.fd, writefds); }
+                unsafe { libc::FD_SET(pfd.fd, writefds); }
             }
             if pfd.revents & libc::POLLPRI != 0 && !exceptfds.is_null() {
-                unsafe { fd_set(pfd.fd, exceptfds); }
+                unsafe { libc::FD_SET(pfd.fd, exceptfds); }
             }
         }
     }
