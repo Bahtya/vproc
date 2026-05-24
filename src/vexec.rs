@@ -968,9 +968,11 @@ unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
     vdiag!("[vexec] write_inline_hook: mprotect RWX OK, writing trampoline");
 
     let code = func_addr as *mut u32;
+    // Write target payload first, then instructions — if interrupted between
+    // writes the CPU never sees a valid LDR pointing at garbage (#23).
+    std::ptr::write_unaligned(code.add(2) as *mut usize, target);
     std::ptr::write_unaligned(code, 0x58000050);       // ldr x16, [pc, #8]
     std::ptr::write_unaligned(code.add(1), 0xD61F0200); // br x16
-    std::ptr::write_unaligned(code.add(2) as *mut usize, target);
 
     // Flush instruction cache for all 16 bytes (two 8-byte lines)
     for off in [0, 8] {
@@ -982,6 +984,12 @@ unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
             "isb",
             addr = in(reg) func_addr + off,
         );
+    }
+
+    // Remove PROT_WRITE — restore to RX (#24 W^X compliance).
+    if mprotect_mte_aware(page, 0x2000, libc::PROT_READ | libc::PROT_EXEC) != 0 {
+        let errno = *libc::__errno();
+        vdiag!("[vexec] write_inline_hook: mprotect restore RX FAILED errno={}", errno);
     }
     true
 }
