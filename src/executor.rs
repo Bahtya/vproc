@@ -6,7 +6,7 @@ use std::os::raw::c_int;
 use crate::coroutine::{Coroutine, IoWait, State, VPid};
 
 thread_local! {
-    static CURRENT_EXECUTOR: UnsafeCell<*mut Executor> = UnsafeCell::new(std::ptr::null_mut());
+    static CURRENT_EXECUTOR: UnsafeCell<*mut Executor> = const { UnsafeCell::new(std::ptr::null_mut()) };
 }
 
 pub fn set_current_executor(ptr: *mut Executor) {
@@ -17,6 +17,10 @@ pub fn get_current_executor() -> *mut Executor {
     CURRENT_EXECUTOR.with(|e| unsafe { *e.get() })
 }
 
+/// Cooperative coroutine scheduler.
+///
+/// Manages virtual processes (coroutines) with a ready queue, I/O wait
+/// tracking, fork parent-child relationships, and signal delivery.
 pub struct Executor {
     pub vprocs: HashMap<VPid, Coroutine>,
     ready_queue: VecDeque<VPid>,
@@ -26,6 +30,12 @@ pub struct Executor {
     pub children: HashMap<VPid, Vec<VPid>>,
     pub saved_fork_lr: Option<u64>,
     pub(crate) exit_codes: HashMap<VPid, i32>,
+}
+
+impl Default for Executor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Executor {
@@ -60,6 +70,8 @@ impl Executor {
         pid
     }
 
+    /// Spawn a virtual process backed by a loaded ELF binary.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn spawn_elf(
         &mut self,
         entry: usize,
@@ -72,7 +84,7 @@ impl Executor {
     ) -> VPid {
         let pid = self.next_pid;
         self.next_pid += 1;
-        let co = Coroutine::new_elf(pid, entry, stack_base, stack_size, argc, argv, envp, auxv);
+        let co = unsafe { Coroutine::new_elf(pid, entry, stack_base, stack_size, argc, argv, envp, auxv) };
         self.vprocs.insert(pid, co);
         self.ready_queue.push_back(pid);
         pid
@@ -90,6 +102,7 @@ impl Executor {
         }
     }
 
+    /// Spawn a child coroutine by forking the parent's minicoro context.
     pub fn spawn_fork_child(&mut self, parent_pid: VPid) -> VPid {
         let child_id = self.next_pid;
         self.next_pid += 1;
@@ -178,6 +191,7 @@ impl Executor {
         true
     }
 
+    /// Yield the current coroutine and run the next ready one.
     pub fn r#yield(&mut self) {
         if let Some(pid) = self.current {
             let co = self.vprocs.get(&pid).unwrap();
@@ -189,6 +203,7 @@ impl Executor {
         self.step();
     }
 
+    /// Reap finished coroutines, close their real fds, and release resources.
     pub fn reap_done_coroutines(&mut self) {
         let done_pids: Vec<VPid> = self.vprocs.iter()
             .filter(|(_, co)| co.is_done())
@@ -259,7 +274,7 @@ pub fn get_exit_code(pid: VPid) -> Option<i32> {
 
 pub fn is_child_of(parent: VPid, child: VPid) -> bool {
     let ex = unsafe { &mut *get_current_executor() };
-    ex.children.get(&parent).map_or(false, |kids| kids.contains(&child))
+    ex.children.get(&parent).is_some_and(|kids| kids.contains(&child))
 }
 
 pub fn reap_child(parent: VPid, child: VPid) {

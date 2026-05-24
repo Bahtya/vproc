@@ -114,8 +114,12 @@ pub extern "C" fn vproc_ffi_destroy_session(session_id: u32) {
 
 /// Create a virtual process within a session.
 /// Returns virtual PID (> 0) on success, 0 on error.
+///
+/// # Safety
+///
+/// `path`, `argv`, `envp` must be valid null-terminated C strings/arrays.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_create_process(
+pub unsafe extern "C" fn vproc_ffi_create_process(
     session_id: u32,
     path: *const c_char,
     argv: *const *const c_char,
@@ -294,8 +298,12 @@ pub extern "C" fn vproc_ffi_vpid_exists(session_id: u32, vpid: u32) -> c_int {
 
 /// Create a virtual process using the default session.
 /// Returns virtual PID (> 0) on success, 0 on error.
+///
+/// # Safety
+///
+/// `path`, `argv`, `envp` must be valid null-terminated C strings/arrays.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_create_process_default(
+pub unsafe extern "C" fn vproc_ffi_create_process_default(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
@@ -403,10 +411,7 @@ pub extern "C" fn vproc_ffi_yield() {
 /// Get exit code of a completed virtual process. Returns -1 if not done yet.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_get_exit_code(vpid: u32) -> c_int {
-    match crate::executor::get_exit_code(vpid) {
-        Some(code) => code,
-        None => -1,
-    }
+    crate::executor::get_exit_code(vpid).unwrap_or(-1)
 }
 
 /// Get the current virtual process ID. Returns real PID if not in a coroutine.
@@ -451,8 +456,12 @@ pub extern "C" fn vproc_ffi_getppid() -> u32 {
 /// Returns -1 on error.
 ///
 /// No mutex: called from inside a coroutine (driver thread), already serialized.
+///
+/// # Safety
+///
+/// `path`, `argv`, `envp` must be valid null-terminated C strings/arrays.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_execve(
+pub unsafe extern "C" fn vproc_ffi_execve(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
@@ -554,8 +563,12 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Create a virtual pipe. Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// `fds` must point to a valid `int[2]` buffer.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_pipe(vpid: u32, fds: *mut c_int) -> c_int {
+pub unsafe extern "C" fn vproc_ffi_pipe(vpid: u32, fds: *mut c_int) -> c_int {
     let table = crate::vfd::get_or_create_table(vpid);
     let (read_fd, write_fd) = table.create_pipe();
     unsafe {
@@ -578,8 +591,12 @@ pub extern "C" fn vproc_ffi_is_virtual_fd(vpid: u32, fd: c_int) -> c_int {
 }
 
 /// Read from a virtual pipe fd. Returns bytes read, or -1 (EAGAIN if empty).
+///
+/// # Safety
+///
+/// `buf` must point to a valid writable buffer of at least `count` bytes.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_read(
+pub unsafe extern "C" fn vproc_ffi_read(
     vpid: u32,
     fd: c_int,
     buf: *mut c_void,
@@ -599,8 +616,12 @@ pub extern "C" fn vproc_ffi_read(
 }
 
 /// Write to a virtual pipe fd. Returns bytes written, or -1 (EAGAIN if full).
+///
+/// # Safety
+///
+/// `buf` must point to a valid readable buffer of at least `count` bytes.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_write(
+pub unsafe extern "C" fn vproc_ffi_write(
     vpid: u32,
     fd: c_int,
     buf: *const c_void,
@@ -625,13 +646,7 @@ pub extern "C" fn vproc_ffi_pipe_is_closed(vpid: u32, fd: c_int) -> c_int {
     crate::vfd::get_table(vpid)
         .and_then(|t| t.get(fd as u32))
         .map(|vfd| match vfd {
-            crate::vfd::Vfd::PipeWrite(buf) => {
-                if buf.is_closed() {
-                    1
-                } else {
-                    0
-                }
-            },
+            crate::vfd::Vfd::PipeWrite(buf) if buf.is_closed() => 1,
             _ => 0,
         })
         .unwrap_or(0)
@@ -685,8 +700,12 @@ pub extern "C" fn vproc_ffi_dup2(vpid: u32, old_fd: c_int, new_fd: c_int) -> c_i
 
 /// Get the per-coroutine working directory.
 /// Returns 0 on success, -1 if no cwd set or vpid not found.
+///
+/// # Safety
+///
+/// `buf` must point to a valid writable buffer of at least `size` bytes.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
+pub unsafe extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
     let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
         return -1;
@@ -699,7 +718,7 @@ pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) ->
                     if bytes.len() + 1 > size {
                         return -1;
                     }
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
                     *buf.add(bytes.len()) = 0;
                     0
                 }

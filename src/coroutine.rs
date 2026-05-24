@@ -102,6 +102,7 @@ extern "C" fn mco_trampoline(co: *mut McoCoro) {
     crate::executor::vproc_exit_with_code(code);
 }
 
+/// A virtual process (coroutine) backed by minicoro.
 pub struct Coroutine {
     pub id: VPid,
     pub ppid: VPid,
@@ -120,6 +121,7 @@ pub struct Coroutine {
 }
 
 impl Coroutine {
+    /// Create a closure-backed coroutine.
     pub fn new(id: VPid, f: Box<dyn FnOnce()>) -> Self {
         let ud = Box::into_raw(Box::new(CoroUserdata {
             exit_code: 0,
@@ -153,7 +155,17 @@ impl Coroutine {
         }
     }
 
-    pub fn new_elf(
+    /// Create a coroutine backed by a loaded ELF binary.
+    ///
+    /// Sets up the stack with argc/argv/envp/auxv and creates a minicoro
+    /// coroutine that will jump directly to the ELF entry point.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must be a valid function pointer. `stack_base` must point to
+    /// a valid memory region of at least `stack_size` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn new_elf(
         id: VPid,
         entry: usize,
         stack_base: *mut u8,
@@ -231,6 +243,7 @@ impl Coroutine {
         }
     }
 
+    /// Resume (or start) the coroutine. Updates state after return.
     pub fn resume(&mut self) {
         self.state = State::Running;
         unsafe {
@@ -250,6 +263,7 @@ impl Coroutine {
         unsafe { mco_yield(self.co); }
     }
 
+    /// Mark the coroutine as finished with the given exit code.
     pub fn set_done(&mut self, code: i32) {
         self.state = State::Done;
         self.exit_code = code;
@@ -268,6 +282,12 @@ impl Coroutine {
         self.co
     }
 
+    /// Fork a new coroutine from an existing one, copying the minicoro context.
+    ///
+    /// # Safety
+    ///
+    /// The parent coroutine must be in a valid suspended state with a live
+    /// minicoro handle. The caller must ensure the parent's stack remains valid.
     pub unsafe fn fork_from(child_id: VPid, parent: &Coroutine) -> Self {
         let mut child_co: *mut McoCoro = ptr::null_mut();
         let rc = mco_fork_from(parent.co, &mut child_co);
@@ -304,7 +324,7 @@ impl Drop for Coroutine {
             unsafe { libc::munmap(base as *mut _, size); }
         }
         if let Some((base, size)) = self.stack_alloc {
-            crate::vexec::free_elf_stack(base, size);
+            unsafe { crate::vexec::free_elf_stack(base, size); }
         }
         unsafe {
             let ud_ptr = mco_get_user_data(self.co);

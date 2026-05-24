@@ -64,6 +64,7 @@ impl PipeBuffer {
         }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn inner(&self) -> &mut PipeBufferInner {
         // SAFETY: cooperative scheduling guarantees only one coroutine accesses this at a time.
         unsafe { &mut *self.inner.get() }
@@ -78,8 +79,8 @@ impl PipeBuffer {
             return -1; // EAGAIN
         }
         let n = dst.len().min(inner.len);
-        for i in 0..n {
-            dst[i] = inner.buf[inner.read_pos];
+        for slot in dst.iter_mut().take(n) {
+            *slot = inner.buf[inner.read_pos];
             inner.read_pos = (inner.read_pos + 1) % PIPE_CAPACITY;
         }
         inner.len -= n;
@@ -96,8 +97,8 @@ impl PipeBuffer {
             return -1; // EAGAIN
         }
         let n = src.len().min(available);
-        for i in 0..n {
-            inner.buf[inner.write_pos] = src[i];
+        for &byte in src.iter().take(n) {
+            inner.buf[inner.write_pos] = byte;
             inner.write_pos = (inner.write_pos + 1) % PIPE_CAPACITY;
         }
         inner.len += n;
@@ -125,6 +126,12 @@ impl PipeBuffer {
 pub struct VfdTable {
     fds: HashMap<u32, Vfd>,
     next_fd: u32,
+}
+
+impl Default for VfdTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VfdTable {

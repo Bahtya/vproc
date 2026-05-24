@@ -75,9 +75,13 @@ fn alloc_elf_stack(size: usize) -> *mut u8 {
 }
 
 /// Free an ELF stack allocated by alloc_elf_stack.
-pub fn free_elf_stack(ptr: *mut u8, size: usize) {
+///
+/// # Safety
+///
+/// `ptr` must have been returned by `alloc_elf_stack` and not already freed.
+pub unsafe fn free_elf_stack(ptr: *mut u8, size: usize) {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-    unsafe { libc::munmap(ptr.sub(page_size) as *mut c_void, page_size + size); }
+    libc::munmap(ptr.sub(page_size) as *mut c_void, page_size + size);
 }
 
 /// mprotect wrapper — currently passes through without PROT_MTE.
@@ -286,7 +290,7 @@ pub fn virtual_execve_dynamic(
     }
 
     // Find main() symbol
-    let main_sym = unsafe { libc::dlsym(handle, b"main\0".as_ptr() as *const u8) };
+    let main_sym = unsafe { libc::dlsym(handle, c"main".as_ptr()) };
     if main_sym.is_null() {
         unsafe { libc::dlclose(handle) };
         return Err(format!("dlsym(main) failed in {}", path));
@@ -442,8 +446,8 @@ pub fn virtual_execve_via_entry(
     let entry_addr = base + e_entry;
 
     // Extract main() address — try dlsym first (most reliable), then _start parsing
-    let mut main_addr: usize = 0;
-    let main_sym = unsafe { libc::dlsym(handle, b"main\0".as_ptr() as *const _) };
+    let main_addr;
+    let main_sym = unsafe { libc::dlsym(handle, c"main".as_ptr()) };
     if !main_sym.is_null() {
         main_addr = main_sym as usize;
         vdiag!("[vexec] dlsym(main) = {:#x}", main_addr);
@@ -593,7 +597,7 @@ fn clear_init_arrays(base: usize, phdrs: &[elf::Phdr]) {
     // Parse dynamic entries and zero out init-related ones
     for i in 0..dyn_size {
         let dyn_ptr = (dyn_addr + i * std::mem::size_of::<elf::Dyn>()) as *mut elf::Dyn;
-        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_tag)) }.into();
+        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_tag)) };
         match tag {
             elf::DT_INIT_ARRAY | elf::DT_INIT => {
                 unsafe { std::ptr::write_unaligned(std::ptr::addr_of_mut!((*dyn_ptr).d_val), 0) };
@@ -696,7 +700,7 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
 
     for i in 0..dyn_count {
         let dyn_ptr = (dyn_addr + i * std::mem::size_of::<elf::Dyn>()) as *const elf::Dyn;
-        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_tag)) }.into();
+        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_tag)) };
         let val = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_val)) } as usize;
         match tag {
             elf::DT_JMPREL => jmprel = val,
@@ -852,7 +856,7 @@ unsafe fn extract_main_addr(entry_addr: usize) -> Option<usize> {
 
             let got_addr = adrp_page + addend + ldr_imm12 * 8;
             let main_addr = std::ptr::read_unaligned(got_addr as *const usize);
-            if main_addr != 0 && main_addr % 4 == 0 {
+            if main_addr != 0 && main_addr.is_multiple_of(4) {
                 return Some(main_addr);
             }
         }
@@ -870,6 +874,8 @@ fn decode_adrp(pc: usize, insn: u32) -> usize {
 }
 
 /// Spawn a coroutine that directly calls main(argc, argv, envp).
+/// Used when the binary has already been initialized via _start/__libc_init.
+#[allow(dead_code)]
 /// Used when the binary has already been initialized via _start/__libc_init.
 fn spawn_main_coroutine(
     main_addr: usize,
@@ -903,7 +909,7 @@ fn spawn_main_coroutine(
             vdiag!("[vexec]   envp[{}]={:#x} bytes={:?}", i, p as usize, bytes);
         }
         // Also check global __environ
-        let environ_sym = unsafe { libc::dlsym(std::ptr::null_mut(), b"__environ\0".as_ptr() as *const _) };
+        let environ_sym = unsafe { libc::dlsym(std::ptr::null_mut(), c"__environ".as_ptr()) };
         if !environ_sym.is_null() {
             let env_global = unsafe { *(environ_sym as *const *const std::os::raw::c_char) };
             vdiag!("[vexec]   __environ={:#x} (envp_ptr={:#x} diff={})",
@@ -989,7 +995,7 @@ fn hook_libc_exit() {
     }
     let rtld_next = -1isize as *mut c_void;
     unsafe {
-        let original = libc::dlsym(rtld_next, b"exit\0".as_ptr() as *const std::os::raw::c_char);
+        let original = libc::dlsym(rtld_next, c"exit".as_ptr());
         if original.is_null() { return; }
         write_inline_hook(original as usize, crate::preload::exit as *const c_void as usize);
     }
@@ -1004,7 +1010,7 @@ fn hook_libc_execve() {
     }
     let rtld_next = -1isize as *mut c_void;
     unsafe {
-        let original = libc::dlsym(rtld_next, b"execve\0".as_ptr() as *const std::os::raw::c_char);
+        let original = libc::dlsym(rtld_next, c"execve".as_ptr());
         if original.is_null() { return; }
         write_inline_hook(original as usize, crate::preload::execve as *const c_void as usize);
     }

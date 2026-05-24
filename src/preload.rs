@@ -11,13 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Runs before any other library code via .init_array (Android/Linux).
 
 mod init {
-    use super::*;
-
     extern "C" fn vproc_auto_enable() {
         unsafe {
             libc::setenv(
-                b"VPROC\0".as_ptr() as *const c_char,
-                b"1\0".as_ptr() as *const c_char,
+                c"VPROC".as_ptr(),
+                c"1".as_ptr(),
                 1,
             );
         }
@@ -62,7 +60,7 @@ extern "C" fn crash_handler(
         let n = libc::snprintf(
             buf.as_mut_ptr() as *mut c_char,
             256,
-            b"\n[SIGSEGV] signal=%d fault_addr=%p\n\0".as_ptr() as *const c_char,
+            c"\n[SIGSEGV] signal=%d fault_addr=%p\n".as_ptr(),
             sig,
             fault_addr,
         );
@@ -80,7 +78,7 @@ extern "C" fn crash_handler(
             let n = libc::snprintf(
                 buf.as_mut_ptr() as *mut c_char,
                 256,
-                b"  #%d fp=%p lr=%p\n\0".as_ptr() as *const c_char,
+                c"  #%d fp=%p lr=%p\n".as_ptr(),
                 i,
                 fp,
                 lr,
@@ -112,7 +110,7 @@ fn enabled() -> bool {
     // Keep checking env until we see "1" — VPROC may be set after
     // program start (e.g. std::env::set_var in main), or during
     // early init before the env var is visible.
-    let val = unsafe { libc::getenv(b"VPROC\0".as_ptr() as *const c_char) };
+    let val = unsafe { libc::getenv(c"VPROC".as_ptr()) };
     let on = !val.is_null() && unsafe { *val == b'1' as _ };
     if on {
         VPROC_ENABLED.store(1, std::sync::atomic::Ordering::Relaxed);
@@ -134,9 +132,9 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
 
     let count = COUNT.load(Ordering::Acquire);
     let cache = &*CACHE.0.get();
-    for i in 0..count {
-        if cache[i].0 == sym.as_ptr() {
-            return cache[i].1;
+    for &(key, val) in cache.iter().take(count) {
+        if key == sym.as_ptr() {
+            return val;
         }
     }
 
@@ -184,14 +182,14 @@ unsafe fn fdsan_clear_tag(fd: c_int) {
     static FUNCS: OnceLock<(Option<GetTagFn>, Option<ExchangeTagFn>)> = OnceLock::new();
     let (get_tag, exchange_tag) = FUNCS.get_or_init(|| {
         let gt = unsafe {
-            libc::dlsym(libc::RTLD_DEFAULT, b"android_fdsan_get_fd_tag\0".as_ptr() as *const _)
+            libc::dlsym(libc::RTLD_DEFAULT, c"android_fdsan_get_fd_tag".as_ptr())
         };
         let et = unsafe {
-            libc::dlsym(libc::RTLD_DEFAULT, b"android_fdsan_exchange_owner_tag\0".as_ptr() as *const _)
+            libc::dlsym(libc::RTLD_DEFAULT, c"android_fdsan_exchange_owner_tag".as_ptr())
         };
         (
-            if gt.is_null() { None } else { Some(std::mem::transmute(gt)) },
-            if et.is_null() { None } else { Some(std::mem::transmute(et)) },
+            if gt.is_null() { None } else { Some(std::mem::transmute::<*mut c_void, GetTagFn>(gt)) },
+            if et.is_null() { None } else { Some(std::mem::transmute::<*mut c_void, ExchangeTagFn>(et)) },
         )
     });
     if let (Some(gt), Some(et)) = (get_tag, exchange_tag) {
@@ -203,6 +201,10 @@ unsafe fn fdsan_clear_tag(fd: c_int) {
 }
 
 /// Call the real libc close() bypassing our interceptor.
+///
+/// # Safety
+///
+/// `fd` must be a valid open file descriptor (or -1, which is a no-op).
 pub unsafe fn real_close(fd: c_int) -> c_int {
     fdsan_clear_tag(fd);
     let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
@@ -495,7 +497,7 @@ pub extern "C" fn execve(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
-    match crate::vexec::virtual_execve(&*path_str, argv_vec, envp_vec) {
+    match crate::vexec::virtual_execve(&path_str, argv_vec, envp_vec) {
         Ok(_) => {
             crate::executor::vproc_exit_with_code(0);
             unreachable!()
@@ -768,7 +770,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
                 }
                 if pipe_buf.is_closed() {
                     unsafe { *libc::__errno() = libc::EPIPE };
-                    crate::executor::vproc_exit_with_code(128 + libc::SIGPIPE as i32);
+                    crate::executor::vproc_exit_with_code(128 + libc::SIGPIPE);
                     unreachable!()
                 }
                 crate::executor::do_yield();
@@ -824,11 +826,11 @@ pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_in
             let vfd = crate::vfd::get_table(vpid).and_then(|t| t.get(pfd.fd as u32));
             match vfd {
                 Some(crate::vfd::Vfd::PipeRead(pipe)) => {
-                    if pfd.events & libc::POLLIN != 0 {
-                        if !pipe.is_empty() || pipe.is_closed() {
-                            pfd.revents |= libc::POLLIN;
-                            if pipe.is_closed() { pfd.revents |= libc::POLLHUP; }
-                        }
+                    if pfd.events & libc::POLLIN != 0
+                        && (!pipe.is_empty() || pipe.is_closed())
+                    {
+                        pfd.revents |= libc::POLLIN;
+                        if pipe.is_closed() { pfd.revents |= libc::POLLHUP; }
                     }
                 }
                 Some(crate::vfd::Vfd::PipeWrite(pipe)) => {
@@ -951,7 +953,7 @@ pub extern "C" fn select(
     } else {
         unsafe {
             let tv = &*timeout;
-            ((tv.tv_sec as i64 * 1000) + (tv.tv_usec as i64 / 1000)) as c_int
+            ((tv.tv_sec * 1000) + (tv.tv_usec / 1000)) as c_int
         }
     };
 
@@ -1188,10 +1190,10 @@ pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
             return 0;
         }
     }
-    if pid == 0 {
-        if current_vpid().is_some() {
-            return 0;
-        }
+    if pid == 0
+        && current_vpid().is_some()
+    {
+        return 0;
     }
     // Real process — pass through
     unsafe {
@@ -1232,10 +1234,7 @@ pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
         if let Some(vpid) = current_vpid() {
             if crate::vfd::get_table(vpid)
                 .and_then(|t| t.get(fd as u32))
-                .map(|vfd| match vfd {
-                    crate::vfd::Vfd::Real(_) => false,
-                    _ => true,
-                })
+                .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
                 .unwrap_or(false)
             {
                 return 0;
@@ -1254,10 +1253,7 @@ pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
         if let Some(vpid) = current_vpid() {
             if crate::vfd::get_table(vpid)
                 .and_then(|t| t.get(fd as u32))
-                .map(|vfd| match vfd {
-                    crate::vfd::Vfd::Real(_) => false,
-                    _ => true,
-                })
+                .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
                 .unwrap_or(false)
             {
                 return vpid as c_int;
@@ -1277,12 +1273,11 @@ pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn raise(sig: c_int) -> c_int {
     if enabled() {
-        let vpid = current_vpid();
-        if vpid.is_some() {
+        if let Some(vpid) = current_vpid() {
             let ptr = crate::executor::get_current_executor();
             if !ptr.is_null() {
                 unsafe {
-                    if let Some(co) = (*ptr).vprocs.get_mut(&vpid.unwrap()) {
+                    if let Some(co) = (*ptr).vprocs.get_mut(&vpid) {
                         match sig {
                             libc::SIGKILL | libc::SIGTERM => {
                                 crate::executor::vproc_exit_with_code(128 + sig);
@@ -1398,7 +1393,7 @@ pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
                         *libc::__errno() = libc::ERANGE;
                         return std::ptr::null_mut();
                     }
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
                     *buf.add(bytes.len()) = 0;
                     return buf;
                 }

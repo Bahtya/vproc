@@ -269,7 +269,7 @@ static RANDOM_BYTES: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
 fn get_random_bytes() -> &'static [u8; 16] {
     RANDOM_BYTES.get_or_init(|| {
         // Try reading AT_RANDOM from /proc/self/auxv
-        if let Some(data) = std::fs::read("/proc/self/auxv").ok() {
+        if let Ok(data) = std::fs::read("/proc/self/auxv") {
             for i in (0..data.len().saturating_sub(15)).step_by(16) {
                 let kind = u64::from_ne_bytes(data[i..i + 8].try_into().unwrap_or([0; 8]));
                 let value = u64::from_ne_bytes(data[i + 8..i + 16].try_into().unwrap_or([0; 8]));

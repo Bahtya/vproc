@@ -18,8 +18,9 @@ import java.util.concurrent.*;
  */
 public class TestTermuxSession {
 
-    // Hermux's actual shell paths
+    /** Hermux's default shell path (busybox ash). Used as fallback when APK-bundled libsh.so is unavailable. */
     static final String SHELL = "/data/data/com.hermux/files/usr/bin/sh";
+    /** Hermux's bash path. Used as fallback when APK-bundled libbash.so is unavailable. */
     static final String BASH  = "/data/data/com.hermux/files/usr/bin/bash";
 
     // ART: untrusted_app 无法访问 Termux 数据目录，用 APK 内嵌的 shell
