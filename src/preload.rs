@@ -11,13 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Runs before any other library code via .init_array (Android/Linux).
 
 mod init {
-    use super::*;
-
     extern "C" fn vproc_auto_enable() {
         unsafe {
             libc::setenv(
-                b"VPROC\0".as_ptr() as *const c_char,
-                b"1\0".as_ptr() as *const c_char,
+                c"VPROC".as_ptr(),
+                c"1".as_ptr(),
                 1,
             );
         }
@@ -46,6 +44,8 @@ pub fn install_crash_handler() {
         sa.sa_flags = libc::SA_SIGINFO;
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
     }
 }
 
@@ -60,13 +60,13 @@ extern "C" fn crash_handler(
         let n = libc::snprintf(
             buf.as_mut_ptr() as *mut c_char,
             256,
-            b"\n[SIGSEGV] signal=%d fault_addr=%p\n\0".as_ptr() as *const c_char,
+            c"\n[SIGSEGV] signal=%d fault_addr=%p\n".as_ptr(),
             sig,
             fault_addr,
         );
         core::str::from_utf8_unchecked(&buf[..n as usize])
     };
-    unsafe { libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len()); }
+    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
 
     // Walk fp chain for backtrace
     let mut fp: usize;
@@ -78,14 +78,14 @@ extern "C" fn crash_handler(
             let n = libc::snprintf(
                 buf.as_mut_ptr() as *mut c_char,
                 256,
-                b"  #%d fp=%p lr=%p\n\0".as_ptr() as *const c_char,
+                c"  #%d fp=%p lr=%p\n".as_ptr(),
                 i,
                 fp,
                 lr,
             );
             core::str::from_utf8_unchecked(&buf[..n as usize])
         };
-        unsafe { libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len()); }
+        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
         fp = unsafe { std::ptr::read_unaligned(fp as *const usize) };
     }
 
@@ -110,7 +110,7 @@ fn enabled() -> bool {
     // Keep checking env until we see "1" — VPROC may be set after
     // program start (e.g. std::env::set_var in main), or during
     // early init before the env var is visible.
-    let val = unsafe { libc::getenv(b"VPROC\0".as_ptr() as *const c_char) };
+    let val = unsafe { libc::getenv(c"VPROC".as_ptr()) };
     let on = !val.is_null() && unsafe { *val == b'1' as _ };
     if on {
         VPROC_ENABLED.store(1, std::sync::atomic::Ordering::Relaxed);
@@ -132,9 +132,9 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
 
     let count = COUNT.load(Ordering::Acquire);
     let cache = &*CACHE.0.get();
-    for i in 0..count {
-        if cache[i].0 == sym.as_ptr() {
-            return cache[i].1;
+    for &(key, val) in cache.iter().take(count) {
+        if key == sym.as_ptr() {
+            return val;
         }
     }
 
@@ -142,7 +142,7 @@ unsafe fn real(sym: &'static str) -> *mut c_void {
     let ptr = libc::dlsym(rtld_next, sym.as_ptr() as *const c_char);
     if ptr.is_null() {
         let msg = format!("vproc: cannot resolve {:?}\n", sym);
-        libc::syscall(64, 2, msg.as_ptr() as *const _, msg.len());
+        libc::write(2, msg.as_ptr() as *const _, msg.len());
         libc::_exit(99);
     }
     let idx = COUNT.fetch_add(1, Ordering::AcqRel);
@@ -171,8 +171,42 @@ fn is_real_fork_child() -> bool {
     REAL_FORK_CHILD.load(Ordering::SeqCst)
 }
 
+/// Clear the fdsan ownership tag on an fd.
+/// Prevents fdsan abort when closing fds owned by unique_fd objects in other
+/// code (ART runtime, JNI bridge, etc.) — unavoidable when bash inherits all
+/// process fds in our dlopen-based virtual exec model.
+unsafe fn fdsan_clear_tag(fd: c_int) {
+    use std::sync::OnceLock;
+    type GetTagFn = unsafe extern "C" fn(c_int) -> u64;
+    type ExchangeTagFn = unsafe extern "C" fn(c_int, u64, u64);
+    static FUNCS: OnceLock<(Option<GetTagFn>, Option<ExchangeTagFn>)> = OnceLock::new();
+    let (get_tag, exchange_tag) = FUNCS.get_or_init(|| {
+        let gt = unsafe {
+            libc::dlsym(libc::RTLD_DEFAULT, c"android_fdsan_get_fd_tag".as_ptr())
+        };
+        let et = unsafe {
+            libc::dlsym(libc::RTLD_DEFAULT, c"android_fdsan_exchange_owner_tag".as_ptr())
+        };
+        (
+            if gt.is_null() { None } else { Some(std::mem::transmute::<*mut c_void, GetTagFn>(gt)) },
+            if et.is_null() { None } else { Some(std::mem::transmute::<*mut c_void, ExchangeTagFn>(et)) },
+        )
+    });
+    if let (Some(gt), Some(et)) = (get_tag, exchange_tag) {
+        let tag = unsafe { gt(fd) };
+        if tag != 0 {
+            unsafe { et(fd, tag, 0); }
+        }
+    }
+}
+
 /// Call the real libc close() bypassing our interceptor.
+///
+/// # Safety
+///
+/// `fd` must be a valid open file descriptor (or -1, which is a no-op).
 pub unsafe fn real_close(fd: c_int) -> c_int {
+    fdsan_clear_tag(fd);
     let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
     f(fd)
 }
@@ -463,7 +497,7 @@ pub extern "C" fn execve(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
-    match crate::vexec::virtual_execve(&*path_str, argv_vec, envp_vec) {
+    match crate::vexec::virtual_execve(&path_str, argv_vec, envp_vec) {
         Ok(_) => {
             crate::executor::vproc_exit_with_code(0);
             unreachable!()
@@ -610,10 +644,32 @@ pub extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
                 _ => fd,
             })
             .unwrap_or(fd);
-        unsafe {
-            let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
-                std::mem::transmute(real("read\0"));
-            return f(real_fd, buf, count);
+        // poll-before-read: check readiness with timeout=0 to avoid blocking the driver thread.
+        loop {
+            let mut pfd = libc::pollfd { fd: real_fd, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe {
+                let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                    std::mem::transmute(real("poll\0"));
+                f(&mut pfd, 1, 0)
+            };
+            if ready > 0 {
+                if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    unsafe {
+                        let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
+                            std::mem::transmute(real("read\0"));
+                        return f(real_fd, buf, count);
+                    }
+                }
+                // POLLERR/POLLNVAL — fall through to read to get proper errno
+                unsafe {
+                    let f: extern "C" fn(c_int, *mut c_void, usize) -> isize =
+                        std::mem::transmute(real("read\0"));
+                    return f(real_fd, buf, count);
+                }
+            }
+            if ready < 0 { return -1; }
+            // Not ready — yield waiting for I/O (driver thread will batch poll)
+            crate::executor::yield_for_io(vec![(real_fd, libc::POLLIN)]);
         }
     }
 
@@ -674,10 +730,32 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
                 _ => fd,
             })
             .unwrap_or(fd);
-        unsafe {
-            let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
-                std::mem::transmute(real("write\0"));
-            return f(real_fd, buf, count);
+        // poll-before-write: check readiness with timeout=0.
+        loop {
+            let mut pfd = libc::pollfd { fd: real_fd, events: libc::POLLOUT, revents: 0 };
+            let ready = unsafe {
+                let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                    std::mem::transmute(real("poll\0"));
+                f(&mut pfd, 1, 0)
+            };
+            if ready > 0 {
+                if pfd.revents & libc::POLLOUT != 0 {
+                    unsafe {
+                        let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
+                            std::mem::transmute(real("write\0"));
+                        return f(real_fd, buf, count);
+                    }
+                }
+                // POLLERR/POLLHUP — fall through to write to get proper errno
+                unsafe {
+                    let f: extern "C" fn(c_int, *const c_void, usize) -> isize =
+                        std::mem::transmute(real("write\0"));
+                    return f(real_fd, buf, count);
+                }
+            }
+            if ready < 0 { return -1; }
+            // Not ready — yield waiting for I/O
+            crate::executor::yield_for_io(vec![(real_fd, libc::POLLOUT)]);
         }
     }
 
@@ -692,7 +770,7 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
                 }
                 if pipe_buf.is_closed() {
                     unsafe { *libc::__errno() = libc::EPIPE };
-                    crate::executor::vproc_exit_with_code(128 + libc::SIGPIPE as i32);
+                    crate::executor::vproc_exit_with_code(128 + libc::SIGPIPE);
                     unreachable!()
                 }
                 crate::executor::do_yield();
@@ -708,16 +786,229 @@ pub extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
 }
 
 // ---------------------------------------------------------------------------
+// poll() — cooperative I/O multiplexing
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_int) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                std::mem::transmute(real("poll\0"));
+            return f(fds, nfds, timeout);
+        }
+    }
+    let vpid = match current_vpid() {
+        Some(p) => p,
+        None => unsafe {
+            let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                std::mem::transmute(real("poll\0"));
+            return f(fds, nfds, timeout);
+        }
+    };
+
+    if fds.is_null() || nfds == 0 {
+        unsafe {
+            let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                std::mem::transmute(real("poll\0"));
+            return f(fds, nfds, timeout);
+        }
+    }
+
+    loop {
+        let mut count = 0i32;
+        let mut wait_fds: Vec<(c_int, i16)> = Vec::new();
+
+        for i in 0..nfds as usize {
+            let pfd = unsafe { &mut *fds.add(i) };
+            pfd.revents = 0;
+
+            let vfd = crate::vfd::get_table(vpid).and_then(|t| t.get(pfd.fd as u32));
+            match vfd {
+                Some(crate::vfd::Vfd::PipeRead(pipe)) => {
+                    if pfd.events & libc::POLLIN != 0
+                        && (!pipe.is_empty() || pipe.is_closed())
+                    {
+                        pfd.revents |= libc::POLLIN;
+                        if pipe.is_closed() { pfd.revents |= libc::POLLHUP; }
+                    }
+                }
+                Some(crate::vfd::Vfd::PipeWrite(pipe)) => {
+                    if pfd.events & libc::POLLOUT != 0 {
+                        if !pipe.is_full() {
+                            pfd.revents |= libc::POLLOUT;
+                        }
+                        if pipe.is_closed() {
+                            pfd.revents |= libc::POLLERR;
+                        }
+                    }
+                }
+                Some(crate::vfd::Vfd::Real(r)) => {
+                    let real_fd = *r;
+                    let mut check = libc::pollfd { fd: real_fd, events: pfd.events, revents: 0 };
+                    let ready = unsafe {
+                        let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                            std::mem::transmute(real("poll\0"));
+                        f(&mut check, 1, 0)
+                    };
+                    if ready > 0 {
+                        pfd.revents = check.revents;
+                    } else {
+                        wait_fds.push((real_fd, pfd.events));
+                    }
+                }
+                Some(crate::vfd::Vfd::File(file_ref)) => {
+                    let real_fd = file_ref.real_fd;
+                    let mut check = libc::pollfd { fd: real_fd, events: pfd.events, revents: 0 };
+                    let ready = unsafe {
+                        let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                            std::mem::transmute(real("poll\0"));
+                        f(&mut check, 1, 0)
+                    };
+                    if ready > 0 {
+                        pfd.revents = check.revents;
+                    } else {
+                        wait_fds.push((real_fd, pfd.events));
+                    }
+                }
+                None => {
+                    // Unknown fd — real poll with timeout=0
+                    let mut check = libc::pollfd { fd: pfd.fd, events: pfd.events, revents: 0 };
+                    let ready = unsafe {
+                        let f: extern "C" fn(*mut libc::pollfd, libc::nfds_t, c_int) -> c_int =
+                            std::mem::transmute(real("poll\0"));
+                        f(&mut check, 1, 0)
+                    };
+                    if ready > 0 {
+                        pfd.revents = check.revents;
+                    } else {
+                        wait_fds.push((pfd.fd, pfd.events));
+                    }
+                }
+            }
+
+            if pfd.revents != 0 {
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            return count;
+        }
+        if timeout == 0 {
+            return 0;
+        }
+
+        // Nothing ready — yield waiting for I/O
+        crate::executor::yield_for_io(wait_fds);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// select() — convert to poll internally
+// ---------------------------------------------------------------------------
+
+const FD_SETSIZE: c_int = 1024;
+
+unsafe fn fd_isset(fd: c_int, set: *const libc::fd_set) -> bool {
+    let mask = 1u32 << (fd % 32);
+    let idx = (fd / 32) as usize;
+    let arr = set as *const [u32; 32];
+    (*arr)[idx] & mask != 0
+}
+
+unsafe fn fd_set(fd: c_int, set: *mut libc::fd_set) {
+    let mask = 1u32 << (fd % 32);
+    let idx = (fd / 32) as usize;
+    let arr = set as *mut [u32; 32];
+    (*arr)[idx] |= mask;
+}
+
+#[no_mangle]
+pub extern "C" fn select(
+    nfds: c_int,
+    readfds: *mut libc::fd_set,
+    writefds: *mut libc::fd_set,
+    exceptfds: *mut libc::fd_set,
+    timeout: *mut libc::timeval,
+) -> c_int {
+    if !enabled() || is_real_fork_child() {
+        unsafe {
+            let f: extern "C" fn(c_int, *mut libc::fd_set, *mut libc::fd_set, *mut libc::fd_set, *mut libc::timeval) -> c_int =
+                std::mem::transmute(real("select\0"));
+            return f(nfds, readfds, writefds, exceptfds, timeout);
+        }
+    }
+    if current_vpid().is_none() {
+        unsafe {
+            let f: extern "C" fn(c_int, *mut libc::fd_set, *mut libc::fd_set, *mut libc::fd_set, *mut libc::timeval) -> c_int =
+                std::mem::transmute(real("select\0"));
+            return f(nfds, readfds, writefds, exceptfds, timeout);
+        }
+    }
+
+    // Convert timeout to poll-style milliseconds
+    let timeout_ms: c_int = if timeout.is_null() {
+        -1 // block indefinitely
+    } else {
+        unsafe {
+            let tv = &*timeout;
+            ((tv.tv_sec * 1000) + (tv.tv_usec / 1000)) as c_int
+        }
+    };
+
+    // Build pollfd array from fd_sets
+    let mut pollfds: Vec<libc::pollfd> = Vec::new();
+    let max_fd = nfds.min(FD_SETSIZE);
+
+    for fd in 0..max_fd {
+        let mut events: i16 = 0;
+        if !readfds.is_null() && unsafe { fd_isset(fd, readfds) } {
+            events |= libc::POLLIN;
+        }
+        if !writefds.is_null() && unsafe { fd_isset(fd, writefds) } {
+            events |= libc::POLLOUT;
+        }
+        if !exceptfds.is_null() && unsafe { fd_isset(fd, exceptfds) } {
+            events |= libc::POLLPRI;
+        }
+        if events != 0 {
+            pollfds.push(libc::pollfd { fd, events, revents: 0 });
+        }
+    }
+
+    let ret = poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms);
+
+    // Clear fd_sets and set bits from results
+    if !readfds.is_null() { unsafe { libc::memset(readfds as *mut _, 0, std::mem::size_of::<libc::fd_set>()); } }
+    if !writefds.is_null() { unsafe { libc::memset(writefds as *mut _, 0, std::mem::size_of::<libc::fd_set>()); } }
+    if !exceptfds.is_null() { unsafe { libc::memset(exceptfds as *mut _, 0, std::mem::size_of::<libc::fd_set>()); } }
+
+    if ret > 0 {
+        for pfd in &pollfds {
+            if pfd.revents & libc::POLLIN != 0 && !readfds.is_null() {
+                unsafe { fd_set(pfd.fd, readfds); }
+            }
+            if pfd.revents & libc::POLLOUT != 0 && !writefds.is_null() {
+                unsafe { fd_set(pfd.fd, writefds); }
+            }
+            if pfd.revents & libc::POLLPRI != 0 && !exceptfds.is_null() {
+                unsafe { fd_set(pfd.fd, exceptfds); }
+            }
+        }
+    }
+
+    ret
+}
+
+// ---------------------------------------------------------------------------
 // close() / dup() / dup2()
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn close(fd: c_int) -> c_int {
     if !enabled() || is_real_fork_child() {
-        unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            return f(fd);
-        }
+        return unsafe { real_close(fd) };
     }
     if fd < 0 {
         unsafe { *libc::__errno() = libc::EBADF };
@@ -725,17 +1016,11 @@ pub extern "C" fn close(fd: c_int) -> c_int {
     }
     let vpid = match current_vpid() {
         Some(p) => p,
-        None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            return f(fd);
-        }
+        None => return unsafe { real_close(fd) },
     };
     let table = match crate::vfd::get_table(vpid) {
         Some(t) => t,
-        None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            return f(fd);
-        }
+        None => return unsafe { real_close(fd) },
     };
     match table.get(fd as u32) {
         Some(crate::vfd::Vfd::Real(_real_fd)) => {
@@ -758,10 +1043,7 @@ pub extern "C" fn close(fd: c_int) -> c_int {
                 -1
             }
         },
-        None => unsafe {
-            let f: extern "C" fn(c_int) -> c_int = std::mem::transmute(real("close\0"));
-            f(fd)
-        },
+        None => unsafe { real_close(fd) },
     }
 }
 
@@ -908,10 +1190,10 @@ pub extern "C" fn setpgid(pid: c_int, pgid: c_int) -> c_int {
             return 0;
         }
     }
-    if pid == 0 {
-        if current_vpid().is_some() {
-            return 0;
-        }
+    if pid == 0
+        && current_vpid().is_some()
+    {
+        return 0;
     }
     // Real process — pass through
     unsafe {
@@ -952,10 +1234,7 @@ pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
         if let Some(vpid) = current_vpid() {
             if crate::vfd::get_table(vpid)
                 .and_then(|t| t.get(fd as u32))
-                .map(|vfd| match vfd {
-                    crate::vfd::Vfd::Real(_) => false,
-                    _ => true,
-                })
+                .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
                 .unwrap_or(false)
             {
                 return 0;
@@ -974,10 +1253,7 @@ pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
         if let Some(vpid) = current_vpid() {
             if crate::vfd::get_table(vpid)
                 .and_then(|t| t.get(fd as u32))
-                .map(|vfd| match vfd {
-                    crate::vfd::Vfd::Real(_) => false,
-                    _ => true,
-                })
+                .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
                 .unwrap_or(false)
             {
                 return vpid as c_int;
@@ -997,12 +1273,11 @@ pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn raise(sig: c_int) -> c_int {
     if enabled() {
-        let vpid = current_vpid();
-        if vpid.is_some() {
+        if let Some(vpid) = current_vpid() {
             let ptr = crate::executor::get_current_executor();
             if !ptr.is_null() {
                 unsafe {
-                    if let Some(co) = (*ptr).vprocs.get_mut(&vpid.unwrap()) {
+                    if let Some(co) = (*ptr).vprocs.get_mut(&vpid) {
                         match sig {
                             libc::SIGKILL | libc::SIGTERM => {
                                 crate::executor::vproc_exit_with_code(128 + sig);
@@ -1118,7 +1393,7 @@ pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
                         *libc::__errno() = libc::ERANGE;
                         return std::ptr::null_mut();
                     }
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
                     *buf.add(bytes.len()) = 0;
                     return buf;
                 }

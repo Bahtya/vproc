@@ -114,8 +114,12 @@ pub extern "C" fn vproc_ffi_destroy_session(session_id: u32) {
 
 /// Create a virtual process within a session.
 /// Returns virtual PID (> 0) on success, 0 on error.
+///
+/// # Safety
+///
+/// `path`, `argv`, `envp` must be valid null-terminated C strings/arrays.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_create_process(
+pub unsafe extern "C" fn vproc_ffi_create_process(
     session_id: u32,
     path: *const c_char,
     argv: *const *const c_char,
@@ -128,18 +132,24 @@ pub extern "C" fn vproc_ffi_create_process(
     let argv_vec = unsafe { crate::c_array_to_vec(argv) };
     let envp_vec = unsafe { crate::c_array_to_vec(envp) };
 
+    // Reduce timer slack from ~40ms (Android background default) to 50µs.
+    // This makes nanosleep(10ms) actually sleep ~10ms instead of ~50ms.
+    unsafe { libc::prctl(29, 50_000, 0, 0, 0); }
+
     unsafe { VPROC_CREATE_PROGRESS = 1; }
 
     let result = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
 
     unsafe { VPROC_CREATE_PROGRESS = 2; }
 
-    let spawn_queue = {
+    let (spawn_queue, session) = {
         let sessions = SESSIONS.lock().unwrap();
         unsafe { VPROC_CREATE_PROGRESS = 3; }
         let session = match sessions.get(&session_id) {
             Some(s) => Arc::clone(s),
-            None => return 0,
+            None => {
+                return 0;
+            }
         };
         drop(sessions);
         unsafe { VPROC_CREATE_PROGRESS = 4; }
@@ -152,8 +162,10 @@ pub extern "C" fn vproc_ffi_create_process(
             unsafe { libc::nanosleep(&libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 }, std::ptr::null_mut()); }
         }
         match sq {
-            Some(q) => q,
-            None => return 0,
+            Some(q) => (q, session),
+            None => {
+                return 0;
+            }
         }
     };
 
@@ -173,16 +185,25 @@ pub extern "C" fn vproc_ffi_create_process(
         cvar.notify_all();
     }
 
+    // Wake driver thread — it waits on Session.wake, not spawn_queue's condvar
+    {
+        let s = session.lock().unwrap();
+        s.wake.notify_all();
+    }
+
     unsafe { VPROC_CREATE_PROGRESS = 6; }
 
     // Wait for driver to process — poll with direct nanosleep
+    // (condvar.wait causes Android scheduler latency ~50ms per wake,
+    //  worse than 10ms poll with prctl-reduced timer slack)
     let mut attempts = 0;
     loop {
         {
             let (lock, _) = &*result;
             let guard = lock.lock().unwrap();
             if guard.is_some() {
-                return guard.unwrap_or(0);
+                let vpid = guard.unwrap_or(0);
+                return vpid;
             }
         }
         attempts += 1;
@@ -200,6 +221,9 @@ pub extern "C" fn vproc_ffi_create_process(
 /// Returns the exit code, or -1 on error/timeout.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int {
+    // Reduce timer slack for this thread
+    unsafe { libc::prctl(29, 50_000, 0, 0, 0); }
+
     let result = Arc::new((Mutex::new(None::<i32>), Condvar::new()));
 
     let sessions = SESSIONS.lock().unwrap();
@@ -211,7 +235,11 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
 
     {
         let s = session.lock().unwrap();
-        // Check if already done (driver thread may have completed it)
+        // Check stored exit code first (works even after coroutine was reaped)
+        if let Some(&code) = s.executor.exit_codes.get(&vpid) {
+            return code;
+        }
+        // Check live coroutine
         if let Some(code) = s.executor.vprocs.get(&vpid).and_then(|co| {
             if co.is_done() { Some(co.exit_code) } else { None }
         }) {
@@ -220,6 +248,9 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
         drop(s);
         let mut s = session.lock().unwrap();
         // Re-check after re-acquiring lock (driver could have finished between drops)
+        if let Some(&code) = s.executor.exit_codes.get(&vpid) {
+            return code;
+        }
         if let Some(code) = s.executor.vprocs.get(&vpid).and_then(|co| {
             if co.is_done() { Some(co.exit_code) } else { None }
         }) {
@@ -232,29 +263,28 @@ pub extern "C" fn vproc_ffi_run_until_exit(session_id: u32, vpid: u32) -> c_int 
         s.wake.notify_all();
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    loop {
-        {
-            let (lock, _) = &*result;
-            let guard = lock.lock().unwrap();
-            if guard.is_some() {
-                return guard.unwrap_or(-1);
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return -1;
+    // Wait for exit — poll with 10ms sleep
+    // (condvar.wait causes Android scheduler latency ~50ms per wake)
+    for _ in 0..30000 {
+        let (lock, _) = &*result;
+        if let Some(code) = *lock.lock().unwrap() {
+            return code;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    -1
 }
 
 /// Check if a virtual process exists within a session.
+/// Also returns 1 for already-exited (reaped) processes whose exit code is stored.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_vpid_exists(session_id: u32, vpid: u32) -> c_int {
     let sessions = SESSIONS.lock().unwrap();
     if let Some(session) = sessions.get(&session_id) {
         let s = session.lock().unwrap();
-        if s.executor.vprocs.contains_key(&vpid) {
+        if s.executor.vprocs.contains_key(&vpid)
+            || s.executor.exit_codes.contains_key(&vpid)
+        {
             return 1;
         }
     }
@@ -268,8 +298,12 @@ pub extern "C" fn vproc_ffi_vpid_exists(session_id: u32, vpid: u32) -> c_int {
 
 /// Create a virtual process using the default session.
 /// Returns virtual PID (> 0) on success, 0 on error.
+///
+/// # Safety
+///
+/// `path`, `argv`, `envp` must be valid null-terminated C strings/arrays.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_create_process_default(
+pub unsafe extern "C" fn vproc_ffi_create_process_default(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
@@ -377,10 +411,7 @@ pub extern "C" fn vproc_ffi_yield() {
 /// Get exit code of a completed virtual process. Returns -1 if not done yet.
 #[no_mangle]
 pub extern "C" fn vproc_ffi_get_exit_code(vpid: u32) -> c_int {
-    match crate::executor::get_exit_code(vpid) {
-        Some(code) => code,
-        None => -1,
-    }
+    crate::executor::get_exit_code(vpid).unwrap_or(-1)
 }
 
 /// Get the current virtual process ID. Returns real PID if not in a coroutine.
@@ -425,8 +456,12 @@ pub extern "C" fn vproc_ffi_getppid() -> u32 {
 /// Returns -1 on error.
 ///
 /// No mutex: called from inside a coroutine (driver thread), already serialized.
+///
+/// # Safety
+///
+/// `path`, `argv`, `envp` must be valid null-terminated C strings/arrays.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_execve(
+pub unsafe extern "C" fn vproc_ffi_execve(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
@@ -528,8 +563,12 @@ pub extern "C" fn vproc_ffi_fork() -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Create a virtual pipe. Returns 0 on success, -1 on error.
+///
+/// # Safety
+///
+/// `fds` must point to a valid `int[2]` buffer.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_pipe(vpid: u32, fds: *mut c_int) -> c_int {
+pub unsafe extern "C" fn vproc_ffi_pipe(vpid: u32, fds: *mut c_int) -> c_int {
     let table = crate::vfd::get_or_create_table(vpid);
     let (read_fd, write_fd) = table.create_pipe();
     unsafe {
@@ -552,8 +591,12 @@ pub extern "C" fn vproc_ffi_is_virtual_fd(vpid: u32, fd: c_int) -> c_int {
 }
 
 /// Read from a virtual pipe fd. Returns bytes read, or -1 (EAGAIN if empty).
+///
+/// # Safety
+///
+/// `buf` must point to a valid writable buffer of at least `count` bytes.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_read(
+pub unsafe extern "C" fn vproc_ffi_read(
     vpid: u32,
     fd: c_int,
     buf: *mut c_void,
@@ -573,8 +616,12 @@ pub extern "C" fn vproc_ffi_read(
 }
 
 /// Write to a virtual pipe fd. Returns bytes written, or -1 (EAGAIN if full).
+///
+/// # Safety
+///
+/// `buf` must point to a valid readable buffer of at least `count` bytes.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_write(
+pub unsafe extern "C" fn vproc_ffi_write(
     vpid: u32,
     fd: c_int,
     buf: *const c_void,
@@ -599,13 +646,7 @@ pub extern "C" fn vproc_ffi_pipe_is_closed(vpid: u32, fd: c_int) -> c_int {
     crate::vfd::get_table(vpid)
         .and_then(|t| t.get(fd as u32))
         .map(|vfd| match vfd {
-            crate::vfd::Vfd::PipeWrite(buf) => {
-                if buf.is_closed() {
-                    1
-                } else {
-                    0
-                }
-            },
+            crate::vfd::Vfd::PipeWrite(buf) if buf.is_closed() => 1,
             _ => 0,
         })
         .unwrap_or(0)
@@ -659,8 +700,12 @@ pub extern "C" fn vproc_ffi_dup2(vpid: u32, old_fd: c_int, new_fd: c_int) -> c_i
 
 /// Get the per-coroutine working directory.
 /// Returns 0 on success, -1 if no cwd set or vpid not found.
+///
+/// # Safety
+///
+/// `buf` must point to a valid writable buffer of at least `size` bytes.
 #[no_mangle]
-pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
+pub unsafe extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) -> c_int {
     let ptr = crate::executor::get_current_executor();
     if ptr.is_null() {
         return -1;
@@ -673,7 +718,7 @@ pub extern "C" fn vproc_ffi_get_cwd(vpid: u32, buf: *mut c_char, size: usize) ->
                     if bytes.len() + 1 > size {
                         return -1;
                     }
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
                     *buf.add(bytes.len()) = 0;
                     0
                 }
@@ -714,31 +759,6 @@ pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) -> i32 {
 // ---------------------------------------------------------------------------
 // Per-session driver loop
 // ---------------------------------------------------------------------------
-
-// sigsetjmp/siglongjmp FFI — not exposed by libc crate on all platforms
-type SigjmpBuf = [c_int; 26]; // large enough for aarch64 sigjmp_buf
-static mut PROBE_JMP: std::mem::MaybeUninit<SigjmpBuf> = std::mem::MaybeUninit::uninit();
-
-unsafe fn probe_sigsetjmp(env: *mut SigjmpBuf, savemask: c_int) -> c_int {
-    extern "C" { fn sigsetjmp(env: *mut c_int, savemask: c_int) -> c_int; }
-    unsafe { sigsetjmp(env as *mut c_int, savemask) }
-}
-
-unsafe fn probe_siglongjmp(env: *mut SigjmpBuf, val: c_int) {
-    #[cfg(target_arch = "aarch64")]
-    std::arch::asm!("xpaclri"); // Strip PAC from lr before siglongjmp
-    extern "C" { fn siglongjmp(env: *mut c_int, val: c_int); }
-    unsafe { siglongjmp(env as *mut c_int, val); }
-}
-
-/// SIGSEGV handler for the driver self-test probe — jumps back to report failure.
-unsafe extern "C" fn probe_sigsegv_handler(
-    _sig: c_int,
-    _info: *mut libc::siginfo_t,
-    _uctx: *mut c_void,
-) {
-    probe_siglongjmp(PROBE_JMP.as_mut_ptr(), 1);
-}
 
 fn run_session_driver(session: Arc<Mutex<Session>>) {
     // 1. Signal isolation — block all signals except SIGWINCH, SIGSEGV, SIGBUS
@@ -782,20 +802,18 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
     }
 
-    // 4. Main loop
+    // 4. Main loop — I/O-aware event-driven scheduling
     loop {
         {
             let mut s = session.lock().unwrap();
 
             if s.shutdown {
-                // Reap all coroutines and cleanup
                 crate::executor::set_current_executor(&mut s.executor as *mut _);
                 s.executor.reap_done_coroutines();
                 crate::vfd::cleanup();
                 return;
             }
 
-            // Set thread-local for all operations in this iteration
             crate::executor::set_current_executor(&mut s.executor as *mut _);
 
             // Drain spawn queue (uses separate lock, not session mutex)
@@ -816,7 +834,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                     Err(e) => {
                         let msg = format!("vproc_ffi_create_process: {}\n", e);
                         unsafe {
-                            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                            libc::write(2, msg.as_ptr() as *const _, msg.len());
                         }
                         0
                     }
@@ -844,25 +862,57 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
 
             // Reap done coroutines
             s.executor.reap_done_coroutines();
+
+            // Collect I/O-waiting fds and batch poll
+            let (pollfds, pid_map) = crate::executor::collect_io_waits();
+            if !pollfds.is_empty() {
+                // Drop session lock while blocking in poll — other threads
+                // can submit spawn requests during this time.
+                drop(s);
+
+                let ready = unsafe {
+                    libc::poll(
+                        pollfds.as_ptr() as *mut libc::pollfd,
+                        pollfds.len() as libc::nfds_t,
+                        50, // 50ms max wait — balances latency and CPU usage
+                    )
+                };
+
+                // Re-lock and wake ready coroutines
+                let mut s = session.lock().unwrap();
+                crate::executor::set_current_executor(&mut s.executor as *mut _);
+
+                if ready > 0 {
+                    crate::executor::wake_io_ready(&pollfds, &pid_map);
+                } else if ready == 0 {
+                    // Timeout — check if any io_wait coroutines should be re-checked
+                    // (e.g. virtual pipe state may have changed). Push them all back.
+                    crate::executor::wake_io_ready(&pollfds, &pid_map);
+                }
+                // If ready < 0 (error), just continue — coroutines stay in io_wait
+            }
         }
 
-        // Block until new work arrives (spawn request, waiter, or active coroutines)
+        // Wait for work using condvar — untimed wait is NOT affected by timer slack.
+        // Must loop to guard against spurious wakeups.
+        // Use raw pointer to wake field to avoid borrow-after-move (wake lives inside
+        // Session behind Arc<Mutex>, so it's stable for the lifetime of the wait).
         {
-            let s = session.lock().unwrap();
-            let spawn_has_work = {
-                let (sq_lock, _) = &*s.spawn_queue;
-                !sq_lock.lock().unwrap().is_empty()
-            };
-            let has_work = spawn_has_work
-                || !s.waiters.is_empty()
-                || s.executor.vprocs.values().any(|c| !c.is_done());
-            if !has_work && !s.shutdown {
-                // addr_of! creates a raw pointer without borrowing the guard,
-                // allowing the guard to be moved into wait_timeout.
-                let wake = std::ptr::addr_of!(s.wake);
-                let _guard = unsafe {
-                    (&*wake).wait_timeout(s, std::time::Duration::from_millis(100))
-                }.unwrap();
+            let mut s = session.lock().unwrap();
+            let wake_ptr = &s.wake as *const Condvar;
+            loop {
+                let spawn_has_work = {
+                    let (sq_lock, _) = &*s.spawn_queue;
+                    !sq_lock.lock().unwrap().is_empty()
+                };
+                let has_ready = !s.executor.vprocs.values().all(|c| c.is_done() || c.io_wait.is_some());
+                let has_work = spawn_has_work
+                    || !s.waiters.is_empty()
+                    || has_ready;
+                if has_work || s.shutdown {
+                    break;
+                }
+                s = unsafe { &*wake_ptr }.wait(s).unwrap();
             }
         }
     }

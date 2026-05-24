@@ -1222,6 +1222,16 @@ static mco_result _mco_makectx(mco_coro* co, _mco_ctxbuf* ctx, void* stack_base,
 
 #elif defined(__aarch64__)
 
+#include <sys/auxv.h>
+#ifndef HWCAP_PACA
+#define HWCAP_PACA (1 << 30)
+#endif
+
+static int __attribute__((unused)) _mco_pac_available(void) {
+  unsigned long hwcap = getauxval(AT_HWCAP);
+  return (hwcap & HWCAP_PACA) != 0;
+}
+
 typedef struct _mco_ctxbuf {
   void *x[12]; /* x19-x30 */
   void *sp;
@@ -1244,8 +1254,10 @@ __asm__(
   "_mco_switch:\n"
 #endif
 
+  "  .arch_extension pauth\n"
   "  mov x10, sp\n"
   "  mov x11, x30\n"
+  "  xpaci x11\n" /* Strip PAC from saved lr at save time (NOP on non-PAC hw) */
   "  stp x19, x20, [x0, #(0*16)]\n"
   "  stp x21, x22, [x0, #(1*16)]\n"
   "  stp d8, d9, [x0, #(7*16)]\n"
@@ -1255,7 +1267,7 @@ __asm__(
   "  stp d12, d13, [x0, #(9*16)]\n"
   "  stp x27, x28, [x0, #(4*16)]\n"
   "  stp d14, d15, [x0, #(10*16)]\n"
-  "  stp x29, x30, [x0, #(5*16)]\n"
+  "  stp x29, x11, [x0, #(5*16)]\n" /* Use stripped x11 for both lr slots */
   "  stp x10, x11, [x0, #(6*16)]\n"
   "  ldp x19, x20, [x1, #(0*16)]\n"
   "  ldp x21, x22, [x1, #(1*16)]\n"
@@ -1266,7 +1278,7 @@ __asm__(
   "  ldp d12, d13, [x1, #(9*16)]\n"
   "  ldp x27, x28, [x1, #(4*16)]\n"
   "  ldp d14, d15, [x1, #(10*16)]\n"
-  "  ldp x29, x30, [x1, #(5*16)]\n"
+  "  ldp x29, x30, [x1, #(5*16)]\n" /* lr already stripped at save time */
   "  ldp x10, x11, [x1, #(6*16)]\n"
   "  mov sp, x10\n"
   "  br x11\n"

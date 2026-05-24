@@ -19,11 +19,24 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <malloc.h>
 #include <signal.h>
+#include <sys/prctl.h>
+
+/* mallopt is available in Android libc (API 26+) but not declared without
+ * the android target triple. Declare it explicitly. */
+extern int mallopt(int __option, int __value);
+#ifndef M_BIONIC_SET_HEAP_TAGGING_LEVEL
+#define M_BIONIC_SET_HEAP_TAGGING_LEVEL (-204)
+#endif
+#ifndef M_HEAP_TAGGING_LEVEL_NONE
+#define M_HEAP_TAGGING_LEVEL_NONE 0
+#endif
 #include <setjmp.h>
 #include <poll.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/auxv.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -32,6 +45,18 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+
+/* dladdr for symbol resolution in crash backtrace */
+typedef int (*dladdr_fn)(const void *, Dl_info *);
+static dladdr_fn get_dladdr(void) {
+    static dladdr_fn fn = NULL;
+    if (!fn) {
+        void *libdl = dlopen("libdl.so", RTLD_NOW);
+        if (!libdl) libdl = dlopen("libc.so", RTLD_NOW);
+        if (libdl) fn = (dladdr_fn)dlsym(libdl, "dladdr");
+    }
+    return fn;
+}
 
 /* Dynamic __android_log_print via dlsym — no liblog link dependency */
 #include <dlfcn.h>
@@ -75,7 +100,7 @@ static ssize_t raw_read(int fd, void *buf, size_t count) {
 }
 
 static void raw_log(const char *msg) {
-    (void)msg; /* disabled — libc write() may be intercepted by vproc GOT hooks */
+    ALOGI("%s", msg);
 }
 
 /* ------------------------------------------------------------------
@@ -108,23 +133,97 @@ static uint32_t g_vproc_session_id = 0;
 static atomic_int g_vproc_initialized = ATOMIC_VAR_INIT(0);
 
 /* Signal handler — matches Hermux's termux.c exactly */
-static struct sigaction g_old_sigsegv, g_old_sigabrt, g_old_sigbus;
+static struct sigaction g_old_sigsegv, g_old_sigabrt, g_old_sigbus, g_old_sigill;
+
+/* Write crash info to persistent file so ArtTestActivity shows it on next launch. */
+static void save_crash_to_file(const char *msg) {
+    int fd = open("/data/data/com.vproc.arttest/files/crash_log.txt",
+                  O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        write(fd, msg, strlen(msg));
+        write(fd, "\n", 1);
+        close(fd);
+    }
+}
 
 static void vproc_crash_signal_handler(int sig, siginfo_t *info, void *uctx) {
     (void)uctx;
     const char *signame = sig == SIGSEGV ? "SIGSEGV" :
                           sig == SIGBUS  ? "SIGBUS"  :
-                          sig == SIGABRT ? "SIGABRT" : "UNKNOWN";
-    char buf[256];
+                          sig == SIGABRT ? "SIGABRT" :
+                          sig == SIGILL  ? "SIGILL"  : "UNKNOWN";
+    char buf[768];
+    const char *sicode = info->si_code == 1 ? "SEGV_MAPERR" :
+                         info->si_code == 2 ? "SEGV_ACCERR" :
+                         info->si_code == 16 ? "SEGV_MTESYNC" :
+                         info->si_code == 17 ? "SEGV_MTEAERR" : "OTHER";
     int n = snprintf(buf, sizeof(buf),
-        "=== NATIVE CRASH in vproc context === signal=%s (%d) si_addr=%p ===",
-        signame, sig, info->si_addr);
+        "=== NATIVE CRASH === signal=%s (%d) si_code=%d(%s) si_addr=%p tid=%d ===",
+        signame, sig, info->si_code, sicode, info->si_addr, (int)syscall(__NR_gettid));
     raw_write(2, buf, n);
     raw_write(2, "\n", 1);
+
+    /* Save to file for ArtTestActivity to show on next launch */
+    save_crash_to_file(buf);
+
+    /* Dump registers from ucontext to identify faulting register values */
+    if (uctx) {
+        ucontext_t *uc = (ucontext_t *)uctx;
+        mcontext_t *mc = &uc->uc_mcontext;
+        n = snprintf(buf, sizeof(buf),
+            "  pc=%p sp=%p x0=%p x1=%p x8=%p x19=%p x20=%p x23=%p",
+            (void*)mc->pc, (void*)mc->sp,
+            (void*)mc->regs[0], (void*)mc->regs[1], (void*)mc->regs[8],
+            (void*)mc->regs[19], (void*)mc->regs[20], (void*)mc->regs[23]);
+        raw_write(2, buf, n);
+        raw_write(2, "\n", 1);
+        save_crash_to_file(buf);
+    }
+
+    /* Log MTE/PAC status */
+    {
+        unsigned long hwcap = getauxval(AT_HWCAP);
+        /* HWCAP_MTE = 1<<18, HWCAP_PACA = 1<<30 */
+        int has_mte = (hwcap & (1UL << 18)) ? 1 : 0;
+        int has_pac = (hwcap & (1UL << 30)) ? 1 : 0;
+        n = snprintf(buf, sizeof(buf),
+            "  HWCAP=%#lx MTE=%d PAC=%d", hwcap, has_mte, has_pac);
+        raw_write(2, buf, n);
+        raw_write(2, "\n", 1);
+        save_crash_to_file(buf);
+    }
+
+    /* Walk fp chain for backtrace with dladdr symbol resolution */
+    dladdr_fn dladdr = get_dladdr();
+    void *fp;
+    __asm__ volatile("mov %0, x29" : "=r"(fp));
+    for (int i = 0; i < 16 && fp; i++) {
+        void *lr = *((void**)((char*)fp + 8));
+        if (dladdr) {
+            Dl_info info2;
+            if (dladdr(lr, &info2) && info2.dli_fname) {
+                const char *sym = info2.dli_sname ? info2.dli_sname : "?";
+                n = snprintf(buf, sizeof(buf),
+                    "  #%d %s(%s+%td) [%p]",
+                    i, info2.dli_fname, sym,
+                    (char*)lr - (char*)info2.dli_saddr, lr);
+            } else {
+                n = snprintf(buf, sizeof(buf), "  #%d [??+%td] [%p]",
+                    i, (char*)lr - (char*)(info2.dli_fbase), lr);
+            }
+        } else {
+            n = snprintf(buf, sizeof(buf), "  #%d fp=%p lr=%p", i, fp, lr);
+        }
+        raw_write(2, buf, n);
+        raw_write(2, "\n", 1);
+        save_crash_to_file(buf);
+        fp = *(void**)fp;
+    }
 
     /* Re-raise with default handler to get tombstone (includes backtrace) */
     struct sigaction *old = sig == SIGSEGV ? &g_old_sigsegv :
                             sig == SIGBUS  ? &g_old_sigbus  :
+                            sig == SIGILL  ? &g_old_sigill  :
                                              &g_old_sigabrt;
     sigaction(sig, old, NULL);
     raise(sig);
@@ -139,8 +238,20 @@ static void vproc_install_crash_handler(void) {
     sigaction(SIGSEGV, &sa, &g_old_sigsegv);
     sigaction(SIGABRT, &sa, &g_old_sigabrt);
     sigaction(SIGBUS,  &sa, &g_old_sigbus);
-    raw_log("[jni] vproc: native crash signal handler installed (SIGSEGV/SIGABRT/SIGBUS)");
+    sigaction(SIGILL,  &sa, &g_old_sigill);
+    raw_log("[jni] vproc: native crash signal handler installed (SIGSEGV/SIGABRT/SIGBUS/SIGILL)");
 }
+
+/* Disable MTE tag check faults entirely (TCF_NONE).
+ * mallopt alone isn't enough — it only controls pointer tags, but the physical
+ * memory tags from mmap(PROT_MTE) remain non-zero. With TCF_NONE the CPU
+ * silently ignores tag mismatches, preventing SIGSEGV. */
+#ifndef PR_SET_TAGGED_ADDR_CTRL
+#define PR_SET_TAGGED_ADDR_CTRL 55
+#endif
+#ifndef PR_TAGGED_ADDR_ENABLE
+#define PR_TAGGED_ADDR_ENABLE (1UL << 0)
+#endif
 
 /* Matches Hermux's vproc_ensure_loaded() */
 static void vproc_ensure_loaded(void) {
@@ -230,6 +341,8 @@ struct cp_arg {
 
 static void *cp_thread_fn(void *a) {
     struct cp_arg *c = (struct cp_arg *)a;
+    /* Reduce timer slack for this thread */
+    prctl(29, 50000, 0, 0, 0);
     ALOGI("cp_thread: enter, calling _s(sid=%u)", c->sid);
     *(c->vpid_out) = g_vproc_create_process_s(c->sid, c->path, c->argv, c->envp,
         c->fds[0], c->fds[1], c->fds[2]);
@@ -261,8 +374,10 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         argv = (char**) malloc((size + 1) * sizeof(char*));
         for (int i = 0; i < size; ++i) {
             jstring s = (jstring)(*env)->GetObjectArrayElement(env, args, i);
-            argv[i] = strdup((*env)->GetStringUTFChars(env, s, NULL));
-            (*env)->ReleaseStringUTFChars(env, s, argv[i]);
+            const char *utf = (*env)->GetStringUTFChars(env, s, NULL);
+            argv[i] = strdup(utf);
+            (*env)->ReleaseStringUTFChars(env, s, utf);
+            (*env)->DeleteLocalRef(env, s);
         }
         argv[size] = NULL;
     }
@@ -273,8 +388,10 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         envp = (char**) malloc((size + 1) * sizeof(char *));
         for (int i = 0; i < size; ++i) {
             jstring s = (jstring)(*env)->GetObjectArrayElement(env, envVars, i);
-            envp[i] = strdup((*env)->GetStringUTFChars(env, s, 0));
-            (*env)->ReleaseStringUTFChars(env, s, envp[i]);
+            const char *utf = (*env)->GetStringUTFChars(env, s, NULL);
+            envp[i] = strdup(utf);
+            (*env)->ReleaseStringUTFChars(env, s, utf);
+            (*env)->DeleteLocalRef(env, s);
         }
         envp[size] = NULL;
     }
@@ -393,10 +510,16 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
     pthread_t cp_tid;
     pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
 
-    /* Wait and log progress */
-    for (int i = 0; i < 40; i++) {
-        usleep(250000); /* 250ms */
-        ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+    /* Reduce timer slack from ~40ms (Android background) to 50µs.
+     * PR_SET_TIMERSLACK = 29. Safe for untrusted apps. */
+    prctl(29, 50000, 0, 0, 0);
+
+    /* Wait and log progress — 10ms poll up to 10s */
+    for (int i = 0; i < 1000; i++) {
+        usleep(10000);
+        if (i % 25 == 0) {
+            ALOGI("watchdog: progress=%u vpid=%u", progress_ptr ? *progress_ptr : 0xFF, vpid);
+        }
         if (vpid != 0) break;
     }
     pthread_join(cp_tid, NULL);
