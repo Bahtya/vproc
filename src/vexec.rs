@@ -11,16 +11,29 @@ use crate::coroutine::VPid;
 use crate::elf;
 use crate::loader;
 
-/// Diagnostic logging for ART APK debugging.
+/// Diagnostic logging — zero cost when VPROC_DIAG env var is unset.
 macro_rules! vdiag {
     ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        unsafe {
-            let bytes = msg.as_bytes();
-            libc::write(2, bytes.as_ptr() as *const _, bytes.len());
-            libc::write(2, b"\n".as_ptr() as *const _, 1);
+        use std::sync::atomic::Ordering as Ord2;
+        if !vdiag::CHECKED.load(Ord2::Relaxed) {
+            let on = std::env::var_os("VPROC_DIAG").is_some();
+            vdiag::ENABLED.store(on, Ord2::Relaxed);
+            vdiag::CHECKED.store(true, Ord2::Relaxed);
+        }
+        if vdiag::ENABLED.load(Ord2::Relaxed) {
+            let msg = format!($($arg)*);
+            unsafe {
+                let bytes = msg.as_bytes();
+                libc::write(2, bytes.as_ptr() as *const _, bytes.len());
+                libc::write(2, b"\n".as_ptr() as *const _, 1);
+            }
         }
     }};
+}
+mod vdiag {
+    use std::sync::atomic::AtomicBool;
+    pub static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub static CHECKED: AtomicBool = AtomicBool::new(false);
 }
 
 const ELF_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB for loaded binaries
