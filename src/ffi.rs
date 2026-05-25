@@ -478,8 +478,7 @@ pub unsafe extern "C" fn vproc_ffi_execve(
             -1 // unreachable but needed for type
         }
         Err(e) => {
-            let msg = format!("vproc: virtual_execve: {}\n", e);
-            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+            crate::vlog_error!("vproc: virtual_execve: {}", e);
             unsafe { *libc::__errno() = libc::ENOEXEC };
             -1
         }
@@ -750,8 +749,7 @@ pub(crate) unsafe fn raw_dup3(old_fd: c_int, new_fd: c_int) -> i32 {
         in("x2") 0usize,
     );
     if ret < 0 {
-        let msg = format!("vproc: raw_dup3({}, {}) failed\n", old_fd, new_fd);
-        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+        crate::vlog_error!("vproc: raw_dup3({}, {}) failed", old_fd, new_fd);
     }
     ret as i32
 }
@@ -784,8 +782,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
         ];
         for (i, &fd) in s.saved_fds.iter().enumerate() {
             if fd < 0 {
-                let msg = format!("vproc: warning: saved_fds[{}] = {} (dup failed)\n", i, fd);
-                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                crate::vlog_error!("vproc: warning: saved_fds[{}] = {} (dup failed)", i, fd);
             }
         }
         // Set the thread-local executor pointer for do_yield
@@ -798,8 +795,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
     {
         let mut s = session.lock().unwrap();
         s.probe_result = Some(0);
-        let msg = "vproc: self-test skipped (probe=ok)\n";
-        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+        crate::vlog!("vproc: self-test skipped (probe=ok)");
     }
 
     // 4. Main loop — I/O-aware event-driven scheduling
@@ -832,10 +828,7 @@ fn run_session_driver(session: Arc<Mutex<Session>>) {
                         exec.vpid
                     }
                     Err(e) => {
-                        let msg = format!("vproc_ffi_create_process: {}\n", e);
-                        unsafe {
-                            libc::write(2, msg.as_ptr() as *const _, msg.len());
-                        }
+                        crate::vlog_error!("vproc_ffi_create_process: {}", e);
                         0
                     }
                 };

@@ -134,7 +134,7 @@ impl Coroutine {
         desc.user_data = ud as *mut c_void;
         let rc = unsafe { mco_create(&mut co_ptr, &mut desc as *mut _) };
         if rc != 0 {
-            eprintln!("vproc: mco_create failed: {}", rc);
+            crate::vlog_error!("vproc: mco_create failed: {}", rc);
             std::process::abort();
         }
 
@@ -219,7 +219,7 @@ impl Coroutine {
             )
         };
         if rc != 0 {
-            eprintln!("vproc: mco_create_with_elf_entry failed: {}", rc);
+            crate::vlog_error!("vproc: mco_create_with_elf_entry failed: {}", rc);
             std::process::abort();
         }
 

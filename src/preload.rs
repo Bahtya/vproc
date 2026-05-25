@@ -1188,8 +1188,7 @@ pub extern "C" fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int {
         if let Some(vpid) = current_vpid() {
             if crate::vfd::get_table(vpid)
                 .and_then(|t| t.get(fd as u32))
-                .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
-                .unwrap_or(false)
+                .is_some()
             {
                 return 0;
             }
@@ -1207,8 +1206,7 @@ pub extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
         if let Some(vpid) = current_vpid() {
             if crate::vfd::get_table(vpid)
                 .and_then(|t| t.get(fd as u32))
-                .map(|vfd| !matches!(vfd, crate::vfd::Vfd::Real(_)))
-                .unwrap_or(false)
+                .is_some()
             {
                 return vpid as c_int;
             }
