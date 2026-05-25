@@ -4,11 +4,11 @@
 
 use std::sync::OnceLock;
 
-type LogFn = unsafe extern "C" fn(c_int, *const u8, *const u8, ...) -> c_int;
+type LogFn = unsafe extern "C" fn(c_int, *const u8, *const u8, *const u8) -> c_int;
 use std::os::raw::c_int;
 
-const ANDROID_LOG_DEBUG: c_int = 3;
-const ANDROID_LOG_ERROR: c_int = 6;
+const LOG_DEBUG: c_int = 3;
+const LOG_ERROR: c_int = 6;
 
 static LOGGER: OnceLock<Option<LogFn>> = OnceLock::new();
 
@@ -32,7 +32,7 @@ fn get_log_fn() -> Option<LogFn> {
 macro_rules! vlog {
     ($($arg:tt)*) => {{
         let msg = format!($($arg)*);
-        $crate::log::_emit($crate::log::_Level::Debug, &msg);
+        $crate::log::emit($crate::log::Level::Debug, &msg);
     }};
 }
 
@@ -41,24 +41,28 @@ macro_rules! vlog {
 macro_rules! vlog_error {
     ($($arg:tt)*) => {{
         let msg = format!($($arg)*);
-        $crate::log::_emit($crate::log::_Level::Error, &msg);
+        $crate::log::emit($crate::log::Level::Error, &msg);
     }};
 }
 
 #[derive(Clone, Copy)]
-pub enum _Level {
+pub enum Level {
     Debug,
     Error,
 }
 
-pub fn _emit(level: _Level, msg: &str) {
+/// Write `msg` to Android logcat.  Falls back to `libc::write(2, ...)` when
+/// `liblog.so` is unavailable (e.g. running tests on a Linux host).
+pub fn emit(level: Level, msg: &str) {
     let prio = match level {
-        _Level::Debug => 3, // ANDROID_LOG_DEBUG
-        _Level::Error => 6, // ANDROID_LOG_ERROR
+        Level::Debug => LOG_DEBUG,
+        Level::Error => LOG_ERROR,
     };
     if let Some(log_fn) = get_log_fn() {
+        // CString::new fails on embedded NUL — use lossy conversion as fallback
+        let c_msg = std::ffi::CString::new(msg)
+            .unwrap_or_else(|_| std::ffi::CString::new(msg.replace('\0', "?")).unwrap_or_default());
         let tag = b"vproc\0";
-        let c_msg = std::ffi::CString::new(msg).unwrap_or_default();
         unsafe { log_fn(prio, tag.as_ptr(), c_msg.as_ptr()); }
     }
 }

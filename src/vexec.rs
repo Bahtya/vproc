@@ -22,7 +22,7 @@ macro_rules! vdiag {
         }
         if vdiag::ENABLED.load(Ord2::Relaxed) {
             let msg = format!($($arg)*);
-            crate::log::_emit(crate::log::_Level::Debug, &msg);
+            crate::log::emit(crate::log::Level::Debug, &msg);
         }
     }};
 }
