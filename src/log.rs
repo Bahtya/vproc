@@ -63,6 +63,7 @@ pub fn emit(level: Level, msg: &str) {
         let c_msg = std::ffi::CString::new(msg)
             .unwrap_or_else(|_| std::ffi::CString::new(msg.replace('\0', "?")).unwrap_or_default());
         let tag = b"vproc\0";
-        unsafe { log_fn(prio, tag.as_ptr(), c_msg.as_ptr()); }
+        let fmt = b"%s\0";
+        unsafe { log_fn(prio, tag.as_ptr(), fmt.as_ptr(), c_msg.as_ptr()); }
     }
 }
