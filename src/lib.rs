@@ -10,7 +10,7 @@ pub mod preload;
 pub mod vexec;
 pub mod vfd;
 
-pub const VERSION: &str = "0.3.0";
+pub const VERSION: &str = "0.4.0";
 
 use coroutine::VPid;
 
