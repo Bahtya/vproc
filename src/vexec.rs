@@ -22,11 +22,7 @@ macro_rules! vdiag {
         }
         if vdiag::ENABLED.load(Ord2::Relaxed) {
             let msg = format!($($arg)*);
-            unsafe {
-                let bytes = msg.as_bytes();
-                libc::write(2, bytes.as_ptr() as *const _, bytes.len());
-                libc::write(2, b"\n".as_ptr() as *const _, 1);
-            }
+            crate::log::_emit(crate::log::_Level::Debug, &msg);
         }
     }};
 }
@@ -665,7 +661,7 @@ fn restore_writable_segments(segments: &[WritableSegment]) {
                 page_size,
                 libc::PROT_READ | libc::PROT_WRITE,
             ) != 0 {
-                eprintln!("[vexec] mprotect RW failed for {:#x}: {}", page_start, *libc::__errno());
+                crate::vlog_error!("[vexec] mprotect RW failed for {:#x}: {}", page_start, *libc::__errno());
                 continue;
             }
             std::ptr::copy_nonoverlapping(seg.data.as_ptr(), seg.addr as *mut u8, size);
@@ -685,7 +681,7 @@ fn restore_writable_segments(segments: &[WritableSegment]) {
                 page_size,
                 prot as c_int,
             ) != 0 {
-                eprintln!("[vexec] mprotect restore failed for {:#x}: {}", page_start, *libc::__errno());
+                crate::vlog_error!("[vexec] mprotect restore failed for {:#x}: {}", page_start, *libc::__errno());
             }
         }
     }

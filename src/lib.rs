@@ -3,6 +3,7 @@ pub mod elf;
 pub mod executor;
 pub mod ffi;
 pub mod loader;
+pub mod log;
 // LD_PRELOAD hooks take raw C pointers by design — suppress the lint for the whole module.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub mod preload;
