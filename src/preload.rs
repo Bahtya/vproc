@@ -487,7 +487,7 @@ pub extern "C" fn execve(
     EXECVE_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
 
-    if !enabled() || is_real_fork_child() {
+    if !enabled() || is_real_fork_child() || crate::executor::get_current_executor().is_null() {
         // Use raw syscall to avoid recursion with hook_libc_execve
         unsafe {
             let ret: isize;

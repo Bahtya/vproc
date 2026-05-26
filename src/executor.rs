@@ -244,7 +244,9 @@ pub extern "C" fn vproc_exit() {
 }
 
 pub fn vproc_exit_with_code(code: i32) {
-    let ex = unsafe { &mut *get_current_executor() };
+    let ptr = get_current_executor();
+    if ptr.is_null() { return; }
+    let ex = unsafe { &mut *ptr };
     let pid = match ex.current {
         Some(p) => p,
         None => return,
@@ -263,7 +265,9 @@ pub fn vproc_exit_with_code(code: i32) {
 }
 
 pub fn get_exit_code(pid: VPid) -> Option<i32> {
-    let ex = unsafe { &mut *get_current_executor() };
+    let ptr = get_current_executor();
+    if ptr.is_null() { return None; }
+    let ex = unsafe { &mut *ptr };
     if let Some(&code) = ex.exit_codes.get(&pid) {
         return Some(code);
     }
@@ -273,19 +277,25 @@ pub fn get_exit_code(pid: VPid) -> Option<i32> {
 }
 
 pub fn is_child_of(parent: VPid, child: VPid) -> bool {
-    let ex = unsafe { &mut *get_current_executor() };
+    let ptr = get_current_executor();
+    if ptr.is_null() { return false; }
+    let ex = unsafe { &mut *ptr };
     ex.children.get(&parent).is_some_and(|kids| kids.contains(&child))
 }
 
 pub fn reap_child(parent: VPid, child: VPid) {
-    let ex = unsafe { &mut *get_current_executor() };
+    let ptr = get_current_executor();
+    if ptr.is_null() { return; }
+    let ex = unsafe { &mut *ptr };
     if let Some(kids) = ex.children.get_mut(&parent) {
         kids.retain(|&k| k != child);
     }
 }
 
 pub fn remove_exit_code(pid: VPid) {
-    let ex = unsafe { &mut *get_current_executor() };
+    let ptr = get_current_executor();
+    if ptr.is_null() { return; }
+    let ex = unsafe { &mut *ptr };
     ex.exit_codes.remove(&pid);
 }
 
@@ -295,7 +305,9 @@ pub fn do_yield() {
         if !co.is_null() {
             // Re-queue current coroutine before yielding, otherwise the scheduler
             // never picks it up again (the same logic as Executor::r#yield).
-            let ex = &mut *get_current_executor();
+            let ptr = get_current_executor();
+            if ptr.is_null() { return; }
+            let ex = &mut *ptr;
             if let Some(pid) = ex.current {
                 if let Some(co_inner) = ex.vprocs.get(&pid) {
                     if !co_inner.is_done() {
@@ -306,7 +318,9 @@ pub fn do_yield() {
             mco_yield_raw(co);
         } else {
             // Driver thread — advance the scheduler.
-            let ex = &mut *get_current_executor();
+            let ptr = get_current_executor();
+            if ptr.is_null() { return; }
+            let ex = &mut *ptr;
             ex.step_from_driver();
         }
     }
