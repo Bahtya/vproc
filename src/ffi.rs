@@ -362,7 +362,7 @@ pub extern "C" fn vproc_ffi_probe() -> c_int {
 /// Return the vproc version string (null-terminated).
 #[no_mangle]
 pub extern "C" fn vproc_ffi_version() -> *const u8 {
-    static VERSION: &[u8] = b"0.4.3\0";
+    static VERSION: &[u8] = b"0.4.4\0";
     VERSION.as_ptr()
 }
 
