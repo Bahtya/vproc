@@ -120,6 +120,7 @@ typedef uint32_t (*vproc_create_process_session_fn)(
     int stdin_fd, int stdout_fd, int stderr_fd);
 typedef int (*vproc_run_until_exit_session_fn)(uint32_t session_id, uint32_t vpid);
 typedef int (*vproc_vpid_exists_session_fn)(uint32_t session_id, uint32_t vpid);
+typedef void (*vproc_destroy_session_fn)(uint32_t session_id);
 
 static vproc_create_process_fn g_vproc_create_process = NULL;
 static vproc_run_until_exit_fn g_vproc_run_until_exit = NULL;
@@ -128,8 +129,19 @@ static vproc_create_session_fn g_vproc_create_session = NULL;
 static vproc_create_process_session_fn g_vproc_create_process_s = NULL;
 static vproc_run_until_exit_session_fn g_vproc_run_until_exit_s = NULL;
 static vproc_vpid_exists_session_fn g_vproc_vpid_exists_s = NULL;
+static vproc_destroy_session_fn g_vproc_destroy_session = NULL;
 
-static uint32_t g_vproc_session_id = 0;
+/* Session management: each TerminalSession gets its own vproc session */
+#define MAX_SESSIONS 64
+static struct {
+    uint32_t id;
+    int32_t vpid;  // -1 if not created yet
+    int ptm;        // PTY master fd
+    int pts;        // PTY slave fd
+} g_vproc_sessions[MAX_SESSIONS];
+static int g_vproc_session_count = 0;
+static pthread_mutex_t g_sessions_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static atomic_int g_vproc_initialized = ATOMIC_VAR_INIT(0);
 
 /* Signal handler — matches Hermux's termux.c exactly */
@@ -275,16 +287,14 @@ static void vproc_ensure_loaded(void) {
     g_vproc_create_process_s = (vproc_create_process_session_fn)dlsym(lib, "vproc_ffi_create_process");
     g_vproc_run_until_exit_s = (vproc_run_until_exit_session_fn)dlsym(lib, "vproc_ffi_run_until_exit");
     g_vproc_vpid_exists_s = (vproc_vpid_exists_session_fn)dlsym(lib, "vproc_ffi_vpid_exists");
+    g_vproc_destroy_session = (vproc_destroy_session_fn)dlsym(lib, "vproc_ffi_destroy_session");
 
-    ALOGI("vproc: session=%p, create=%p, run=%p, exists=%p",
+    ALOGI("vproc: session=%p, create=%p, run=%p, exists=%p, destroy=%p",
         (void*)g_vproc_create_session, (void*)g_vproc_create_process_s,
-        (void*)g_vproc_run_until_exit_s, (void*)g_vproc_vpid_exists_s);
+        (void*)g_vproc_run_until_exit_s, (void*)g_vproc_vpid_exists_s,
+        (void*)g_vproc_destroy_session);
 
-    if (g_vproc_create_session && g_vproc_create_process_s) {
-        ALOGI("vproc: creating session...");
-        g_vproc_session_id = g_vproc_create_session();
-        ALOGI("vproc: session_id=%u", g_vproc_session_id);
-    }
+    /* Don't create a global session here - each TerminalSession creates its own */
 
     /* Also resolve _default wrappers as fallback */
     g_vproc_create_process = (vproc_create_process_fn)dlsym(lib, "vproc_ffi_create_process_default");
@@ -495,6 +505,51 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         raw_log(buf);
     }
 
+    /* Create a new vproc session for this TerminalSession */
+    if (!g_vproc_create_session) {
+        raw_log("[jni] vproc: g_vproc_create_session not resolved");
+        close(pts);
+        close(ptm);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+    uint32_t session_id = g_vproc_create_session();
+    if (session_id == 0) {
+        raw_log("[jni] vproc: create_session failed");
+        close(pts);
+        close(ptm);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+
+    /* Store session info */
+    pthread_mutex_lock(&g_sessions_mutex);
+    int session_idx = -1;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (g_vproc_sessions[i].id == 0) {
+            g_vproc_sessions[i].id = session_id;
+            g_vproc_sessions[i].vpid = -1;
+            g_vproc_sessions[i].ptm = ptm;
+            g_vproc_sessions[i].pts = pts;
+            session_idx = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_mutex);
+    if (session_idx < 0) {
+        raw_log("[jni] vproc: too many sessions");
+        g_vproc_destroy_session(session_id);
+        close(pts);
+        close(ptm);
+        (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
+        if (cwd) (*env)->ReleaseStringUTFChars(env, cwd, cwd_utf8);
+        return -1;
+    }
+
+    ALOGI("createSubprocess: created session_id=%u", session_id);
+
     /* Create virtual process — matches Hermux's 6-arg call exactly */
     {
         char buf[256];
@@ -511,14 +566,14 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         ALOGI("createSubprocess: progress_ptr=%p", (void *)progress_ptr);
     }
 
-    ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, g_vproc_session_id, g_vproc_create_process_s ? 1 : 0);
+    ALOGI("createSubprocess: about to call create_process cmd=%s sid=%u has_s=%d", cmd_utf8, session_id, g_vproc_create_process_s ? 1 : 0);
 
     /* Call create_process in a child thread so we can log progress */
     uint32_t vpid = 0;
     int cp_done = 0;
     pthread_mutex_t cp_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cp_cond = PTHREAD_COND_INITIALIZER;
-    struct cp_arg cpa = { g_vproc_session_id, cmd_utf8, argv, envp, {pts, pts, pts}, &vpid, progress_ptr, &cp_mutex, &cp_cond, &cp_done };
+    struct cp_arg cpa = { session_id, cmd_utf8, argv, envp, {pts, pts, pts}, &vpid, progress_ptr, &cp_mutex, &cp_cond, &cp_done };
     pthread_t cp_tid;
     pthread_create(&cp_tid, NULL, cp_thread_fn, &cpa);
 
@@ -556,6 +611,16 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
 
     if (vpid == 0) {
         raw_log("[jni] vproc: create_process returned 0 (failure)");
+        g_vproc_destroy_session(session_id);
+        /* Clear session entry */
+        pthread_mutex_lock(&g_sessions_mutex);
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            if (g_vproc_sessions[i].id == session_id) {
+                g_vproc_sessions[i].id = 0;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_sessions_mutex);
         close(pts);
         close(ptm);
         (*env)->ReleaseStringUTFChars(env, cmd, cmd_utf8);
@@ -563,12 +628,22 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
         return -1;
     }
 
+    /* Update session with vpid */
+    pthread_mutex_lock(&g_sessions_mutex);
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (g_vproc_sessions[i].id == session_id) {
+            g_vproc_sessions[i].vpid = vpid;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_sessions_mutex);
+
     /* pts stays open — the coroutine's VfdTable references it */
     {
         char buf[128];
         snprintf(buf, sizeof(buf),
-            "[jni] vproc: virtual process created successfully vpid=%u ptm=%d pts=%d",
-            vpid, ptm, pts);
+            "[jni] vproc: virtual process created successfully session=%u vpid=%u ptm=%d pts=%d",
+            session_id, vpid, ptm, pts);
         raw_log(buf);
     }
 
@@ -578,10 +653,11 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
     if (argv) { for (char **tmp = argv; *tmp; ++tmp) free(*tmp); free(argv); }
     if (envp) { for (char **tmp = envp; *tmp; ++tmp) free(*tmp); free(envp); }
 
-    /* Write vpid to processIdArray */
+    /* Write session_id to processIdArray - Java layer uses this for waitFor */
     int *pProcId = (int*) (*env)->GetPrimitiveArrayCritical(env, processIdArray, NULL);
     if (pProcId) {
-        *pProcId = (int) vpid;
+        *pProcId = (int) session_id;
+        *(pProcId + 1) = (int) vpid;  /* Also store vpid for reference */
         (*env)->ReleasePrimitiveArrayCritical(env, processIdArray, pProcId, 0);
     }
 
@@ -589,36 +665,47 @@ JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_createSubprocess
 }
 
 /* ------------------------------------------------------------------
- * JNI: waitFor — matches Hermux's waitFor exactly
+ * JNI: waitFor — with session_id for multi-session support
  * ------------------------------------------------------------------ */
 
 JNIEXPORT jint JNICALL Java_com_vproc_arttest_TestTermuxSession_waitFor(
-    JNIEnv *env, jclass cls, jint pid)
+    JNIEnv *env, jclass cls, jint sessionId, jint vpid)
 {
     (void)env; (void)cls;
-    ALOGI("waitFor: enter vpid=%d", pid);
+    ALOGI("waitFor: enter session=%u vpid=%d", sessionId, vpid);
     vproc_ensure_loaded();
-    int exists = 0;
-    if (g_vproc_session_id > 0 && g_vproc_vpid_exists_s) {
-        exists = g_vproc_vpid_exists_s(g_vproc_session_id, (uint32_t)pid);
-    } else if (g_vproc_vpid_exists) {
-        exists = g_vproc_vpid_exists((uint32_t)pid);
-    }
-    if (exists && g_vproc_run_until_exit_s && g_vproc_session_id > 0) {
-        ALOGI("waitFor: calling run_until_exit(sid=%u, vpid=%d)", g_vproc_session_id, pid);
-        int code = g_vproc_run_until_exit_s(g_vproc_session_id, (uint32_t)pid);
-        ALOGI("waitFor: run_until_exit returned %d", code);
-        {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "[jni] vproc: run_until_exit(vpid=%d) returned %d", pid, code);
-            raw_log(buf);
+
+    if (sessionId > 0 && g_vproc_vpid_exists_s) {
+        int exists = g_vproc_vpid_exists_s((uint32_t)sessionId, (uint32_t)vpid);
+        if (exists && g_vproc_run_until_exit_s) {
+            ALOGI("waitFor: calling run_until_exit(sid=%u, vpid=%d)", sessionId, vpid);
+            int code = g_vproc_run_until_exit_s((uint32_t)sessionId, (uint32_t)vpid);
+            ALOGI("waitFor: run_until_exit returned %d", code);
+
+            /* Destroy session after wait */
+            if (g_vproc_destroy_session) {
+                g_vproc_destroy_session((uint32_t)sessionId);
+                ALOGI("waitFor: session %u destroyed", sessionId);
+            }
+
+            /* Clear session entry */
+            pthread_mutex_lock(&g_sessions_mutex);
+            for (int i = 0; i < MAX_SESSIONS; i++) {
+                if (g_vproc_sessions[i].id == (uint32_t)sessionId) {
+                    g_vproc_sessions[i].id = 0;
+                    g_vproc_sessions[i].vpid = -1;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_sessions_mutex);
+
+            if (code >= 0) return code;
         }
-        if (code >= 0) return code;
     }
 
-    /* Fallback to real waitpid */
+    /* Fallback to real waitpid if vproc session not found */
     int status;
-    waitpid(pid, &status, 0);
+    waitpid(vpid, &status, 0);
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return -WTERMSIG(status);
     return 0;
