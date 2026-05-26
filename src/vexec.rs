@@ -781,6 +781,11 @@ fn patch_got_for_loaded_binary(base: usize, phdrs: &[elf::Phdr]) {
             "getcwd" => crate::preload::getcwd as *const c_void as usize,
             "poll" => crate::preload::poll as *const c_void as usize,
             "select" => crate::preload::select as *const c_void as usize,
+            "tcsetpgrp" => crate::preload::tcsetpgrp as *const c_void as usize,
+            "tcgetpgrp" => crate::preload::tcgetpgrp as *const c_void as usize,
+            "setsid" => crate::preload::setsid as *const c_void as usize,
+            "getpgrp" => crate::preload::getpgrp as *const c_void as usize,
+            "pipe2" => crate::preload::pipe2 as *const c_void as usize,
             _ => continue,
         };
 
