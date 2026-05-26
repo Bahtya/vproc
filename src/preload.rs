@@ -1023,12 +1023,29 @@ pub extern "C" fn dup(old_fd: c_int) -> c_int {
             return f(old_fd);
         }
     };
-    match table.dup(old_fd as u32) {
-        Ok(new_fd) => new_fd as c_int,
-        Err(_) => {
-            unsafe { *libc::__errno() = libc::EBADF };
-            -1
+    match table.get(old_fd as u32) {
+        Some(crate::vfd::Vfd::Real(real_fd)) => {
+            // Real fd source: create a real kernel fd via dup.
+            let new_real = unsafe {
+                let f = real_fn!("dup\0", extern "C" fn(c_int) -> c_int);
+                f(*real_fd)
+            };
+            if new_real < 0 {
+                unsafe { *libc::__errno() = libc::EBADF };
+                return -1;
+            }
+            let new_fd = table.insert(crate::vfd::Vfd::File(std::sync::Arc::new(
+                crate::vfd::FileRef { real_fd: new_real, cloexec: false },
+            )));
+            new_fd as c_int
         }
+        _ => match table.dup(old_fd as u32) {
+            Ok(new_fd) => new_fd as c_int,
+            Err(_) => {
+                unsafe { *libc::__errno() = libc::EBADF };
+                -1
+            }
+        },
     }
 }
 
@@ -1054,12 +1071,35 @@ pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
             return f(old_fd, new_fd);
         }
     };
-    match table.dup2(old_fd as u32, new_fd as u32) {
-        Ok(fd) => fd as c_int,
-        Err(_) => {
-            unsafe { *libc::__errno() = libc::EBADF };
-            -1
+    match table.get(old_fd as u32) {
+        Some(crate::vfd::Vfd::Real(real_fd)) => {
+            // Real fd source: create a real kernel fd via dup2 so that
+            // terminal ioctls (tcgetattr/tcsetattr) work on the new fd.
+            // Use Vfd::File (owned fd) so close() properly reaps it.
+            let real_dup2 = unsafe {
+                let f = real_fn!("dup2\0", extern "C" fn(c_int, c_int) -> c_int);
+                f(*real_fd, new_fd)
+            };
+            if real_dup2 < 0 {
+                unsafe { *libc::__errno() = libc::EBADF };
+                return -1;
+            }
+            table.insert_at(
+                new_fd as u32,
+                crate::vfd::Vfd::File(std::sync::Arc::new(crate::vfd::FileRef {
+                    real_fd: new_fd,
+                    cloexec: false,
+                })),
+            );
+            new_fd
         }
+        _ => match table.dup2(old_fd as u32, new_fd as u32) {
+            Ok(fd) => fd as c_int,
+            Err(_) => {
+                unsafe { *libc::__errno() = libc::EBADF };
+                -1
+            }
+        },
     }
 }
 

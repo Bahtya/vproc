@@ -193,6 +193,19 @@ impl VfdTable {
         fd
     }
 
+    /// Insert a Vfd at a specific fd number, replacing any existing entry.
+    /// Used by dup2 when a real kernel fd is created.
+    pub fn insert_at(&mut self, fd: u32, vfd: Vfd) {
+        if self.fds.contains_key(&fd) {
+            let _ = self.close(fd);
+        }
+        self.fds.insert(fd, vfd);
+        // Update next_fd to skip past this fd
+        if fd >= self.next_fd {
+            self.next_fd = fd + 1;
+        }
+    }
+
     pub fn get(&self, fd: u32) -> Option<&Vfd> {
         self.fds.get(&fd)
     }
