@@ -109,8 +109,8 @@ public class TestTermuxSession {
                                 String[] args, String[] envVars,
                                 int[] processIdArray,
                                 int rows, int columns, int cellWidth, int cellHeight);
-    // Matches Hermux's JNI.waitFor
-    native int waitFor(int pid);
+    // Updated: waitFor now takes sessionId and vpid for multi-session support
+    native int waitFor(int sessionId, int vpid);
     native void setPtyWindowSize(int fd, int rows, int cols, int cellWidth, int cellHeight);
 
     // --- Legacy native methods (for backward compat) ---
@@ -189,32 +189,60 @@ public class TestTermuxSession {
     }
 
     /**
+     * VprocSession - manages a vproc session with its own driver thread.
+     * Each TerminalSession gets its own vproc session for true concurrency.
+     */
+    static class VprocSession {
+        final int sessionId;
+        final int vpid;
+        final int ptm;
+        VprocSession(int sessionId, int vpid, int ptm) {
+            this.sessionId = sessionId;
+            this.vpid = vpid;
+            this.ptm = ptm;
+        }
+    }
+
+    /**
      * Run a session matching Hermux's TerminalSession flow exactly:
      *   createSubprocess → InputReader thread → waitFor thread → join
      *
      * This mirrors:
      *   TerminalSession() → JNI.createSubprocess()
      *   TerminalSession$1.run() → processOnStdoutRead() (read from ptm)
-     *   TerminalSession$2.run() → JNI.waitFor(pid) (wait for exit)
+     *   TerminalSession$2.run() → JNI.waitFor(sessionId, vpid) (wait for exit)
+     *
+     * Each call creates a new vproc session with its own driver thread,
+     * enabling true concurrency between sessions.
      */
-    Result runHermuxSession(String shellPath, String cmd) throws Exception {
+    VprocSession createHermuxSession(String shellPath, String cmd) throws Exception {
         String cwd = "/data/data/com.hermux/files/home";
         String[] argv = {shellPath, "-c", cmd};
         String[] envp = buildEnvp();
 
         // Matches TerminalSession.java: JNI.createSubprocess(...)
-        int[] pidArr = new int[1];
+        // processIdArray[0] = sessionId, processIdArray[1] = vpid
+        int[] pidArr = new int[2];
         int ptm = createSubprocess(shellPath, cwd, argv, envp, pidArr, 24, 80, 0, 0);
         if (ptm < 0) {
             System.err.println("    createSubprocess failed (ptm=" + ptm + ")");
-            return new Result(-1, "", false, 0, 0);
+            return null;
         }
-        int vpid = pidArr[0];
-        System.err.println("    createSubprocess: ptm=" + ptm + " vpid=" + vpid);
+        int sessionId = pidArr[0];
+        int vpid = pidArr[1];
+        System.err.println("    createSubprocess: session=" + sessionId + " vpid=" + vpid + " ptm=" + ptm);
+        return new VprocSession(sessionId, vpid, ptm);
+    }
 
-        // Matches TerminalSession.java: InputReader thread
+    /**
+     * Wait for a vproc session to complete and collect output.
+     */
+    Result waitHermuxSession(VprocSession session) throws Exception {
+        int ptm = session.ptm;
         final StringBuilder output = new StringBuilder();
         final byte[] buf = new byte[4096];
+
+        // InputReader thread
         Thread inputReader = new Thread(() -> {
             try {
                 while (true) {
@@ -225,22 +253,22 @@ public class TestTermuxSession {
             } catch (Exception e) {
                 // Expected when ptm is closed
             }
-        }, "InputReader-vpid" + vpid);
+        }, "InputReader-sess" + session.sessionId);
         inputReader.setDaemon(true);
 
-        // Matches TerminalSession.java: TermSessionWaiter thread
+        // Waiter thread - calls waitFor with sessionId and vpid
         final int[] exitCodeHolder = new int[]{-2};
         Thread waiter = new Thread(() -> {
             try {
-                int code = waitFor(vpid);
+                int code = waitFor(session.sessionId, session.vpid);
                 exitCodeHolder[0] = code;
             } catch (Exception e) {
                 System.err.println("    waitFor exception: " + e);
             }
-        }, "TermSessionWaiter-vpid" + vpid);
+        }, "Waiter-sess" + session.sessionId);
         waiter.setDaemon(true);
 
-        // Start both threads (matches Hermux's process creation flow)
+        // Start both threads
         inputReader.start();
         waiter.start();
 
@@ -257,6 +285,18 @@ public class TestTermuxSession {
         inputReader.join(2000);
 
         return new Result(exitCodeHolder[0], output.toString(), false, 0, 0);
+    }
+
+    /**
+     * Convenience method: create and wait for a hermux session in one call.
+     * For testing multi-session concurrency, use createHermuxSession + waitHermuxSession separately.
+     */
+    Result runHermuxSession(String shellPath, String cmd) throws Exception {
+        VprocSession session = createHermuxSession(shellPath, cmd);
+        if (session == null) {
+            return new Result(-1, "", false, 0, 0);
+        }
+        return waitHermuxSession(session);
     }
 
     void test(String name, boolean condition) {
@@ -685,6 +725,162 @@ public class TestTermuxSession {
 
     // --- Concurrency tests ---
 
+    /**
+     * Test true concurrent sessions - each gets its own vproc session.
+     * This is the key test for issue #44: one session's run_until_exit
+     * should not block another session's create_process.
+     */
+    void testConcurrentSessions() throws Exception {
+        System.err.println("=== Concurrent Sessions Test (issue #44) ===");
+        String bash = getBashPath();
+        String sh = getShellPath();
+
+        // Create 3 sessions concurrently (each with its own vproc session)
+        VprocSession[] sessions = new VprocSession[3];
+        Thread[] creators = new Thread[3];
+        String[] cmds = {"echo session_0", "echo session_1", "echo session_2"};
+
+        for (int i = 0; i < 3; i++) {
+            final int idx = i;
+            creators[i] = new Thread(() -> {
+                try {
+                    String shell = (idx % 2 == 0) ? bash : sh;
+                    sessions[idx] = createHermuxSession(shell, cmds[idx]);
+                    if (sessions[idx] == null) {
+                        System.err.printf("    session %d: createHermuxSession failed%n", idx);
+                    } else {
+                        System.err.printf("    session %d: created (session=%d vpid=%d)%n",
+                            idx, sessions[idx].sessionId, sessions[idx].vpid);
+                    }
+                } catch (Exception e) {
+                    System.err.printf("    session %d: exception: %s%n", idx, e);
+                }
+            }, "Creator-" + i);
+        }
+
+        // Start all creators concurrently
+        long start = System.nanoTime();
+        for (Thread t : creators) t.start();
+
+        // Wait for all to complete (with timeout)
+        for (Thread t : creators) {
+            t.join(5000);
+            if (t.isAlive()) {
+                System.err.println("    WARNING: creator thread timed out");
+                t.interrupt();
+            }
+        }
+        long createTime = (System.nanoTime() - start) / 1_000_000;
+        System.err.printf("    All sessions created in %d ms%n", createTime);
+
+        // Verify all sessions were created successfully
+        boolean allCreated = true;
+        for (int i = 0; i < 3; i++) {
+            if (sessions[i] == null) {
+                allCreated = false;
+                System.err.printf("    session %d: NOT created%n", i);
+            }
+        }
+        test("all concurrent sessions created successfully", allCreated);
+
+        // Wait for all sessions to complete
+        Thread[] waiters = new Thread[3];
+        Result[] results = new Result[3];
+        for (int i = 0; i < 3; i++) {
+            final int idx = i;
+            waiters[i] = new Thread(() -> {
+                try {
+                    results[idx] = waitHermuxSession(sessions[idx]);
+                    System.err.printf("    session %d: completed exit=%d%n",
+                        idx, results[idx].exitCode);
+                } catch (Exception e) {
+                    System.err.printf("    session %d: wait exception: %s%n", idx, e);
+                    results[idx] = new Result(-1, "", false, 0, 0);
+                }
+            }, "Waiter-" + i);
+        }
+
+        start = System.nanoTime();
+        for (Thread t : waiters) t.start();
+        for (Thread t : waiters) {
+            t.join(10000);
+            if (t.isAlive()) {
+                System.err.println("    WARNING: waiter thread timed out");
+                t.interrupt();
+            }
+        }
+        long waitTime = (System.nanoTime() - start) / 1_000_000;
+        System.err.printf("    All sessions completed in %d ms%n", waitTime);
+
+        // Verify all completed successfully
+        boolean allOk = true;
+        for (int i = 0; i < 3; i++) {
+            if (results[i] == null || results[i].exitCode != 0) {
+                allOk = false;
+                System.err.printf("    session %d: FAIL exit=%d output=[%s]%n", i,
+                    results[i] != null ? results[i].exitCode : -1,
+                    results[i] != null && results[i].output.length() > 50 ?
+                        results[i].output.substring(0, 50) + "..." : results[i].output);
+            } else if (!results[i].output.contains(cmds[i])) {
+                allOk = false;
+                System.err.printf("    session %d: output mismatch expected '%s' got '%s'%n",
+                    i, cmds[i], results[i].output.trim());
+            }
+        }
+        test("all concurrent sessions completed successfully", allOk);
+    }
+
+    /**
+     * Test that run_until_exit in one session does not block create_process in another.
+     * This is the specific scenario from issue #44.
+     */
+    void testRunUntilExitDoesNotBlockCreate() throws Exception {
+        System.err.println("=== RunUntilExit Does Not Block Create Test (issue #44) ===");
+        String bash = getBashPath();
+        String sh = getShellPath();
+
+        // Session 1: long-running command (simulates TerminalSession A running bash)
+        VprocSession session1 = createHermuxSession(bash, "sleep 2 && echo session1_done");
+        if (session1 == null) {
+            test("session 1 created", false);
+            return;
+        }
+        System.err.printf("    Session 1 created (session=%d vpid=%d), running long command...%n",
+            session1.sessionId, session1.vpid);
+
+        // Session 2: quick command - should NOT be blocked by session 1's run_until_exit
+        Thread.sleep(100); // Give session 1 a moment to start
+        long start = System.nanoTime();
+        VprocSession session2 = createHermuxSession(sh, "echo session2_unblocked");
+        long createTime = System.nanoTime() - start;
+
+        if (session2 == null) {
+            test("session 2 can be created while session 1 running", false);
+            // Clean up session 1
+            try { waitHermuxSession(session1); } catch (Exception e) {}
+            return;
+        }
+
+        boolean notBlocked = createTime < 2000; // Should complete in < 2 seconds
+        test("session 2 not blocked by session 1's run_until_exit", notBlocked);
+        System.err.printf("    Session 2 created in %d ms%n", createTime / 1_000_000);
+
+        // Clean up
+        try {
+            Result r2 = waitHermuxSession(session2);
+            System.err.printf("    Session 2 completed: exit=%d%n", r2.exitCode);
+        } catch (Exception e) {
+            System.err.printf("    Session 2 wait exception: %s%n", e);
+        }
+
+        try {
+            Result r1 = waitHermuxSession(session1);
+            System.err.printf("    Session 1 completed: exit=%d%n", r1.exitCode);
+        } catch (Exception e) {
+            System.err.printf("    Session 1 wait exception: %s%n", e);
+        }
+    }
+
     void testParallelSh() throws Exception {
         // Sequential hermux sessions — the driver thread is single-threaded,
         // so true parallelism requires separate sessions (not yet supported by JNI bridge).
@@ -958,8 +1154,24 @@ public class TestTermuxSession {
 
         System.err.println();
 
-        // Concurrency tests (last — uses separate hermux sessions for parallelism)
+        // Concurrency tests (now with per-session vproc sessions - issue #44 fix)
         System.err.println("--- Concurrency Tests ---");
+
+        // Issue #44 tests - verify sessions don't block each other
+        try {
+            t.testConcurrentSessions();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: concurrent sessions test crashed: " + e);
+            t.failed++;
+        }
+        try {
+            t.testRunUntilExitDoesNotBlockCreate();
+        } catch (Throwable e) {
+            System.err.println("  SKIP: run_until_exit block test crashed: " + e);
+            t.failed++;
+        }
+
+        // Existing parallelism tests
         try {
             t.testParallelSh();
         } catch (Throwable e) {
