@@ -473,8 +473,6 @@ pub fn virtual_execve_via_entry(
     hook_libc_exit();
     vdiag!("[vexec] hook_libc_execve...");
     hook_libc_execve();
-    vdiag!("[vexec] hook_libc_fork...");
-    hook_libc_fork();
     vdiag!("[vexec] patch_got_for_loaded_binary...");
     patch_got_for_loaded_binary(base, &phdrs);
     vdiag!("[vexec] GOT patched, saving writable segments...");
@@ -1032,21 +1030,6 @@ fn hook_libc_execve() {
         let original = libc::dlsym(rtld_next, c"execve".as_ptr());
         if original.is_null() { return; }
         write_inline_hook(original as usize, crate::preload::execve as *const c_void as usize);
-    }
-}
-
-/// Inline-hook libc's fork() so REAL_FORK_CHILD is set even when
-/// loaded via dlopen (not LD_PRELOAD).
-fn hook_libc_fork() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let rtld_next = -1isize as *mut c_void;
-    unsafe {
-        let original = libc::dlsym(rtld_next, c"fork".as_ptr());
-        if original.is_null() { return; }
-        write_inline_hook(original as usize, crate::preload::fork as *const c_void as usize);
     }
 }
 
