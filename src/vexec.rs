@@ -469,12 +469,10 @@ pub fn virtual_execve_via_entry(
 
     vdiag!("[vexec] clear_init_arrays...");
     clear_init_arrays(base, &phdrs);
-    vdiag!("[vexec] hook_libc_exit...");
-    hook_libc_exit();
-    vdiag!("[vexec] hook_libc_execve...");
-    hook_libc_execve();
     vdiag!("[vexec] patch_got_for_loaded_binary...");
     patch_got_for_loaded_binary(base, &phdrs);
+    vdiag!("[vexec] patch_libc_got...");
+    patch_libc_got();
     vdiag!("[vexec] GOT patched, saving writable segments...");
 
     // Save writable segment state AFTER clear_init_arrays + GOT patch.
@@ -961,81 +959,202 @@ fn register_elf_c_strings(vpid: VPid, c_strings: Vec<*mut u8>) {
     }
 }
 
-/// Write an inline-hook trampoline at `func_addr` that branches to `target`.
-///
-/// Overwrites the first 16 bytes with:
-///   ldr x16, [pc, #8]   // load target address
-///   br  x16             // branch to target
-///   .quad target        // 64-bit target address
-unsafe fn write_inline_hook(func_addr: usize, target: usize) -> bool {
-    vdiag!("[vexec] write_inline_hook: addr={:#x} target={:#x}", func_addr, target);
-    let page = func_addr & !0xfff;
-    if mprotect_mte_aware(
-        page,
-        0x2000,
-        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-    ) != 0 {
-        let errno = unsafe { *libc::__errno() };
-        vdiag!("[vexec] write_inline_hook: mprotect RWX FAILED errno={}", errno);
-        return false;
+/// Patch libc.so's GOT entries for exit() and execve() so that internal
+/// calls (e.g. __libc_init → exit()) route through our interceptors.
+/// This replaces the old write_inline_hook approach which modified libc
+/// code pages — GOT patching is safer (no mprotect RWX on code, no icache flush).
+fn patch_libc_got() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
-    vdiag!("[vexec] write_inline_hook: mprotect RWX OK, writing trampoline");
 
-    let code = func_addr as *mut u32;
-    // Write target payload first, then instructions — if interrupted between
-    // writes the CPU never sees a valid LDR pointing at garbage (#23).
-    std::ptr::write_unaligned(code.add(2) as *mut usize, target);
-    std::ptr::write_unaligned(code, 0x58000050);       // ldr x16, [pc, #8]
-    std::ptr::write_unaligned(code.add(1), 0xD61F0200); // br x16
+    // Find libc.so via dl_iterate_phdr
+    let libc_base = match find_loaded_base_by_name("libc.so") {
+        Some(b) => b,
+        None => {
+            crate::vlog_error!("[vexec] patch_libc_got: cannot find libc.so base");
+            return;
+        }
+    };
 
-    // Flush instruction cache for all 16 bytes (two 8-byte lines)
-    for off in [0, 8] {
-        std::arch::asm!(
-            "dc cvau, {addr}",
-            "dsb ish",
-            "ic ivau, {addr}",
-            "dsb ish",
-            "isb",
-            addr = in(reg) func_addr + off,
+    // Get phdrs for libc
+    let phdrs = match find_loaded_phdrs(libc_base) {
+        Some(p) => p,
+        None => {
+            crate::vlog_error!("[vexec] patch_libc_got: cannot find libc.so phdrs");
+            return;
+        }
+    };
+
+    // Scan libc's JMPREL for exit and execve, same logic as patch_got_for_loaded_binary
+    let mut patches: Vec<(*mut usize, usize)> = Vec::new();
+    let mut pages = std::collections::BTreeSet::new();
+
+    let dyn_phdr = match phdrs.iter().find(|p| p.p_type == elf::PT_DYNAMIC) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let dyn_addr = libc_base + (dyn_phdr.p_vaddr as usize);
+    let dyn_count = dyn_phdr.p_memsz as usize / std::mem::size_of::<elf::Dyn>();
+
+    let mut jmprel: usize = 0;
+    let mut pltrelsz: usize = 0;
+    let mut symtab: usize = 0;
+    let mut strtab: usize = 0;
+
+    for i in 0..dyn_count {
+        let dyn_ptr = (dyn_addr + i * std::mem::size_of::<elf::Dyn>()) as *const elf::Dyn;
+        let tag: i64 = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_tag)) };
+        let val = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*dyn_ptr).d_val)) } as usize;
+        match tag {
+            elf::DT_JMPREL => jmprel = val,
+            elf::DT_PLTRELSZ => pltrelsz = val,
+            elf::DT_SYMTAB => symtab = val,
+            elf::DT_STRTAB => strtab = val,
+            _ => {}
+        }
+    }
+
+    if jmprel == 0 || symtab == 0 || strtab == 0 || pltrelsz == 0 {
+        return;
+    }
+
+    let jmprel = jmprel + libc_base;
+    let symtab = symtab + libc_base;
+    let strtab = strtab + libc_base;
+    let rela_count = pltrelsz / std::mem::size_of::<elf::Rela>();
+
+    for i in 0..rela_count {
+        let rela_ptr = (jmprel + i * std::mem::size_of::<elf::Rela>()) as *const elf::Rela;
+        let r_info = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*rela_ptr).r_info)) };
+        let r_offset = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*rela_ptr).r_offset)) };
+
+        if elf::rela_type(r_info) != elf::R_AARCH64_JUMP_SLOT {
+            continue;
+        }
+
+        let sym_idx = elf::rela_sym(r_info) as usize;
+        let sym_ptr = (symtab + sym_idx * std::mem::size_of::<elf::Sym>()) as *const elf::Sym;
+        let st_name = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*sym_ptr).st_name)) } as usize;
+
+        let name_cstr = (strtab + st_name) as *const std::os::raw::c_char;
+        let name = match unsafe { std::ffi::CStr::from_ptr(name_cstr) }.to_str() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        let our_addr: usize = match name {
+            "exit" => crate::preload::exit as *const c_void as usize,
+            "execve" => crate::preload::execve as *const c_void as usize,
+            _ => continue,
+        };
+
+        let got_entry = (libc_base + r_offset as usize) as *mut usize;
+
+        // Save the original function address before overwriting
+        let original_addr = unsafe { std::ptr::read_unaligned(got_entry) };
+        match name {
+            "exit" => crate::preload::set_original_libc_exit(original_addr),
+            "execve" => crate::preload::set_original_libc_execve(original_addr),
+            _ => {}
+        }
+
+        pages.insert((got_entry as usize) & !0xfff);
+        patches.push((got_entry, our_addr));
+    }
+
+    if patches.is_empty() {
+        vdiag!("[vexec] patch_libc_got: no patches needed");
+        return;
+    }
+
+    vdiag!("[vexec] patch_libc_got: {} patches across {} pages", patches.len(), pages.len());
+
+    for &page in &pages {
+        mprotect_mte_aware(page, 0x2000, libc::PROT_READ | libc::PROT_WRITE);
+    }
+    for &(got_entry, our_addr) in &patches {
+        unsafe { std::ptr::write_unaligned(got_entry, our_addr); }
+    }
+    for &page in &pages {
+        mprotect_mte_aware(page, 0x2000, libc::PROT_READ);
+    }
+    vdiag!("[vexec] patch_libc_got: done");
+}
+
+/// Find the base address of a loaded shared object by partial name match.
+/// Unlike find_loaded_base which takes a file path, this searches by soname substring.
+fn find_loaded_base_by_name(name: &str) -> Option<usize> {
+    let name_c = std::ffi::CString::new(name).ok()?;
+    let result = std::cell::Cell::new(None::<usize>);
+    unsafe {
+        SEARCH_PATH = name_c.as_ptr();
+        libc::dl_iterate_phdr(
+            Some(dl_iterate_name_callback),
+            &result as *const _ as *mut c_void,
         );
     }
-
-    // Remove PROT_WRITE — restore to RX (#24 W^X compliance).
-    if mprotect_mte_aware(page, 0x2000, libc::PROT_READ | libc::PROT_EXEC) != 0 {
-        let errno = *libc::__errno();
-        vdiag!("[vexec] write_inline_hook: mprotect restore RX FAILED errno={}", errno);
-    }
-    true
+    result.get()
 }
 
-/// Inline-hook libc's exit() by overwriting its first instructions
-/// with a branch to our interceptor.
-fn hook_libc_exit() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+unsafe extern "C" fn dl_iterate_name_callback(
+    info: *mut libc::dl_phdr_info,
+    _size: usize,
+    data: *mut c_void,
+) -> c_int {
+    let name_ptr = unsafe { SEARCH_PATH };
+    let search = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_bytes();
+    let info_name = unsafe { (*info).dlpi_name };
+    if info_name.is_null() {
+        return 0;
     }
-    let rtld_next = -1isize as *mut c_void;
-    unsafe {
-        let original = libc::dlsym(rtld_next, c"exit".as_ptr());
-        if original.is_null() { return; }
-        write_inline_hook(original as usize, crate::preload::exit as *const c_void as usize);
+    let info_name_bytes = unsafe { std::ffi::CStr::from_ptr(info_name) }.to_bytes();
+    // Check if the search string appears in the library path
+    if info_name_bytes.windows(search.len()).any(|w| w == search) {
+        let result = unsafe { &*(data as *const std::cell::Cell<Option<usize>>) };
+        result.set(Some(unsafe { (*info).dlpi_addr } as usize));
+        return 1;
     }
+    0
 }
 
-/// Inline-hook libc's execve() by overwriting its first instructions
-/// with a branch to our interceptor.
-fn hook_libc_execve() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-    let rtld_next = -1isize as *mut c_void;
+/// Find the program headers for a loaded shared object at a given base address.
+fn find_loaded_phdrs(_base: usize) -> Option<Vec<elf::Phdr>> {
+    let result = std::cell::Cell::new(None::<(*const elf::Phdr, u16)>);
     unsafe {
-        let original = libc::dlsym(rtld_next, c"execve".as_ptr());
-        if original.is_null() { return; }
-        write_inline_hook(original as usize, crate::preload::execve as *const c_void as usize);
+        libc::dl_iterate_phdr(
+            Some(dl_iterate_phdrs_callback),
+            &result as *const _ as *mut c_void,
+        );
     }
+    let (phdr_ptr, phnum) = result.get()?;
+    let mut phdrs = Vec::with_capacity(phnum as usize);
+    for i in 0..phnum as usize {
+        let ptr = unsafe { phdr_ptr.add(i) };
+        phdrs.push(unsafe { std::ptr::read_unaligned(ptr) });
+    }
+    Some(phdrs)
+}
+
+unsafe extern "C" fn dl_iterate_phdrs_callback(
+    info: *mut libc::dl_phdr_info,
+    _size: usize,
+    data: *mut c_void,
+) -> c_int {
+    let result = unsafe { &*(data as *const std::cell::Cell<Option<(*const elf::Phdr, u16)>>) };
+    if result.get().is_some() {
+        return 0;
+    }
+    let info_base = unsafe { (*info).dlpi_addr } as usize;
+    if info_base != 0 {
+        result.set(Some((
+            unsafe { (*info).dlpi_phdr } as *const elf::Phdr,
+            unsafe { (*info).dlpi_phnum },
+        )));
+    }
+    0
 }
 
 /// Determine if a binary is static or dynamic and call the appropriate loader.

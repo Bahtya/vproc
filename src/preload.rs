@@ -293,6 +293,19 @@ pub extern "C" fn _exit(code: c_int) -> ! {
     }
 }
 
+/// Saved original libc function addresses (before GOT patching).
+/// Used to call the real libc exit()/execve() from non-coroutine contexts.
+static ORIGINAL_LIBC_EXIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORIGINAL_LIBC_EXECVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_original_libc_exit(addr: usize) {
+    ORIGINAL_LIBC_EXIT.store(addr, Ordering::SeqCst);
+}
+
+pub fn set_original_libc_execve(addr: usize) {
+    ORIGINAL_LIBC_EXECVE.store(addr, Ordering::SeqCst);
+}
+
 #[no_mangle]
 pub extern "C" fn exit(code: c_int) -> ! {
     if !enabled() || is_real_fork_child() {
@@ -305,7 +318,15 @@ pub extern "C" fn exit(code: c_int) -> ! {
     if vpid.is_some() {
         crate::executor::vproc_exit_with_code(code);
     }
-    // Raw exit_group syscall — bypass LD_PRELOAD, never returns.
+    // Non-coroutine: call original libc exit() (atexit handlers, stdio flush)
+    let original = ORIGINAL_LIBC_EXIT.load(Ordering::SeqCst);
+    if original != 0 {
+        unsafe {
+            let f = std::mem::transmute::<usize, extern "C" fn(c_int) -> !>(original);
+            f(code);
+        }
+    }
+    // Fallback: raw exit_group syscall
     unsafe {
         std::arch::asm!(
             "mov x8, #94",
