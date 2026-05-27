@@ -1023,12 +1023,19 @@ pub extern "C" fn dup(old_fd: c_int) -> c_int {
             return f(old_fd);
         }
     };
-    match table.get(old_fd as u32) {
-        Some(crate::vfd::Vfd::Real(real_fd)) => {
-            // Real fd source: create a real kernel fd via dup.
+    // Resolve the underlying real kernel fd for Real and File sources.
+    // Both have real kernel backing — create a real dup so terminal ioctls
+    // (tcgetattr/tcsetattr) work on the new fd without interception.
+    let underlying_real = match table.get(old_fd as u32) {
+        Some(crate::vfd::Vfd::Real(real_fd)) => Some(*real_fd),
+        Some(crate::vfd::Vfd::File(file_ref)) => Some(file_ref.real_fd),
+        _ => None,
+    };
+    match underlying_real {
+        Some(real_fd) => {
             let new_real = unsafe {
                 let f = real_fn!("dup\0", extern "C" fn(c_int) -> c_int);
-                f(*real_fd)
+                f(real_fd)
             };
             if new_real < 0 {
                 unsafe { *libc::__errno() = libc::EBADF };
@@ -1039,7 +1046,7 @@ pub extern "C" fn dup(old_fd: c_int) -> c_int {
             )));
             new_fd as c_int
         }
-        _ => match table.dup(old_fd as u32) {
+        None => match table.dup(old_fd as u32) {
             Ok(new_fd) => new_fd as c_int,
             Err(_) => {
                 unsafe { *libc::__errno() = libc::EBADF };
@@ -1071,14 +1078,19 @@ pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
             return f(old_fd, new_fd);
         }
     };
-    match table.get(old_fd as u32) {
-        Some(crate::vfd::Vfd::Real(real_fd)) => {
-            // Real fd source: create a real kernel fd via dup2 so that
-            // terminal ioctls (tcgetattr/tcsetattr) work on the new fd.
-            // Use Vfd::File (owned fd) so close() properly reaps it.
+    // Resolve the underlying real kernel fd for Real and File sources.
+    // Both have real kernel backing — create a real dup2 so terminal ioctls
+    // (tcgetattr/tcsetattr) work on the new fd without interception.
+    let underlying_real = match table.get(old_fd as u32) {
+        Some(crate::vfd::Vfd::Real(real_fd)) => Some(*real_fd),
+        Some(crate::vfd::Vfd::File(file_ref)) => Some(file_ref.real_fd),
+        _ => None,
+    };
+    match underlying_real {
+        Some(real_fd) => {
             let real_dup2 = unsafe {
                 let f = real_fn!("dup2\0", extern "C" fn(c_int, c_int) -> c_int);
-                f(*real_fd, new_fd)
+                f(real_fd, new_fd)
             };
             if real_dup2 < 0 {
                 unsafe { *libc::__errno() = libc::EBADF };
@@ -1093,7 +1105,7 @@ pub extern "C" fn dup2(old_fd: c_int, new_fd: c_int) -> c_int {
             );
             new_fd
         }
-        _ => match table.dup2(old_fd as u32, new_fd as u32) {
+        None => match table.dup2(old_fd as u32, new_fd as u32) {
             Ok(fd) => fd as c_int,
             Err(_) => {
                 unsafe { *libc::__errno() = libc::EBADF };
