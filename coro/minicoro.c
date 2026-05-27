@@ -1253,7 +1253,7 @@ __asm__(
   ".hidden _mco_switch\n"
   "_mco_switch:\n"
 #endif
-
+  "  bti c\n"
   "  .arch_extension pauth\n"
   "  mov x10, sp\n"
   "  mov x11, x30\n"
@@ -1281,7 +1281,7 @@ __asm__(
   "  ldp x29, x30, [x1, #(5*16)]\n" /* lr already stripped at save time */
   "  ldp x10, x11, [x1, #(6*16)]\n"
   "  mov sp, x10\n"
-  "  br x11\n"
+  "  ret\n"
 #ifndef __APPLE__
   ".size _mco_switch, .-_mco_switch\n"
 #endif
@@ -1298,6 +1298,7 @@ __asm__(
   ".hidden _mco_wrap_main\n"
   "_mco_wrap_main:\n"
 #endif
+  "  bti c\n"
   "  mov x0, x19\n"
   "  mov x30, x21\n"
   "  br x20\n"
