@@ -1253,7 +1253,6 @@ __asm__(
   ".hidden _mco_switch\n"
   "_mco_switch:\n"
 #endif
-  "  bti c\n"
   "  .arch_extension pauth\n"
   "  mov x10, sp\n"
   "  mov x11, x30\n"
@@ -1298,7 +1297,6 @@ __asm__(
   ".hidden _mco_wrap_main\n"
   "_mco_wrap_main:\n"
 #endif
-  "  bti c\n"
   "  mov x0, x19\n"
   "  mov x30, x21\n"
   "  br x20\n"
